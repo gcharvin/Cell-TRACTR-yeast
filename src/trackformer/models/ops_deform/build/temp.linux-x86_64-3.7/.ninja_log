@@ -1,0 +1,6 @@
+# ninja log v5
+0	8954	1660671266246953084	/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/build/temp.linux-x86_64-3.7/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/src/cpu/ms_deform_attn_cpu.o	b6901694e77f99bd
+1	25126	1660671282135018075	/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/build/temp.linux-x86_64-3.7/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/src/vision.o	9cd6112dcf001a51
+32	7798	1660671302573874910	/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/build/temp.linux-x86_64-3.7/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/src/cpu/ms_deform_attn_cpu.o	51285f6acd7ec9c1
+32	21238	1660671315264765592	/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/build/temp.linux-x86_64-3.7/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/src/cuda/ms_deform_attn_cuda.o	6718f88d1ae9d63c
+32	22166	1660671316696418750	/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/build/temp.linux-x86_64-3.7/projectnb/dunlop/ooconnor/object_detection/Deformable-DETR/models/ops/src/vision.o	2760dbcd2b805270
