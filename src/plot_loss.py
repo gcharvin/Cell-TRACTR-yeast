@@ -8,8 +8,9 @@ from pathlib import Path
 import pickle
 import re
 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/results')
-folder = '20221131_final'
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
+folder = '20221203_no_dab_no_mask'
+# folder = '20221203_dab_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -99,7 +100,7 @@ colors = ['b','g','r','c']
 for midx,metric in enumerate(metrics):
     train_acc = np.nanmean(metrics_train[metric],axis=-2)
     train_acc = train_acc[:,0] / train_acc[:,1]
-    val_acc = np.nanmean(metrics_train[metric],axis=-2)
+    val_acc = np.nanmean(metrics_val[metric],axis=-2)
     val_acc = val_acc[:,0] / val_acc[:,1]
     ax.plot(np.arange(1,epochs+1),train_acc, color = colors[midx],label='train_' + metric)
     ax.plot(np.arange(1,epochs+1),val_acc, '--', color = colors[midx],label='val_' + metric)

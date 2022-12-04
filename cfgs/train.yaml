@@ -46,6 +46,8 @@ num_queries: 30
 pre_norm: false
 dec_n_points: 4
 enc_n_points: 4
+# DAB-DETR
+use_dab: false
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
@@ -66,7 +68,7 @@ multi_frame_attention_separate_encoder: true
 merge_frame_features: true
 overflow_boxes: true
 # Segmentation
-masks: true
+masks: false
 # Matcher
 # Class coefficient in the matching cost
 set_cost_class: 2.0
@@ -113,7 +115,7 @@ img_transform:
   val_width: 800
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/object_detection/trackformer_2d/results
+output_dir: /projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results
 # device to use for training / testing
 device: cuda
 seed: 42

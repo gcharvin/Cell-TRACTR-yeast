@@ -52,6 +52,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
+        dict_shape = metrics_dict['loss_ce'].shape
+        for metrics_dict_key in metrics_dict.keys():
+            assert metrics_dict[metrics_dict_key].shape[:2] == dict_shape, 'Metrics needed to be added per epoch'
+
+
         if i in ids and (epoch % 5 == 0 or epoch == 1):
             utils.plot_results(outputs, prev_outputs, targets,samples,savepath = args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png')
 

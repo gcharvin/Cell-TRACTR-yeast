@@ -933,7 +933,7 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
 
         for weight_dict_key in weight_dict.keys(): # If there are empty chambers in both samples, we need to manually add nan to standarize it
             if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
-                metrics_dict['weight_dict_key'] = np.array(np.nan)[None,None]
+                metrics_dict[weight_dict_key] = np.array(np.nan)[None,None]
         
     else:
         for metrics_key in acc_dict.keys():
@@ -945,7 +945,7 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
 
         for weight_dict_key in weight_dict.keys(): # If there are empty chambers in both samples, we need to manually add nan to standarize it
             if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
-                metrics_dict[loss_dict_key] = np.concatenate((metrics_dict[loss_dict_key],np.array(np.nan)[None,None]),axis=1)
+                metrics_dict[weight_dict_key] = np.concatenate((metrics_dict[weight_dict_key],np.array(np.nan)[None,None]),axis=1)
 
     return metrics_dict
 

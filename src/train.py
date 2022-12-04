@@ -21,17 +21,17 @@ from trackformer.models import build_model
 ex = sacred.Experiment('train')
 # ex.add_config('../cfgs/train.yaml')
 # ex.add_config(str(Path('../cfgs/train.yaml').resolve()))
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/cfgs/train.yaml')
-ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/cfgs/train_deformable.yaml')
+ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train.yaml')
+ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
 
 #### TODO 
 # Need to properly update data augmentations so that the multiple frames in a row will get properly flipped
 # Also only certain data augmentations for the 16 bit gt
 
 def train(args: Namespace) -> None:
-   
-    args.output_dir = Path(args.output_dir) / '20221131_final'
-    # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/results/20221020_mask_weight_target_cell_100_other_cells_20_dataaug_not_hflip_freeze_detr_2/checkpoint.pth')
+
+    args.output_dir = Path(args.output_dir) / (f'20221204_fix_bug_{"dab" if args.use_dab else "no_dab"}_{"mask" if args.masks else "no_mask"}')
+    # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/20221020_mask_weight_target_cell_100_other_cells_20_dataaug_not_hflip_freeze_detr_2/checkpoint.pth')
     args.save_model_interval = False
     # args.resume_optim = False
     # args.freeze_detr = True
