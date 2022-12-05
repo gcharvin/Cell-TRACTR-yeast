@@ -12,6 +12,7 @@ import math
 import torch
 from torch import nn
 from torch.nn.init import constant_, normal_, xavier_uniform_
+import torch.nn.functional as F
 
 from ..util.misc import inverse_sigmoid
 from .ops.modules import MSDeformAttn
@@ -24,6 +25,7 @@ class DeformableTransformer(nn.Module):
                  dropout=0.1, activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300,
+                 use_dab=False, high_dim_query_update=False, no_sine_embed=False,
                  multi_frame_attention_separate_encoder=False):
         super().__init__()
 
@@ -33,6 +35,7 @@ class DeformableTransformer(nn.Module):
         self.two_stage_num_proposals = two_stage_num_proposals
         self.num_feature_levels = num_feature_levels
         self.multi_frame_attention_separate_encoder = multi_frame_attention_separate_encoder
+        self.use_dab = use_dab
 
         enc_num_feature_levels = num_feature_levels
         if multi_frame_attention_separate_encoder:
@@ -45,7 +48,8 @@ class DeformableTransformer(nn.Module):
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points)
-        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
+        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec,
+                                                    use_dab=use_dab, d_model=d_model, high_dim_query_update=high_dim_query_update, no_sine_embed=no_sine_embed)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
@@ -55,7 +59,12 @@ class DeformableTransformer(nn.Module):
             self.pos_trans = nn.Linear(d_model * 2, d_model * 2)
             self.pos_trans_norm = nn.LayerNorm(d_model * 2)
         else:
-            self.reference_points = nn.Linear(d_model, 2)
+            if not self.use_dab:
+                self.reference_points = nn.Linear(d_model, 2)
+
+        self.high_dim_query_update = high_dim_query_update
+        if high_dim_query_update:
+            assert not self.use_dab, "use_dab must be True"
 
         self._reset_parameters()
 
@@ -66,7 +75,7 @@ class DeformableTransformer(nn.Module):
         for m in self.modules():
             if isinstance(m, MSDeformAttn):
                 m._reset_parameters()
-        if not self.two_stage:
+        if not self.two_stage and not self.use_dab:
             xavier_uniform_(self.reference_points.weight.data, gain=1.0)
             constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
@@ -197,6 +206,10 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+        elif self.use_dab:
+            reference_points = query_embed[..., self.d_model:].sigmoid() 
+            tgt = query_embed[..., :self.d_model]
+            query_embed = None
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
@@ -215,11 +228,18 @@ class DeformableTransformer(nn.Module):
             assert torch.sum(torch.isnan(prev_hs_embed)) == 0, 'Nan in track query_hs embeds'
             assert torch.sum(torch.isnan(prev_boxes)) == 0, 'Nan in track boxes'
 
-            prev_query_embed = torch.zeros_like(prev_hs_embed)
+            #### Group DETR - get rid of attn mask and do all masking on deformalbe_detr.py
+            if not self.use_dab:
+                prev_query_embed = torch.zeros_like(prev_hs_embed)
+                query_embed = torch.cat([prev_query_embed, query_embed], dim=1)
+            else:
+                num_object_queries = tgt.shape[1] 
+                num_track_queries = prev_hs_embed.shape[1]
+                num_total_queries = num_object_queries + num_track_queries
+                query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(prev_hs_embed.device)
+                query_attn_mask[:num_track_queries,num_track_queries:] = True
 
             prev_tgt = prev_hs_embed
-
-            query_embed = torch.cat([prev_query_embed, query_embed], dim=1)
             tgt = torch.cat([prev_tgt, tgt], dim=1)
 
             # reference_points = torch.cat([prev_boxes[..., :2], reference_points], dim=1)
@@ -227,6 +247,7 @@ class DeformableTransformer(nn.Module):
             reference_points = torch.cat([prev_boxes[..., :reference_points.shape[-1]], reference_points], dim=1)
 
         init_reference_out = reference_points
+
 
         # decoder
         hs, inter_references = self.decoder(
@@ -353,7 +374,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
 
-        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), key_padding_mask=query_attn_mask)[0].transpose(0, 1)
+        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), attn_mask=query_attn_mask)[0].transpose(0, 1)
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
@@ -372,7 +393,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False, use_dab=False, d_model=256, high_dim_query_update=False, no_sine_embed=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
@@ -381,9 +402,29 @@ class DeformableTransformerDecoder(nn.Module):
         self.bbox_embed = None
         self.class_embed = None
 
+        #### DAB-DETR
+        self.use_dab = use_dab
+        self.d_model = d_model
+        self.no_sine_embed = no_sine_embed
+        if use_dab:
+            self.query_scale = MLP(d_model, d_model, d_model, 2)
+            if self.no_sine_embed:
+                self.ref_point_head = MLP(4, d_model, d_model, 3)
+            else:
+                self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
+        self.high_dim_query_update = high_dim_query_update
+        if high_dim_query_update:
+            self.high_dim_query_proj = MLP(d_model, d_model, d_model, 2)
+        #### DAB-DETR
+
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_valid_ratios, src_level_start_index,
                 query_pos=None, src_padding_mask=None, query_attn_mask=None):
         output = tgt
+
+        #### DAB-DETR
+        if self.use_dab:
+            assert query_pos is None
+        #### DAB-DETR
 
         intermediate = []
         intermediate_reference_points = []
@@ -394,6 +435,22 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
+
+            #### DAB-DETR
+            if self.use_dab:
+                # import ipdb; ipdb.set_trace()
+                if self.no_sine_embed:
+                    raw_query_pos = self.ref_point_head(reference_points_input)
+                else:
+                    query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :],self.d_model) # bs, nq, d_model * 2
+                    raw_query_pos = self.ref_point_head(query_sine_embed) # bs, nq, 256
+                pos_scale = self.query_scale(output) if lid != 0 else 1
+                query_pos = pos_scale * raw_query_pos
+            if self.high_dim_query_update and lid != 0:
+                query_pos = query_pos + self.high_dim_query_proj(output) 
+            #### DAB-DETR
+
+
             output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, query_attn_mask)
             assert torch.sum(torch.isnan(output)) == 0, 'Output causing nan'
 
@@ -441,4 +498,51 @@ def build_deforamble_transformer(args):
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
         two_stage_num_proposals=args.num_queries,
-        multi_frame_attention_separate_encoder=args.multi_frame_attention and args.multi_frame_attention_separate_encoder)
+        use_dab=args.use_dab,
+        multi_frame_attention_separate_encoder=args.multi_frame_attention and args.multi_frame_attention_separate_encoder,
+        )
+
+class MLP(nn.Module):
+    """ 
+        Adapted from DAB-DETR
+        Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
+
+def gen_sineembed_for_position(pos_tensor,d_model):
+    '''Adapted from DAB-DETR'''
+    # n_query, bs, _ = pos_tensor.size()
+    # sineembed_tensor = torch.zeros(n_query, bs, 288)
+    scale = 2 * math.pi
+    dim_t = torch.arange((d_model // 2), dtype=torch.float32, device=pos_tensor.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / (d_model // 2))
+    x_embed = pos_tensor[:, :, 0] * scale
+    y_embed = pos_tensor[:, :, 1] * scale
+    pos_x = x_embed[:, :, None] / dim_t
+    pos_y = y_embed[:, :, None] / dim_t
+    pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+    pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
+    if pos_tensor.size(-1) == 2:
+        pos = torch.cat((pos_y, pos_x), dim=2)
+    elif pos_tensor.size(-1) == 4:
+        w_embed = pos_tensor[:, :, 2] * scale
+        pos_w = w_embed[:, :, None] / dim_t
+        pos_w = torch.stack((pos_w[:, :, 0::2].sin(), pos_w[:, :, 1::2].cos()), dim=3).flatten(2)
+
+        h_embed = pos_tensor[:, :, 3] * scale
+        pos_h = h_embed[:, :, None] / dim_t
+        pos_h = torch.stack((pos_h[:, :, 0::2].sin(), pos_h[:, :, 1::2].cos()), dim=3).flatten(2)
+
+        pos = torch.cat((pos_y, pos_x, pos_w, pos_h), dim=2)
+    else:
+        raise ValueError("Unknown pos_tensor shape(-1):{}".format(pos_tensor.size(-1)))
+    return pos

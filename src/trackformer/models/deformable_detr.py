@@ -30,7 +30,8 @@ class DeformableDETR(DETR):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
-                 multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False):
+                 multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
+                 use_dab=True, random_refpoints_xy=False,):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -50,12 +51,27 @@ class DeformableDETR(DETR):
         self.multi_frame_encoding = multi_frame_encoding
         self.overflow_boxes = overflow_boxes
         self.num_feature_levels = num_feature_levels
+
+        self.use_dab = use_dab
+        self.random_refpoints_xy = random_refpoints_xy
+
+        ### DAB-DETR
         if not two_stage:
-            self.query_embed = nn.Embedding(num_queries, self.hidden_dim * 2)
+            if not use_dab:
+                self.query_embed = nn.Embedding(num_queries, self.hidden_dim*2)
+            else:
+                self.tgt_embed = nn.Embedding(num_queries, self.hidden_dim)
+                self.refpoint_embed = nn.Embedding(num_queries, 4)
+                if random_refpoints_xy:
+                    self.refpoint_embed.weight.data[:, :2].uniform_(0,1)
+                    self.refpoint_embed.weight.data[:, :2] = inverse_sigmoid(self.refpoint_embed.weight.data[:, :2])
+                    self.refpoint_embed.weight.data[:, :2].requires_grad = False
+        ### DAB-DETR
+
         num_channels = backbone.num_channels[-num_feature_levels:]
         if num_feature_levels > 1:
             # return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
-            # num_backbone_outs = len(backbone.strides) - 1
+            num_backbone_outs = len(backbone.strides) - 1
 
             input_proj_list = []
             for i in range(num_feature_levels):
@@ -64,12 +80,12 @@ class DeformableDETR(DETR):
                     nn.Conv2d(in_channels, self.hidden_dim, kernel_size=1),
                     nn.GroupNorm(32, self.hidden_dim),
                 ))
-            # for _ in range(num_feature_levels - num_backbone_outs):
-            #     input_proj_list.append(nn.Sequential(
-            #         nn.Conv2d(in_channels, self.hidden_dim, kernel_size=3, stride=2, padding=1),
-            #         nn.GroupNorm(32, self.hidden_dim),
-            #     ))
-            #     in_channels = self.hidden_dim
+            for _ in range(num_feature_levels - num_backbone_outs):
+                input_proj_list.append(nn.Sequential(
+                    nn.Conv2d(in_channels, self.hidden_dim, kernel_size=3, stride=2, padding=1),
+                    nn.GroupNorm(32, self.hidden_dim),
+                ))
+                in_channels = self.hidden_dim
             self.input_proj = nn.ModuleList(input_proj_list)
         else:
             self.input_proj = nn.ModuleList([
@@ -201,9 +217,24 @@ class DeformableDETR(DETR):
                     else:
                         pos_list.append(pos_l)
 
-        query_embeds = None
-        if not self.two_stage:
+        bs = src.shape[0]
+        #### Add Group-DETR here
+        #if group_object: Only want to use on frame t0 (not frame t-2 or t-1)
+            # Repeat the query embeds for use_dab and not use_dab
+            # Create attn_mask; trakc queries have already been accounted for
+        #### DAB-DETR
+        if self.two_stage:
+            assert NotImplementedError
+            query_embeds = None
+        elif self.use_dab:
+            tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)          # nq, 256
+            refanchor = self.refpoint_embed.weight.repeat(bs,1,1)      # nq, 4
+            query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
+        else:
             query_embeds = self.query_embed.weight
+        #### DAB-DETR
+
+
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
             self.transformer(src_list, mask_list, pos_list, query_embeds, targets)
 

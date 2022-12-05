@@ -206,11 +206,9 @@ class DETRTrackingBase(nn.Module):
                         target['track_ids'] = torch.cat((target['track_ids'][:target_ind_not_matched_i],torch.tensor([-1]).to(device),target['track_ids'][target_ind_not_matched_i:]))
                         target['labels'] = torch.cat((target['labels'][:target_ind_not_matched_i],torch.cat((target['labels'][target_ind_not_matched_i,:1],torch.ones(1,).long().to(device)))[None],torch.cat((target['labels'][target_ind_not_matched_i,1:],torch.ones(1,).long().to(device)))[None],target['labels'][target_ind_not_matched_i+1:]))
                         
-                        N,_,H,W = target['masks'].shape
-                        target['masks'] = torch.cat((target['masks'][:target_ind_not_matched_i],torch.cat((target['masks'][target_ind_not_matched_i,:1],torch.zeros((1,H,W)).to(device=device,dtype=torch.uint8)))[None],torch.cat((target['masks'][target_ind_not_matched_i,1:],torch.zeros((1,H,W)).to(device=device,dtype=torch.uint8)))[None],target['masks'][target_ind_not_matched_i+1:]))
-                
-                        # if 'masks' in target:
-                        #     raise Exception('Need to update for segmentation here as well')
+                        if 'masks' in target:
+                            N,_,H,W = target['masks'].shape
+                            target['masks'] = torch.cat((target['masks'][:target_ind_not_matched_i],torch.cat((target['masks'][target_ind_not_matched_i,:1],torch.zeros((1,H,W)).to(device=device,dtype=torch.uint8)))[None],torch.cat((target['masks'][target_ind_not_matched_i,1:],torch.zeros((1,H,W)).to(device=device,dtype=torch.uint8)))[None],target['masks'][target_ind_not_matched_i+1:]))
 
                         count += 1
 
