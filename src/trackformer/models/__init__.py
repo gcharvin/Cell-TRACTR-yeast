@@ -37,7 +37,8 @@ def build_model(args):
         'num_queries': args.num_queries,
         'aux_loss': args.aux_loss,
         'overflow_boxes': args.overflow_boxes,
-        'use_dab': args.use_dab}
+        'use_dab': args.use_dab,
+        'group_object': args.group_object}
 
     tracking_kwargs = {
         'track_query_false_positive_prob': args.track_query_false_positive_prob,
@@ -53,6 +54,7 @@ def build_model(args):
         transformer = build_deforamble_transformer(args)
 
         detr_kwargs['transformer'] = transformer
+        detr_kwargs['num_queries'] = args.num_queries
         detr_kwargs['num_feature_levels'] = args.num_feature_levels
         detr_kwargs['with_box_refine'] = args.with_box_refine
         detr_kwargs['two_stage'] = args.two_stage

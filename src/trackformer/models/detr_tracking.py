@@ -37,8 +37,8 @@ class DETRTrackingBase(nn.Module):
         self.eval()
         self._tracking = True
 
-    def add_track_queries_to_targets(self, targets, prev_indices, swap_prev_indices, prev_out, prev_prev_track=False, keep_all_track=False):
-
+    def add_track_queries_to_targets(self, targets, prev_indices, swap_prev_indices, prev_out, prev_prev_track=False, keep_all_track=False, group_object=False):
+    
         device = prev_out['pred_boxes'].device
 
         min_prev_target_ind = min([len(prev_ind[1]) for prev_ind in prev_indices])
@@ -49,22 +49,11 @@ class DETRTrackingBase(nn.Module):
         for i, (target, prev_ind) in enumerate(zip(targets, prev_indices)):
             prev_out_ind, prev_target_ind = prev_ind
 
-            # if self._track_query_false_negative_prob:
-            #     # random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
-            #     # prev_prev_track = False
-            #     if prev_prev_track or keep_all_track:
-            #         random_subset_mask = torch.randperm(len(prev_target_ind))
-            #     elif rand_num > 0.5:  #max number to be tracked since 
-            #         random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind]
-            #     else:
-            #         random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
-
-                    
             if prev_prev_track or keep_all_track:
                 random_subset_mask = torch.randperm(len(prev_target_ind))
             elif rand_num > 0.8:  #max number to be tracked since 
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind]
-            elif rand_num < 0.5:
+            elif rand_num < 0.5 and not group_object:
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
             else:
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind - 1]
@@ -195,6 +184,26 @@ class DETRTrackingBase(nn.Module):
             target_ind_matched_idx = target_ind_match_matrix.nonzero()[:, 1]
             target_ind_not_matched_idx = (1 - target_ind_match_matrix.sum(dim=0)).nonzero()[:,0]
 
+            if group_object:
+                target['group_object_gts'] = {}
+                group_object_gts = target['group_object_gts']
+                group_object_gts['labels'] = target['labels'].clone()
+                group_object_gts['boxes'] = target['boxes'].clone()
+                group_object_gts['empty'] = target['empty'].clone()
+
+                if 'masks' in target:
+                    group_object_gts['masks'] = target['masks'].clone()
+                count = 0
+                for b in range(len(target['boxes'])):
+                    if target['boxes'][b,-1] > 0:
+                        group_object_gts['boxes'] = torch.cat((target['boxes'][:b],torch.cat((target['boxes'][b,:4],torch.zeros(4,).to(device)))[None],torch.cat((target['boxes'][b,4:],torch.zeros(4,).to(device)))[None],target['boxes'][b+1:]))
+                        group_object_gts['labels'] = torch.cat((target['labels'][:b],torch.cat((target['labels'][b,:1],torch.ones(1,).long().to(device)))[None],torch.cat((target['labels'][b,1:],torch.ones(1,).long().to(device)))[None],target['labels'][b+1:]))
+                        
+                        if 'masks' in target:
+                            N,_,H,W = target['masks'].shape
+                            group_object_gts['masks'] = torch.cat((target['masks'][:b],torch.cat((target['masks'][b,:1],torch.zeros((1,H,W)).to(device=device,dtype=torch.uint8)))[None],torch.cat((target['masks'][b,1:],torch.zeros((1,H,W)).to(device=device,dtype=torch.uint8)))[None],target['masks'][b+1:]))
+
+                        count += 1
 
             # If there is a FN for a cell in the previous frame that divides, then the labels/boxes/masks need to be adjusted for object detection to detect the divided cells separately
             if len(target_ind_not_matched_idx) > 0:
@@ -379,10 +388,11 @@ class DETRTrackingBase(nn.Module):
 
                     prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
 
-                self.add_track_queries_to_targets(targets, prev_indices, swap_prev_indices, prev_outputs_without_aux, prev_prev_track=prev_prev_track)
+                self.add_track_queries_to_targets(targets, prev_indices, swap_prev_indices, prev_outputs_without_aux,
+                                                  prev_prev_track=prev_prev_track, group_object=self.group_object)
 
 
-        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features)
+        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object)
 
         return out, targets, features, memory, hs, prev_out
 

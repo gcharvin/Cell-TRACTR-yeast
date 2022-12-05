@@ -31,7 +31,7 @@ class DeformableDETR(DETR):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
-                 use_dab=True, random_refpoints_xy=False,):
+                 use_dab=True, random_refpoints_xy=False,group_object=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -44,6 +44,7 @@ class DeformableDETR(DETR):
             with_box_refine: iterative bounding box refinement
             two_stage: two-stage Deformable DETR
         """
+        
         super().__init__(backbone, transformer, num_classes, num_queries, aux_loss)
 
         self.merge_frame_features = merge_frame_features
@@ -51,6 +52,9 @@ class DeformableDETR(DETR):
         self.multi_frame_encoding = multi_frame_encoding
         self.overflow_boxes = overflow_boxes
         self.num_feature_levels = num_feature_levels
+        self.num_queries = num_queries
+
+        self.group_object = group_object
 
         self.use_dab = use_dab
         self.random_refpoints_xy = random_refpoints_xy
@@ -137,7 +141,7 @@ class DeformableDETR(DETR):
     #     num_backbone_outs = len(self.backbone.strides)
     #     return [self.hidden_dim, ] * num_backbone_outs
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None):
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -218,11 +222,9 @@ class DeformableDETR(DETR):
                         pos_list.append(pos_l)
 
         bs = src.shape[0]
-        #### Add Group-DETR here
-        #if group_object: Only want to use on frame t0 (not frame t-2 or t-1)
-            # Repeat the query embeds for use_dab and not use_dab
-            # Create attn_mask; trakc queries have already been accounted for
+
         #### DAB-DETR
+        query_attn_mask = None 
         if self.two_stage:
             assert NotImplementedError
             query_embeds = None
@@ -230,13 +232,40 @@ class DeformableDETR(DETR):
             tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)          # nq, 256
             refanchor = self.refpoint_embed.weight.repeat(bs,1,1)      # nq, 4
             query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
+
+            #### Group-DETR
+            groups = 1
+            if group_object:
+                query_embeds = query_embeds.repeat(1,2,1)
+                groups += 1
+
+            if targets is not None and 'track_queries_mask' in targets[0]:
+                num_track_queries = targets[0]['track_queries_mask'].sum()
+            else: 
+                num_track_queries = 0
+
+            num_total_queries = query_embeds.shape[1] + num_track_queries 
+
+            query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)
+            query_attn_mask[:num_track_queries,num_track_queries:] = True
+
+            #### Group-DETR
+            if group_object:
+                query_attn_mask[num_track_queries:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True
+                query_attn_mask[num_total_queries - self.num_queries:,:num_total_queries - self.num_queries] = True
+
         else:
             query_embeds = self.query_embed.weight
+            
+            #### Group-DETR
+            if group_object:
+                query_embeds.repeat(2,1)
+
         #### DAB-DETR
 
 
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-            self.transformer(src_list, mask_list, pos_list, query_embeds, targets)
+            self.transformer(src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask)
 
         save_references = torch.cat((init_reference[None],inter_references[...,:init_reference.shape[-1]]),axis=0)
 

@@ -9,7 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '20221203_no_dab_no_mask'
+folder = '20221204_fix_bug_no_dab_no_mask'
 # folder = '20221203_dab_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
@@ -21,6 +21,7 @@ with open(datapath / folder / 'metrics_val.pkl', 'rb') as f:
 losses = [key for key in metrics_train.keys() if 'loss' in key and not bool(re.search('\d',key))]
 metrics = [key for key in metrics_train.keys() if 'acc' in key]
 epochs = metrics_train['loss'].shape[0]
+epochs_val = metrics_train['loss'].shape[0]
 
 
 # Plot Overall Loss
@@ -48,7 +49,7 @@ for loss in losses:
     train_loss = np.nanmean(metrics_train[loss],axis=-1)
     val_loss = np.nanmean(metrics_val[loss],axis=-1)
     ax[0].plot(np.arange(1,epochs+1),train_loss,label=loss)
-    ax[1].plot(np.arange(1,epochs+1),val_loss,label=loss)
+    ax[1].plot(np.arange(1,epochs_val+1),val_loss,label=loss)
     min_y = min((min_y,min(train_loss),min(val_loss)))
     max_y = max((max_y,max(train_loss),max(val_loss)))
 
@@ -79,7 +80,7 @@ for i,loss in enumerate(losses):
             train_loss = np.nanmean(metrics_train[loss_key],axis=-1)
             val_loss = np.nanmean(metrics_val[loss_key],axis=-1)
             ax[0,i].plot(np.arange(1,epochs+1),train_loss,label=loss_key)
-            ax[1,i].plot(np.arange(1,epochs+1),val_loss,label=loss_key)
+            ax[1,i].plot(np.arange(1,epochs_val+1),val_loss,label=loss_key)
             min_y = min((min_y,min(train_loss),min(val_loss)))
             max_y = max((max_y,max(train_loss),max(val_loss)))
 
@@ -103,7 +104,7 @@ for midx,metric in enumerate(metrics):
     val_acc = np.nanmean(metrics_val[metric],axis=-2)
     val_acc = val_acc[:,0] / val_acc[:,1]
     ax.plot(np.arange(1,epochs+1),train_acc, color = colors[midx],label='train_' + metric)
-    ax.plot(np.arange(1,epochs+1),val_acc, '--', color = colors[midx],label='val_' + metric)
+    ax.plot(np.arange(1,epochs_val+1),val_acc, '--', color = colors[midx],label='val_' + metric)
 
 ax.set_xlabel('Epochs')
 ax.set_ylabel('Accuracy')

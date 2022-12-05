@@ -35,8 +35,43 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets)
 
+        if args.group_object:
+            outputs_object = {}
+
+            outputs_object['pred_logits'] = outputs['pred_logits'][:,-args.num_queries:]
+            outputs_object['pred_boxes'] = outputs['pred_boxes'][:,-args.num_queries:]
+
+            outputs['pred_logits'] = outputs['pred_logits'][:,:-args.num_queries]
+            outputs['pred_boxes'] = outputs['pred_boxes'][:,:-args.num_queries]
+
+            if args.masks:
+                outputs_object['pred_mask'] = outputs['pred_mask'][:,-args.num_queries:]
+                outputs['pred_mask'] = outputs['pred_mask'][:,:-args.num_queries] 
+
+            if 'aux_outputs' in outputs:
+                outputs_object['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
+                for lid in range(len(outputs['aux_outputs'])):
+                    outputs_object['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,-args.num_queries:]
+                    outputs_object['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,-args.num_queries:]
+
+                    outputs['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,:-args.num_queries]
+                    outputs['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,:-args.num_queries]
+
+                    if args.masks:
+                        outputs_object['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,-args.num_queries:]
+                        outputs['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,:-args.num_queries]
+
+            loss_dict_object = criterion(outputs_object, [target['group_object_gts'] for target in targets],return_bbox_track_acc=False)
+
         loss_dict, acc_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
+
+        if args.group_object:
+            loss_dict_keys = list(loss_dict.keys())
+            for loss_dict_key in loss_dict_keys:
+                loss_dict[loss_dict_key+'_object'] = loss_dict_object[loss_dict_key] 
+                weight_dict[loss_dict_key +'_object'] = weight_dict[loss_dict_key] * args.group_object_coef
+
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
 

@@ -30,7 +30,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    args.output_dir = Path(args.output_dir) / (f'20221204_fix_bug_{"dab" if args.use_dab else "no_dab"}_{"mask" if args.masks else "no_mask"}')
+    args.output_dir = Path(args.output_dir) / (f'20221204_group_{"dab" if args.use_dab else "no_dab"}_{"mask" if args.masks else "no_mask"}')
     # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/20221020_mask_weight_target_cell_100_other_cells_20_dataaug_not_hflip_freeze_detr_2/checkpoint.pth')
     args.save_model_interval = False
     # args.resume_optim = False

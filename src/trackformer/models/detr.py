@@ -40,10 +40,6 @@ class DETR(nn.Module):
 
         # match interface with deformable DETR
         self.input_proj = nn.Conv2d(backbone.num_channels[-1], self.hidden_dim, kernel_size=1)
-        # self.input_proj = nn.ModuleList([
-        #     nn.Sequential(
-        #         nn.Conv2d(backbone.num_channels[-1], self.hidden_dim, kernel_size=1)
-        #     )])
 
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -431,9 +427,7 @@ class SetCriterion(nn.Module):
 
         assert N < (self.args.num_queries + 15), f'Number of predictions ({N}) should not exceed {self.args.num_queries + 15}'
 
-        # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
-
         indices, swap_indices = threshold_indices(indices,max_ind=N)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
