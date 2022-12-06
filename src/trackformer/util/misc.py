@@ -1043,7 +1043,7 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
     for t,target in enumerate(targets):
         pred_logits = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach().cpu()
         pred_boxes = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach().cpu()
-        track_div_cell = target['track_queries_TP_mask'][target['track_queries_TP_mask']]
+        track_div_cell = target['track_div_mask'][target['track_queries_TP_mask']]
         if target['empty']: # No objects in image so it should be all zero
             acc[1] += (pred_logits > cls_thresh).sum()
             continue

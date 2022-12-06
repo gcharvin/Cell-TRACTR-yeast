@@ -137,7 +137,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, targets=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None):
         assert self.two_stage or query_embed is not None
         assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
 
@@ -190,7 +190,7 @@ class DeformableTransformer(nn.Module):
 
         # prepare input for decoder
         bs, _, c = memory.shape
-        query_attn_mask = None
+
         if self.two_stage:
             output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
@@ -232,12 +232,6 @@ class DeformableTransformer(nn.Module):
             if not self.use_dab:
                 prev_query_embed = torch.zeros_like(prev_hs_embed)
                 query_embed = torch.cat([prev_query_embed, query_embed], dim=1)
-            else:
-                num_object_queries = tgt.shape[1] 
-                num_track_queries = prev_hs_embed.shape[1]
-                num_total_queries = num_object_queries + num_track_queries
-                query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(prev_hs_embed.device)
-                query_attn_mask[:num_track_queries,num_track_queries:] = True
 
             prev_tgt = prev_hs_embed
             tgt = torch.cat([prev_tgt, tgt], dim=1)
@@ -438,7 +432,6 @@ class DeformableTransformerDecoder(nn.Module):
 
             #### DAB-DETR
             if self.use_dab:
-                # import ipdb; ipdb.set_trace()
                 if self.no_sine_embed:
                     raw_query_pos = self.ref_point_head(reference_points_input)
                 else:

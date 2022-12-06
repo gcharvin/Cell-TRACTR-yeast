@@ -9,8 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '20221203_no_dab_no_mask'
-# folder = '20221203_dab_no_mask'
+folder = '22_12_05_group__dab_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -21,13 +20,18 @@ with open(datapath / folder / 'metrics_val.pkl', 'rb') as f:
 losses = [key for key in metrics_train.keys() if 'loss' in key and not bool(re.search('\d',key))]
 metrics = [key for key in metrics_train.keys() if 'acc' in key]
 epochs = metrics_train['loss'].shape[0]
+epochs_val = metrics_val['loss'].shape[0]
+
+groups = [None]
+if 'loss_ce_object' in losses:
+    groups += ['object']
 
 
 # Plot Overall Loss
 fig,ax = plt.subplots()
 
 ax.plot(np.arange(1,epochs+1),np.nanmean(metrics_train['loss'],axis=-1),label='train')
-ax.plot(np.arange(1,epochs+1),np.nanmean(metrics_val['loss'],axis=-1),label='val')
+ax.plot(np.arange(1,epochs_val+1),np.nanmean(metrics_val['loss'],axis=-1),label='val')
 ax.set_xlabel('Epochs')
 ax.set_ylabel('Loss')
 ax.legend()
@@ -48,7 +52,7 @@ for loss in losses:
     train_loss = np.nanmean(metrics_train[loss],axis=-1)
     val_loss = np.nanmean(metrics_val[loss],axis=-1)
     ax[0].plot(np.arange(1,epochs+1),train_loss,label=loss)
-    ax[1].plot(np.arange(1,epochs+1),val_loss,label=loss)
+    ax[1].plot(np.arange(1,epochs_val+1),val_loss,label=loss)
     min_y = min((min_y,min(train_loss),min(val_loss)))
     max_y = max((max_y,max(train_loss),max(val_loss)))
 
@@ -69,29 +73,48 @@ plt.savefig(datapath / folder / 'loss_plot_train_log.png')
 
 
 losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice']] # total loss has not auxillary losses
-fig,ax = plt.subplots(2,len(losses),figsize=(15,6))
 
-min_y = np.inf
-max_y = 0
-for i,loss in enumerate(losses):
-    for loss_key in metrics_train.keys():
-        if loss in loss_key and loss != loss_key:
-            train_loss = np.nanmean(metrics_train[loss_key],axis=-1)
-            val_loss = np.nanmean(metrics_val[loss_key],axis=-1)
-            ax[0,i].plot(np.arange(1,epochs+1),train_loss,label=loss_key)
-            ax[1,i].plot(np.arange(1,epochs+1),val_loss,label=loss_key)
-            min_y = min((min_y,min(train_loss),min(val_loss)))
-            max_y = max((max_y,max(train_loss),max(val_loss)))
 
-    for d,dataset in enumerate(['train','val']):
-        ax[d,i].set_xlabel('Epochs')
-        ax[d,i].set_ylabel('Loss')
-        ax[d,i].legend()
-        ax[d,i].set_title(f'{dataset}: {loss}')
-        ax[d,i].set_ylim(min_y,max_y)
+def plot_aux_losses(losses,metrics_train,metrics_val,groups):
 
-fig.tight_layout()
-plt.savefig(datapath / folder / 'aux_loss_plot_train.png')
+    for gidx,group in enumerate(groups):
+        other_groups = [g for g in groups if g != group]
+
+        if gidx == 0:
+            losses_group = [loss for loss in losses if sum([g in loss for g in other_groups]) == 0]
+        else:
+            losses_group = [loss for loss in losses if group in loss]
+
+        fig,ax = plt.subplots(len(losses_group),2,figsize=(10,len(losses_group)*3))
+        min_y = np.inf
+        max_y = 0
+        for i,loss in enumerate(losses_group):
+            if group is not None:
+                loss = loss.replace('_' + group,'')
+
+            for loss_key in metrics_train.keys():
+                if (group is not None and group not in loss_key) or (group is None and sum([g in loss_key for g in other_groups]) > 0):
+                    continue
+                
+                if loss in loss_key and bool(re.search('\d',loss_key)):
+                    train_loss = np.nanmean(metrics_train[loss_key],axis=-1)
+                    val_loss = np.nanmean(metrics_val[loss_key],axis=-1)
+                    ax[i,0].plot(np.arange(1,epochs+1),train_loss,label=loss_key)
+                    ax[i,1].plot(np.arange(1,epochs_val+1),val_loss,label=loss_key)
+                    min_y = min((min_y,min(train_loss),min(val_loss)))
+                    max_y = max((max_y,max(train_loss),max(val_loss)))
+
+            for d,dataset in enumerate(['train','val']):
+                ax[i,d].set_xlabel('Epochs')
+                ax[i,d].set_ylabel('Loss')
+                ax[i,d].legend()
+                ax[i,d].set_title(f'{dataset}: {loss} {group if group is not None else ""}')
+                ax[i,d].set_ylim(min_y,max_y)
+
+        fig.tight_layout()
+        plt.savefig(datapath / folder / (f'aux_loss{"_" + group if group is not None else ""}_plot.png'))
+
+plot_aux_losses(losses,metrics_train,metrics_val,groups=groups)
 
 
 # Plot acc
@@ -103,7 +126,7 @@ for midx,metric in enumerate(metrics):
     val_acc = np.nanmean(metrics_val[metric],axis=-2)
     val_acc = val_acc[:,0] / val_acc[:,1]
     ax.plot(np.arange(1,epochs+1),train_acc, color = colors[midx],label='train_' + metric)
-    ax.plot(np.arange(1,epochs+1),val_acc, '--', color = colors[midx],label='val_' + metric)
+    ax.plot(np.arange(1,epochs_val+1),val_acc, '--', color = colors[midx],label='val_' + metric)
 
 ax.set_xlabel('Epochs')
 ax.set_ylabel('Accuracy')
