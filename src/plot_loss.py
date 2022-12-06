@@ -9,8 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '20221204_group_dab_no_mask'
-# folder = '20221203_dab_no_mask'
+folder = '22_12_05_group__dab_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -23,10 +22,10 @@ metrics = [key for key in metrics_train.keys() if 'acc' in key]
 epochs = metrics_train['loss'].shape[0]
 epochs_val = metrics_val['loss'].shape[0]
 
+groups = [None]
 if 'loss_ce_object' in losses:
-    group = 'object'
-else:
-    group = ''
+    groups += ['object']
+
 
 # Plot Overall Loss
 fig,ax = plt.subplots()
@@ -75,7 +74,6 @@ plt.savefig(datapath / folder / 'loss_plot_train_log.png')
 
 losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice']] # total loss has not auxillary losses
 
-groups = [None,'object']
 
 def plot_aux_losses(losses,metrics_train,metrics_val,groups):
 
