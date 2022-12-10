@@ -236,9 +236,39 @@ class DeformableTransformer(nn.Module):
             prev_tgt = prev_hs_embed
             tgt = torch.cat([prev_tgt, tgt], dim=1)
 
-            # reference_points = torch.cat([prev_boxes[..., :2], reference_points], dim=1)
-            ### ooconnor change; not sure if this is ok. reference_points.shape[-1] is 2 or 4 depending on two_stage True/Fase
             reference_points = torch.cat([prev_boxes[..., :reference_points.shape[-1]], reference_points], dim=1)
+
+            if 'dn_track' in targets[0]:
+                
+                targets_dn_track = [target['dn_track'] for target in targets]
+
+                num_dn_track = targets_dn_track[0]['boxes'].shape[0]
+
+                prev_hs_embed_dn_track = torch.stack([t['track_query_hs_embeds'] for t in targets_dn_track])
+                prev_boxes_dn_track = torch.stack([t['track_query_boxes'] for t in targets_dn_track])
+
+                assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
+                assert torch.sum(torch.isnan(prev_boxes_dn_track)) == 0, 'Nan in track boxes'
+
+                #### Group DETR - get rid of attn mask and do all masking on deformalbe_detr.py
+                if not self.use_dab:
+                    prev_query_embed_dn_track = torch.zeros_like(prev_hs_embed_dn_track)
+                    query_embed = torch.cat([query_embed,prev_query_embed_dn_track], dim=1)
+
+                prev_tgt_dn_track = prev_hs_embed_dn_track
+                tgt = torch.cat([tgt,prev_tgt_dn_track], dim=1)
+
+                reference_points = torch.cat([reference_points,prev_boxes_dn_track[..., :reference_points.shape[-1]]], dim=1)
+
+                new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=tgt.device).bool()
+
+                if query_attn_mask is not None:
+                    new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
+
+                new_query_attn_mask[:-num_dn_track,-num_dn_track:] = True
+                new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
+
+                query_attn_mask = new_query_attn_mask
 
         init_reference_out = reference_points
 

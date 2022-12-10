@@ -15,6 +15,42 @@ from tqdm import tqdm
 from .util import misc as utils
 from .datasets.transforms import Normalize,ToTensor,Compose
 
+def split_outputs(outputs,indices,new_outputs=None,update_masks=False):
+
+    if new_outputs is None:
+        new_outputs = outputs
+    new_outputs['pred_logits'] = outputs['pred_logits'][:,indices[0]:indices[1]]
+    new_outputs['pred_boxes'] = outputs['pred_boxes'][:,indices[0]:indices[1]]
+
+    if update_masks:
+        new_outputs['pred_mask'] = outputs['pred_mask'][:,indices[0]:indices[1]]
+
+    if 'aux_outputs' in outputs:
+        for lid in range(len(outputs['aux_outputs'])):
+            new_outputs['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,indices[0]:indices[1]]
+            new_outputs['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,indices[0]:indices[1]]
+
+            if update_masks:
+                new_outputs['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,indices[0]:indices[1]]
+
+    return new_outputs
+
+def calc_loss_for_training_methods(training_method:str,
+                                   outputs,
+                                   groups,
+                                   targets,
+                                   criterion,
+                                   masks=False):
+    outputs_TM = {}
+    outputs_TM['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
+
+    groups.append(groups[-1] + targets[0][training_method]['num_queries'])
+
+    outputs_TM = split_outputs(outputs,groups[-2:],outputs_TM,update_masks=masks)
+
+    loss_dict_TM = criterion(outputs_TM, [target[training_method] for target in targets],return_bbox_track_acc=False)
+
+    return outputs_TM, loss_dict_TM, groups
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postprocessors,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -35,42 +71,32 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets)
 
-        if args.group_object:
-            outputs_object = {}
+        training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
-            outputs_object['pred_logits'] = outputs['pred_logits'][:,-args.num_queries:]
-            outputs_object['pred_boxes'] = outputs['pred_boxes'][:,-args.num_queries:]
+        meta_data = {}
+    
+        groups = [0]
+        groups.append(groups[-1] + len(targets[0]['track_queries_mask']))
 
-            outputs['pred_logits'] = outputs['pred_logits'][:,:-args.num_queries]
-            outputs['pred_boxes'] = outputs['pred_boxes'][:,:-args.num_queries]
+        for training_method in training_methods:
+            meta_data[training_method] = {}
+            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, args.masks)
 
-            if args.masks:
-                outputs_object['pred_mask'] = outputs['pred_mask'][:,-args.num_queries:]
-                outputs['pred_mask'] = outputs['pred_mask'][:,:-args.num_queries] 
+            meta_data[training_method]['outputs'] = outputs_TM
+            meta_data[training_method]['loss_dict'] = loss_dict_TM
 
-            if 'aux_outputs' in outputs:
-                outputs_object['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
-                for lid in range(len(outputs['aux_outputs'])):
-                    outputs_object['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,-args.num_queries:]
-                    outputs_object['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,-args.num_queries:]
+        outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
 
-                    outputs['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,:-args.num_queries]
-                    outputs['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,:-args.num_queries]
-
-                    if args.masks:
-                        outputs_object['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,-args.num_queries:]
-                        outputs['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,:-args.num_queries]
-
-            loss_dict_object = criterion(outputs_object, [target['group_object_gts'] for target in targets],return_bbox_track_acc=False)
 
         loss_dict, acc_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
-        if args.group_object:
-            loss_dict_keys = list(loss_dict.keys())
+        loss_dict_keys = list(loss_dict.keys())
+
+        for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
-                loss_dict[loss_dict_key+'_object'] = loss_dict_object[loss_dict_key] 
-                weight_dict[loss_dict_key +'_object'] = weight_dict[loss_dict_key] * args.group_object_coef
+                loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
+                weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
@@ -93,7 +119,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
 
         if i in ids and (epoch % 5 == 0 or epoch == 1):
-            utils.plot_results(outputs, prev_outputs, targets,samples,savepath = args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png')
+            utils.plot_results(outputs, prev_outputs, targets,samples, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
@@ -119,42 +145,31 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets)
 
-        if args.group_object:
-            outputs_object = {}
+        training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
-            outputs_object['pred_logits'] = outputs['pred_logits'][:,-args.num_queries:]
-            outputs_object['pred_boxes'] = outputs['pred_boxes'][:,-args.num_queries:]
+        meta_data = {}
 
-            outputs['pred_logits'] = outputs['pred_logits'][:,:-args.num_queries]
-            outputs['pred_boxes'] = outputs['pred_boxes'][:,:-args.num_queries]
+        groups = [0]
+        groups.append(groups[-1] + len(targets[0]['track_queries_mask']))
 
-            if args.masks:
-                outputs_object['pred_mask'] = outputs['pred_mask'][:,-args.num_queries:]
-                outputs['pred_mask'] = outputs['pred_mask'][:,:-args.num_queries] 
+        for training_method in training_methods:
+            meta_data[training_method] = {}
+            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, args.masks)
 
-            if 'aux_outputs' in outputs:
-                outputs_object['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
-                for lid in range(len(outputs['aux_outputs'])):
-                    outputs_object['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,-args.num_queries:]
-                    outputs_object['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,-args.num_queries:]
+            meta_data[training_method]['outputs'] = outputs_TM
+            meta_data[training_method]['loss_dict'] = loss_dict_TM
 
-                    outputs['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,:-args.num_queries]
-                    outputs['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,:-args.num_queries]
-
-                    if args.masks:
-                        outputs_object['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,-args.num_queries:]
-                        outputs['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,:-args.num_queries]
-
-            loss_dict_object = criterion(outputs_object, [target['group_object_gts'] for target in targets],return_bbox_track_acc=False)
+        outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
 
         loss_dict, acc_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
-        if args.group_object:
-            loss_dict_keys = list(loss_dict.keys())
+        loss_dict_keys = list(loss_dict.keys())
+
+        for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
-                loss_dict[loss_dict_key+'_object'] = loss_dict_object[loss_dict_key] 
-                weight_dict[loss_dict_key +'_object'] = weight_dict[loss_dict_key] * args.group_object_coef
+                loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
+                weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
@@ -163,7 +178,7 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
         if i in ids and (epoch % 5 == 0 or epoch == 1) and train:
-            utils.plot_results(outputs, prev_outputs, targets,samples,savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png')
+            utils.plot_results(outputs, prev_outputs, targets,samples, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
@@ -391,7 +406,11 @@ def run_pipeline(model, fps, device, output_dir, args):
                             boxes = boxes[track_ind]
 
                             img_ref_box = np.copy(np.array(img))
-                            for ridx,(x,y) in enumerate(boxes):
+                            for ridx in range(boxes.shape[0]):
+                                if args.use_dab:
+                                    x,y,w,h = boxes[ridx]
+                                else:
+                                    x,y - boxes[ridx]
 
                                 if not(div_track[ridx-1] and  div_track[ridx]):
                                     img_ref_box = cv2.circle(img_ref_box, (int(x*target_size[1]),int(y*target_size[0])), radius=1, color=color[ridx], thickness=-1)
@@ -501,7 +520,11 @@ def run_pipeline(model, fps, device, output_dir, args):
 
                 if previmg is not None and track:
                     ref_pts = references[0,0]
-                    for ridx,(x,y) in enumerate(ref_pts):
+                    for ridx in range(ref_pts.shape[0]):
+                        if args.use_dab:
+                            x,y,w,h = ref_pts[ridx]
+                        else:
+                            x,y = ref_pts[ridx]
 
                         if ridx < ref_pts.shape[0] - args.num_queries:
                             color = (255,0,0)

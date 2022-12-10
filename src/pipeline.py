@@ -19,20 +19,24 @@ from trackformer.util.misc import nested_dict_to_namespace
 
 ex = sacred.Experiment('train')
 # ex.add_config('../cfgs/train.yaml')
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/cfgs/train.yaml')
-ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/cfgs/train_deformable.yaml')
+ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train.yaml')
+ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
 
 def train(args: Namespace) -> None:
 
-    modelname = '20221130_updated_metrics'
+    modelname = '221208_dn_track_dab_no_mask'
+
+    args.dn_track = False
+    args.dn_object = False
+    args.group_object = False
    
     args.output_dir = Path(args.output_dir) / modelname
     print(args.output_dir)
     args.save_model_interval = False
     args.eval_only = True
-    args.resume = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/results') / modelname / 'checkpoint.pth'
+    args.resume = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname / 'checkpoint.pth'
     
-    datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells/predictions/2022-04-24_TrainingSet8/img')
+    datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/predictions/2022-04-24_TrainingSet8/img')
     fps = sorted(list((datapath).glob('*.png')))
 
     print(args)

@@ -47,8 +47,15 @@ pre_norm: false
 dec_n_points: 4
 enc_n_points: 4
 # DAB-DETR
-use_dab: true
-group_object: true
+use_dab: false
+group_object: false
+dn_track: false
+dn_track_l1: 0.1
+dn_track_l2: 0.05
+dn_object: false
+dn_label: 0.3
+dn_object_l1: 0.2
+dn_object_l2: 0.1
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
@@ -82,6 +89,8 @@ set_cost_giou: 2.0
 aux_loss: true
 return_intermediate_masks: false
 group_object_coef: 1.0
+dn_object_coef: 1.0
+dn_track_coef: 1.0
 mask_loss_coef: 25.0
 mask_weight_cells_coef: 1 #2.0
 mask_weight_target_cell_coef: 10.0
