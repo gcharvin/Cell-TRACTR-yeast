@@ -31,7 +31,7 @@ class DeformableDETR(DETR):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,device,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
-                 use_dab=True, random_refpoints_xy=False,group_object=False, dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0):
+                 use_dab=True, random_refpoints_xy=False,group_object=False, dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0, refine_object_queries=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -61,6 +61,11 @@ class DeformableDETR(DETR):
 
         self.use_dab = use_dab
         self.random_refpoints_xy = random_refpoints_xy
+
+        self.refine_object_queries = refine_object_queries
+
+        if self.refine_object_queries:
+            self.object_embedding = nn.Embedding(1,self.hidden_dim)
 
         ### DAB-DETR
         if not two_stage:
@@ -244,7 +249,9 @@ class DeformableDETR(DETR):
             assert NotImplementedError
             query_embeds = None
         elif self.use_dab:
-            tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)          # nq, 256
+            tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)      # nq, 256
+            if self.refine_object_queries:
+                tgt_embed += self.object_embedding.weight
             refanchor = self.refpoint_embed.weight.repeat(bs,1,1)      # nq, 4
             query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
 
@@ -261,7 +268,7 @@ class DeformableDETR(DETR):
             num_total_queries = query_embeds.shape[1] + num_track_queries 
 
             query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)
-            query_attn_mask[:num_track_queries,num_track_queries:] = True
+            #query_attn_mask[:num_track_queries,num_track_queries:] = True
 
             #### Group-DETR
             if group_object:

@@ -47,7 +47,7 @@ pre_norm: false
 dec_n_points: 4
 enc_n_points: 4
 # DAB-DETR
-use_dab: false
+use_dab: true
 group_object: false
 dn_track: false
 dn_track_l1: 0.1
@@ -56,6 +56,9 @@ dn_object: false
 dn_label: 0.3
 dn_object_l1: 0.2
 dn_object_l2: 0.1
+# Embeddings to differentiate object vs track queries
+refine_track_queries: true
+refine_object_queries: true
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`

@@ -42,7 +42,8 @@ def build_model(args):
         'group_object': args.group_object,
         'dn_object_l1': args.dn_object_l1,
         'dn_object_l2': args.dn_object_l2,
-        'dn_label': args.dn_label}
+        'dn_label': args.dn_label,
+        'refine_object_queries': args.refine_object_queries}
 
     tracking_kwargs = {
         'track_query_false_positive_prob': args.track_query_false_positive_prob,
@@ -52,7 +53,8 @@ def build_model(args):
         'dn_track': args.dn_track,
         'dn_track_l1': args.dn_track_l1,
         'dn_track_l2': args.dn_track_l2,
-        'dn_object': args.dn_object,}
+        'dn_object': args.dn_object,
+        'refine_track_queries': args.refine_track_queries}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,

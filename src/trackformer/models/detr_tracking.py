@@ -23,7 +23,8 @@ class DETRTrackingBase(nn.Module):
                  dn_track = False,
                  dn_track_l1 = 0,
                  dn_track_l2 = 0,
-                 dn_object = False):
+                 dn_object = False,
+                 refine_track_queries = False):
         self._matcher = matcher
         self._track_query_false_positive_prob = track_query_false_positive_prob
         self._track_query_false_negative_prob = track_query_false_negative_prob
@@ -32,6 +33,10 @@ class DETRTrackingBase(nn.Module):
         self.dn_track_l1 = dn_track_l1
         self.dn_track_l2 = dn_track_l2
         self.dn_object = dn_object
+
+        self.refine_track_queries = refine_track_queries
+        if self.refine_track_queries:
+            self.track_embedding = nn.Embedding(1,self.hidden_dim)
 
         self._tracking = False
 
@@ -397,7 +402,10 @@ class DETRTrackingBase(nn.Module):
 
             # set prev frame info
 
-            target['track_query_hs_embeds'] = prev_out['hs_embed'][i, target['prev_ind'][0]]
+            if self.refine_track_queries:
+                target['track_query_hs_embeds'] = prev_out['hs_embed'][i, target['prev_ind'][0]] + self.track_embedding.weight
+            else:
+                target['track_query_hs_embeds'] = prev_out['hs_embed'][i, target['prev_ind'][0]] 
 
             boxes = prev_out['pred_boxes'].detach()[i, target['prev_ind'][0]]
 
