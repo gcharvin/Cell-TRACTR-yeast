@@ -54,8 +54,7 @@ def build_model(args):
         'dn_track_l1': args.dn_track_l1,
         'dn_track_l2': args.dn_track_l2,
         'dn_object': args.dn_object,
-        'refine_track_queries': args.refine_track_queries,
-        'refine_division_embeddings': args.refine_division_embeddings,}
+        'refine_div_track_queries': args.refine_div_track_queries}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,

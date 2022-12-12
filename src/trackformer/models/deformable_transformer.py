@@ -26,7 +26,8 @@ class DeformableTransformer(nn.Module):
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300,
                  use_dab=False, high_dim_query_update=False, no_sine_embed=False,
-                 multi_frame_attention_separate_encoder=False):
+                 multi_frame_attention_separate_encoder=False, 
+                 refine_track_queries=False, refine_div_track_queries=False):
         super().__init__()
 
         self.d_model = d_model
@@ -36,6 +37,15 @@ class DeformableTransformer(nn.Module):
         self.num_feature_levels = num_feature_levels
         self.multi_frame_attention_separate_encoder = multi_frame_attention_separate_encoder
         self.use_dab = use_dab
+
+        self.refine_track_queries = refine_track_queries
+        self.refine_div_track_queries = refine_div_track_queries
+
+        if self.refine_track_queries:
+            self.track_embedding = nn.Embedding(1,self.hidden_dim)
+
+        if self.refine_div_track_queries:
+            self.div_track_embedding = nn.Embedding(2,self.hidden_dim)
 
         enc_num_feature_levels = num_feature_levels
         if multi_frame_attention_separate_encoder:
@@ -244,11 +254,25 @@ class DeformableTransformer(nn.Module):
 
                 num_dn_track = targets_dn_track[0]['boxes'].shape[0]
 
-                prev_hs_embed_dn_track = torch.stack([t['track_query_hs_embeds'] for t in targets_dn_track])
+                prev_hs_embed_dn_track = [t['track_query_hs_embeds'] for t in targets_dn_track]
                 prev_boxes_dn_track = torch.stack([t['track_query_boxes'] for t in targets_dn_track])
+
+                if self.refine_div_track_queries:
+                    # We want to inject noise into the divided cells
+                    # I randomly flip because I don't want to memorize
+
+                    for tidx,target in enumerate(targets):
+                        rand_nb = torch.randint(2,(1,))[0]
+                        prev_hs_embed_dn_track[tidx][torch.where(target['tgt_div_ind'] == 1)] += self.div_track_embedding.weight[rand_nb]
+                        prev_hs_embed_dn_track[tidx][torch.where(target['tgt_div_ind'] == 2)] += self.div_track_embedding.weight[1 - rand_nb]
+
+                prev_hs_embed_dn_track = torch.stack(prev_hs_embed_dn_track)
 
                 assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
                 assert torch.sum(torch.isnan(prev_boxes_dn_track)) == 0, 'Nan in track boxes'
+
+                if self.refine_track_queries:
+                    prev_hs_embed_dn_track += self.track_embedding.weight
 
                 #### Group DETR - get rid of attn mask and do all masking on deformalbe_detr.py
                 if not self.use_dab:
