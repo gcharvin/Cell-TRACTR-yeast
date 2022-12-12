@@ -24,7 +24,9 @@ class DETRTrackingBase(nn.Module):
                  dn_track_l1 = 0,
                  dn_track_l2 = 0,
                  dn_object = False,
-                 refine_track_queries = False):
+                 refine_track_queries = False,
+                 refine_division_embeddings = False,):
+
         self._matcher = matcher
         self._track_query_false_positive_prob = track_query_false_positive_prob
         self._track_query_false_negative_prob = track_query_false_negative_prob
@@ -33,13 +35,17 @@ class DETRTrackingBase(nn.Module):
         self.dn_track_l1 = dn_track_l1
         self.dn_track_l2 = dn_track_l2
         self.dn_object = dn_object
+        self.refine_division_embeddings = refine_division_embeddings
 
-        if self.dn_object:
+        if self.dn_track:
             self.dn_track_embedding = nn.Embedding(1,self.hidden_dim)
 
         self.refine_track_queries = refine_track_queries
         if self.refine_track_queries:
             self.track_embedding = nn.Embedding(1,self.hidden_dim)
+
+        if self.refine_division_embeddings:
+            self.division_embeddings = nn.Embedding(2,self.hidden_dim)
 
         self._tracking = False
 
@@ -97,6 +103,9 @@ class DETRTrackingBase(nn.Module):
             new_prev_target_ind = torch.zeros((prev_input_boxes.shape[0]))
             tgt_div_mask = torch.zeros((prev_input_boxes.shape[0])).bool()
 
+            if self.refine_division_embeddings:
+                tgt_div_ind = torch.zeros((prev_input_boxes.shape[0])).long()
+
             count = 0
             div = 0
             for i, prev_output_box in enumerate(prev_output_boxes):
@@ -122,6 +131,9 @@ class DETRTrackingBase(nn.Module):
                     new_prev_target_ind[count+1] = box_input_div_ind
                     tgt_div_mask[count] = True
                     tgt_div_mask[count+1] = True
+                    if self.refine_division_embeddings:
+                        tgt_div_ind[count] = 1
+                        tgt_div_ind[count+1] = 2
                     count += 2
                     prev_out_ind = torch.cat((prev_out_ind[:i+div],prev_out_ind[i+div:i+div+1],prev_out_ind[i+div:]))
                     div += 1
@@ -131,6 +143,9 @@ class DETRTrackingBase(nn.Module):
             assert len(prev_out_ind) == len(new_prev_target_ind)
             target['prev_ind'] = [prev_out_ind,new_prev_target_ind.long()]
             target['tgt_div_masks'] = tgt_div_mask
+
+            if self.refine_division_embeddings:
+                target['tgt_div_ind'] = tgt_div_ind
 
     def calc_num_FPs(self,targets,return_FPs=False):
 
@@ -189,6 +204,11 @@ class DETRTrackingBase(nn.Module):
             random_false_out_ind.append(random_false_out_idx)
 
         target['prev_ind'][0] = torch.tensor(target['prev_ind'][0].tolist() + random_false_out_ind).long()
+
+        target['rand_FP_mask'] = torch.cat([
+            torch.zeros_like(target['target_ind_matching']).bool().to(self.device),
+            torch.tensor([True, ] * len(random_false_out_ind)).bool().to(self.device)
+        ])
 
         target['target_ind_matching'] = torch.cat([
             target['target_ind_matching'],
@@ -288,6 +308,7 @@ class DETRTrackingBase(nn.Module):
                 # match track ids between frames
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 dn_track['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
+                #dn_track['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['dn_track']['num_FPs'])).bool().to(self.device)))
                 dn_track['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
             prev_track_ids = track_ids[target['prev_ind'][1]]
@@ -295,6 +316,7 @@ class DETRTrackingBase(nn.Module):
             # match track ids between frames
             target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
             target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
+            target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
             target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
             target_ind_not_matched_idx = (1 - target_ind_match_matrix.sum(dim=0)).nonzero()[:,0]
 
@@ -323,7 +345,6 @@ class DETRTrackingBase(nn.Module):
                         
                         self.update_target(target,target_ind_not_matched_i)
                         count += 1
-
 
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
@@ -368,7 +389,7 @@ class DETRTrackingBase(nn.Module):
                 dn_track['track_queries_fal_pos_mask'][~dn_track['target_ind_matching']] = True      
 
                 # dn_track['track_query_hs_embeds'] = prev_out['hs_embed'][i, dn_track['prev_ind'][0]]
-                dn_track['track_query_hs_embeds'] = self.dn_track_embedding.weight.repeat(len(dn_track['prev_ind']),1)
+                dn_track['track_query_hs_embeds'] = self.dn_track_embedding.weight.repeat(len(dn_track['prev_ind'][0]),1)
 
                 boxes = prev_out['pred_boxes'].detach()[i, dn_track['prev_ind'][0]]
 
@@ -410,6 +431,16 @@ class DETRTrackingBase(nn.Module):
                 target['track_query_hs_embeds'] = prev_out['hs_embed'][i, target['prev_ind'][0]] + self.track_embedding.weight
             else:
                 target['track_query_hs_embeds'] = prev_out['hs_embed'][i, target['prev_ind'][0]] 
+
+            if prev_prev_track and self.refine_division_embeddings:
+                assert 'tgt_div_ind' in target
+
+                # We want to inject noise into the divided cells
+                # I randomly flip because I don't want to memorize
+                rand_nb = torch.randint(2,(1,))[0]
+
+                target['track_query_hs_embeds'][torch.where(target['tgt_div_ind'] == 1)] += self.division_embeddings.weight[rand_nb]
+                target['track_query_hs_embeds'][torch.where(target['tgt_div_ind'] == 2)] += self.division_embeddings.weight[1 - rand_nb]
 
             boxes = prev_out['pred_boxes'].detach()[i, target['prev_ind'][0]]
 

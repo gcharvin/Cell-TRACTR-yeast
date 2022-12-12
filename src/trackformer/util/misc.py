@@ -1340,15 +1340,33 @@ def calc_bbox_acc(outputs,targets, indices, cls_thresh = 0.5, iou_thresh = 0.75)
         return torch.zeros_like(acc), acc
 
 def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
+    num_queries = (~targets[0]['track_queries_mask']).sum()
     acc = torch.zeros((2),dtype=torch.int32)
     div_acc = torch.zeros((2),dtype=torch.int32)
     track_div_cell_acc = torch.zeros((2),dtype=torch.int32)
+    cells_leaving_acc = torch.zeros((2,),dtype=torch.int32)
+    rand_FP_acc = torch.zeros((2,),dtype=torch.int32)
     for t,target in enumerate(targets):
         pred_logits = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach().cpu()
         pred_boxes = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach().cpu()
         track_div_cell = target['track_div_mask'][target['track_queries_TP_mask']]
-        if target['empty']: # No objects in image so it should be all zero
-            acc[1] += (pred_logits > cls_thresh).sum()
+
+        assert 'cells_leaving_mask' in target
+
+        # Specifically measures accuracy for cells leaving the frame; ground truth is always 0
+        cell_leaving_pred_logits = outputs['pred_logits'][t][:-num_queries][target['cells_leaving_mask']].sigmoid().detach().cpu()
+        sample_acc = torch.tensor([(cell_leaving_pred_logits[:,0] < cls_thresh).sum(),cell_leaving_pred_logits.shape[0]])
+        cells_leaving_acc += sample_acc
+        acc += sample_acc
+
+        # Specifically measures accuracy for the random generated FP track queries; ground truth is always 0
+        if 'rand_FP_mask' in target:
+            FP_pred_logits = outputs['pred_logits'][t][:-num_queries][target['rand_FP_mask']].sigmoid().detach().cpu()
+            sample_acc = torch.tensor([(FP_pred_logits[:,0] < cls_thresh).sum(),FP_pred_logits.shape[0]])
+            rand_FP_acc += sample_acc
+            acc += sample_acc
+
+        if target['empty']: # No objects to track
             continue
 
         box_matching = target['track_query_match_ids']
@@ -1358,7 +1376,7 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
 
         for p,pred_logit in enumerate(pred_logits):
             if pred_logit[0] < cls_thresh:
-                acc[1] += 1
+                # acc[1] += 1  # error having this here
                 if track_div_cell[p]:
                     track_div_cell_acc[1] += 1
 
@@ -1413,4 +1431,4 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
         FPs = outputs['pred_logits'][t][~target['track_queries_TP_mask'] * target['track_queries_mask']].sigmoid().detach().cpu()
         acc[1] += (FPs > cls_thresh).sum()
 
-    return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None]
+    return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None], cells_leaving_acc[None,None], rand_FP_acc[None,None]

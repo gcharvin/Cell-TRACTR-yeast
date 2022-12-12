@@ -43,7 +43,7 @@ def build_model(args):
         'dn_object_l1': args.dn_object_l1,
         'dn_object_l2': args.dn_object_l2,
         'dn_label': args.dn_label,
-        'refine_object_queries': args.refine_object_queries}
+        'refine_object_queries': args.refine_object_queries,}
 
     tracking_kwargs = {
         'track_query_false_positive_prob': args.track_query_false_positive_prob,
@@ -54,7 +54,8 @@ def build_model(args):
         'dn_track_l1': args.dn_track_l1,
         'dn_track_l2': args.dn_track_l2,
         'dn_object': args.dn_object,
-        'refine_track_queries': args.refine_track_queries}
+        'refine_track_queries': args.refine_track_queries,
+        'refine_division_embeddings': args.refine_division_embeddings,}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,

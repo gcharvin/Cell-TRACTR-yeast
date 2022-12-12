@@ -455,10 +455,12 @@ class SetCriterion(nn.Module):
             metrics['overall_object_det_acc'] = bbox_det_only_acc + bbox_FN_acc
             metrics['no_tracking_object_det_acc'] = bbox_det_only_acc
             metrics['untracked_object_det_acc'] = bbox_FN_acc
-            track_acc, div_acc, track_post_div_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+            track_acc, div_acc, track_post_div_acc, cells_leaving_acc, rand_FP_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
             metrics['overall_track_acc'] = track_acc
             metrics['divisions_track_acc'] = div_acc
             metrics['post_division_track_acc'] = track_post_div_acc
+            metrics['cells_leaving_track_acc'] = cells_leaving_acc
+            metrics['rand_FP_track_acc'] = rand_FP_acc
 
         # Compute all the requested losses
         losses = {}

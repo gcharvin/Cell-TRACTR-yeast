@@ -59,6 +59,7 @@ dn_object_l2: 0.1
 # Embeddings to differentiate object vs track queries
 refine_track_queries: true
 refine_object_queries: true
+refine_division_embeddings: false
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
@@ -99,11 +100,11 @@ mask_weight_cells_coef: 1 #2.0
 mask_weight_target_cell_coef: 10.0
 dice_loss_coef: 2.0
 loss_coef: 1.0 # This is just a formality
-cls_loss_coef: 20.0
+cls_loss_coef: 1.0 #20.0
 bbox_loss_coef: 5.0
-giou_loss_coef: 2
-div_loss_coef: 10
-track_div_loss_coef: 10
+giou_loss_coef: 2.0
+div_loss_coef: 2.0 #10
+track_div_loss_coef: 2.0 #10
 object_queies_loss_coef: 1
 # Relative classification weight of the no-object class
 eos_coef: 0.1
