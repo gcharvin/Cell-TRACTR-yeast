@@ -34,6 +34,9 @@ class DETRTrackingBase(nn.Module):
         self.dn_track_l2 = dn_track_l2
         self.dn_object = dn_object
 
+        if self.dn_object:
+            self.dn_track_embedding = nn.Embedding(1,self.hidden_dim)
+
         self.refine_track_queries = refine_track_queries
         if self.refine_track_queries:
             self.track_embedding = nn.Embedding(1,self.hidden_dim)
@@ -364,7 +367,8 @@ class DETRTrackingBase(nn.Module):
                 dn_track['track_queries_fal_pos_mask'] = torch.zeros_like(dn_track['target_ind_matching']).to(self.device).bool()
                 dn_track['track_queries_fal_pos_mask'][~dn_track['target_ind_matching']] = True      
 
-                dn_track['track_query_hs_embeds'] = prev_out['hs_embed'][i, dn_track['prev_ind'][0]]
+                # dn_track['track_query_hs_embeds'] = prev_out['hs_embed'][i, dn_track['prev_ind'][0]]
+                dn_track['track_query_hs_embeds'] = self.dn_track_embedding.weight.repeat(len(dn_track['prev_ind']),1)
 
                 boxes = prev_out['pred_boxes'].detach()[i, dn_track['prev_ind'][0]]
 
