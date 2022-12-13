@@ -28,10 +28,10 @@ def _get_clones(module, N):
 
 class DeformableDETR(DETR):
     """ This is the Deformable DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
+    def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,device,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
-                 use_dab=True, random_refpoints_xy=False,group_object=False):
+                 use_dab=True, random_refpoints_xy=False,group_object=False, dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0, refine_object_queries=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -45,8 +45,7 @@ class DeformableDETR(DETR):
             two_stage: two-stage Deformable DETR
         """
         
-        super().__init__(backbone, transformer, num_classes, num_queries, aux_loss)
-
+        super().__init__(backbone, transformer, num_classes, num_queries, device, aux_loss)
         self.merge_frame_features = merge_frame_features
         self.multi_frame_attention = multi_frame_attention
         self.multi_frame_encoding = multi_frame_encoding
@@ -55,9 +54,18 @@ class DeformableDETR(DETR):
         self.num_queries = num_queries
 
         self.group_object = group_object
+        self.dn_object_l1 = dn_object_l1
+        self.dn_object_l2 = dn_object_l2
+
+        self.dn_label = dn_label
 
         self.use_dab = use_dab
         self.random_refpoints_xy = random_refpoints_xy
+
+        self.refine_object_queries = refine_object_queries
+
+        if self.refine_object_queries:
+            self.object_embedding = nn.Embedding(1,self.hidden_dim)
 
         ### DAB-DETR
         if not two_stage:
@@ -71,6 +79,11 @@ class DeformableDETR(DETR):
                     self.refpoint_embed.weight.data[:, :2] = inverse_sigmoid(self.refpoint_embed.weight.data[:, :2])
                     self.refpoint_embed.weight.data[:, :2].requires_grad = False
         ### DAB-DETR
+
+        ### DN-DETR --> dn_objects
+        # This provides the content queries for the denoised objects. Only used during training
+        self.label_enc = nn.Embedding(num_classes + 10, self.hidden_dim) # according to DN-DETR you can just add extra unused classes here
+        ### DN-DETR --> dn_objects
 
         num_channels = backbone.num_channels[-num_feature_levels:]
         if num_feature_levels > 1:
@@ -109,8 +122,7 @@ class DeformableDETR(DETR):
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
 
-        # if two-stage, the last class_embed and bbox_embed is for
-        # region proposal generation
+        # if two-stage, the last class_embed and bbox_embed is for region proposal generation
         num_pred = transformer.decoder.num_layers
         if two_stage:
             num_pred += 1
@@ -136,12 +148,20 @@ class DeformableDETR(DETR):
             self.merge_features = nn.Conv2d(self.hidden_dim * 2, self.hidden_dim, kernel_size=1)
             self.merge_features = _get_clones(self.merge_features, num_feature_levels)
 
+    def add_noise_to_boxes(self,boxes,l_1,l_2,clamp=True):
+        noise = torch.rand_like(boxes) * 2 - 1
+        boxes[..., :2] += boxes[..., 2:] * noise[..., :2] * l_1
+        boxes[..., 2:] *= 1 + l_2 * noise[..., 2:]
+        if clamp:
+            boxes = torch.clamp(boxes,0,1)
+        return boxes
+    
     # def fpn_channels(self):
     #     """ Returns FPN channels. """
     #     num_backbone_outs = len(self.backbone.strides)
     #     return [self.hidden_dim, ] * num_backbone_outs
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False):
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -222,37 +242,124 @@ class DeformableDETR(DETR):
                         pos_list.append(pos_l)
 
         bs = src.shape[0]
-
+        training_methods = []
         #### DAB-DETR
         query_attn_mask = None 
         if self.two_stage:
             assert NotImplementedError
             query_embeds = None
         elif self.use_dab:
-            tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)          # nq, 256
+            tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)      # nq, 256
+            if self.refine_object_queries:
+                tgt_embed += self.object_embedding.weight
             refanchor = self.refpoint_embed.weight.repeat(bs,1,1)      # nq, 4
             query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
 
             #### Group-DETR
-            groups = 1
             if group_object:
                 query_embeds = query_embeds.repeat(1,2,1)
-                groups += 1
+                training_methods.append('group_object')
 
-            if targets is not None and 'track_queries_mask' in targets[0]:
-                num_track_queries = targets[0]['track_queries_mask'].sum()
+            if targets is not None and 'track_query_hs_embeds' in targets[0]:
+                num_track_queries = targets[0]['track_query_hs_embeds'].shape[0]
             else: 
                 num_track_queries = 0
 
             num_total_queries = query_embeds.shape[1] + num_track_queries 
 
             query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)
-            query_attn_mask[:num_track_queries,num_track_queries:] = True
+            #query_attn_mask[:num_track_queries,num_track_queries:] = True
 
             #### Group-DETR
             if group_object:
-                query_attn_mask[num_track_queries:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True
+                # query_attn_mask[num_track_queries:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True
+                query_attn_mask[:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True # HAve not accessed the impact of this error
                 query_attn_mask[num_total_queries - self.num_queries:,:num_total_queries - self.num_queries] = True
+
+            #### DN-DETR for noised object detection
+            if dn_object and torch.tensor([target['empty'] for target in targets]).sum() == 0: # If there is an empty chamber, skip all denoising
+                training_methods.append('dn_object')
+                for t,target in enumerate(targets):
+                    target['dn_object'] = {}
+                    target['dn_object']['boxes'] = target['boxes'].clone()
+                    target['dn_object']['labels'] = target['labels'].clone()
+
+                    count = 0 
+                    for b in range(target['dn_object']['boxes'].shape[0]):
+                        if target['dn_object']['boxes'][b+count,-1] > 0:
+                            target['dn_object']['boxes'] = torch.cat((target['dn_object']['boxes'][:b+count], 
+                                                            torch.cat((target['dn_object']['boxes'][b+count,:4],torch.zeros(4,).to(self.device)))[None], 
+                                                            torch.cat((target['dn_object']['boxes'][b+count,4:],torch.zeros(4,).to(self.device)))[None], 
+                                                            target['dn_object']['boxes'][b+count+1:]))
+                            target['dn_object']['labels'] = torch.cat((target['dn_object']['labels'][:b+count],
+                                                             torch.cat((target['dn_object']['labels'][b+count,:1],torch.ones(1,).long().to(self.device)))[None],
+                                                             torch.cat((target['dn_object']['labels'][b+count,1:],torch.ones(1,).long().to(self.device)))[None],
+                                                             target['dn_object']['labels'][b+count+1:]))
+                            count += 1
+
+
+                num_boxes = torch.tensor([target['dn_object']['boxes'].shape[0] for target in targets]).long()
+                num_FPs = max(num_boxes) - num_boxes
+
+                query_embed_dn_track = torch.zeros((bs,max(num_boxes),query_embeds.shape[-1])).to(self.device)
+                batch_boxes = torch.zeros((bs,max(num_boxes),4)).to(self.device)
+
+                for t,target in enumerate(targets):
+
+                    dn_object = target['dn_object']
+                    assert (target['dn_object']['boxes'][:,-1] > 0).sum() == 0
+                    boxes = target['dn_object']['boxes'][:,:4].clone()
+                    labels = target['dn_object']['labels'][:,0].clone() # need to generate the label embedding
+                    random_mask = torch.randperm(boxes.shape[0])
+                    boxes = boxes[random_mask]
+                    target['dn_object']['track_query_match_ids'] = random_mask ### formality for it work in matcher.py code
+                    target['dn_object']['empty'] = target['empty']
+                    target['dn_object']['noised_boxes_gt'] = boxes.clone()
+
+                    l_1 = self.dn_object_l1
+                    l_2 = self.dn_object_l2
+
+                    boxes = self.add_noise_to_boxes(boxes,l_1,l_2)
+                    target['dn_object']['track_queries_fal_pos_mask'] = torch.zeros((boxes.shape[0] + num_FPs[t])).bool().to(self.device)
+
+                    if num_FPs[t] > 0:
+                        random_FP_mask = torch.randperm(num_FPs[t])
+                        FP_boxes = target['dn_object']['boxes'][random_FP_mask,:4].clone()
+                        FP_boxes = self.add_noise_to_boxes(FP_boxes,l_1*3,l_2*3)
+                        boxes = torch.cat((boxes, FP_boxes),axis=0)
+                        # No tracking is done here; just a formality so it works in the matcher.py code; but there are FPs as in empty tracking boxes
+                        target['dn_object']['track_queries_fal_pos_mask'][-num_FPs[t]:] = True
+
+                        labels = torch.cat((labels,torch.ones((num_FPs[t])).long().to(self.device)))
+
+                    if self.dn_label > 0:
+                        random_labels_mask = torch.randperm(labels.shape[0])[:torch.ceil(torch.tensor(labels.shape[0] * self.dn_label)).long()]
+                        labels[random_labels_mask] = 1 - labels[random_labels_mask]
+
+                    # Also a formality so it works in the mathcer.py code
+                    target['dn_object']['track_queries_mask'] = torch.ones((boxes.shape[0])).bool().to(self.device)
+                    target['dn_object']['num_queries'] = boxes.shape[0]
+                    target['dn_object']['noised_boxes'] = boxes
+
+                    label_embedding = self.label_enc(labels)
+                    query_embed_dn_track[t,:,:self.hidden_dim] = label_embedding
+                    query_embed_dn_track[t,:,self.hidden_dim:] = boxes      
+
+                    batch_boxes[t] = boxes
+
+                query_embeds = torch.cat((query_embeds,query_embed_dn_track),axis=1)
+
+                num_dn_object_queries = query_embed_dn_track.shape[1]
+                num_total_queries += num_dn_object_queries
+                new_query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)    
+                new_query_attn_mask[:-num_dn_object_queries,:-num_dn_object_queries] = query_attn_mask
+                new_query_attn_mask[-num_dn_object_queries:,:-num_dn_object_queries] = True
+                new_query_attn_mask[:-num_dn_object_queries,-num_dn_object_queries:] = True
+                query_attn_mask = new_query_attn_mask
+
+            if targets is not None and  'dn_track' in targets[0]:
+                training_methods.append('dn_track')
+
 
         else:
             query_embeds = self.query_embed.weight
@@ -299,7 +406,8 @@ class DeformableDETR(DETR):
         out = {'pred_logits': outputs_class[-1],
                'pred_boxes': outputs_coord[-1],
                'hs_embed': hs[-1],
-               'references': save_references}
+               'references': save_references,
+               'training_methods': training_methods,}
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -319,8 +427,6 @@ class DeformableDETR(DETR):
             offset += height * width
 
         memory = memory_slices
-        # memory = memory_slices[-1]
-        # features = [NestedTensor(memory_slide) for memory_slide in memory_slices]
 
         return out, targets, features_all, memory, hs
 

@@ -17,7 +17,7 @@ from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection. """
 
-    def __init__(self, backbone, transformer, num_classes, num_queries,
+    def __init__(self, backbone, transformer, num_classes, num_queries, device,
                  aux_loss=False, overflow_boxes=False):
         """ Initializes the model.
         Parameters:
@@ -30,7 +30,7 @@ class DETR(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
-
+        self.device = device
         self.num_queries = num_queries
         self.transformer = transformer
         self.overflow_boxes = overflow_boxes
@@ -433,7 +433,8 @@ class SetCriterion(nn.Module):
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets) - sum(t["empty"] for t in targets) # Empty chambers have an empty box and label as placeholder so we need to subtract it as a box
         num_boxes = torch.as_tensor(
-            [num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+            # [num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+            [num_boxes], dtype=torch.float, device=outputs['pred_logits'].device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item() 
@@ -450,11 +451,16 @@ class SetCriterion(nn.Module):
         iou_threshold = 0.75
         if return_bbox_track_acc:
             metrics = {}
-            metrics['bbox_acc'] = calc_bbox_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            track_acc, div_acc, track_post_div_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['track_acc'] = track_acc
-            metrics['div_acc'] = div_acc
-            metrics['track_post_div_acc'] = track_post_div_acc
+            bbox_det_only_acc, bbox_FN_acc = calc_bbox_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+            metrics['overall_object_det_acc'] = bbox_det_only_acc + bbox_FN_acc
+            metrics['no_tracking_object_det_acc'] = bbox_det_only_acc
+            metrics['untracked_object_det_acc'] = bbox_FN_acc
+            track_acc, div_acc, track_post_div_acc, cells_leaving_acc, rand_FP_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+            metrics['overall_track_acc'] = track_acc
+            metrics['divisions_track_acc'] = div_acc
+            metrics['post_division_track_acc'] = track_post_div_acc
+            metrics['cells_leaving_track_acc'] = cells_leaving_acc
+            metrics['rand_FP_track_acc'] = rand_FP_acc
 
         # Compute all the requested losses
         losses = {}

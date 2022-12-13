@@ -9,7 +9,9 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '22_12_05_group__dab_no_mask'
+folder = '221210_dn_track_dab_no_mask'
+folder = '221210_dn_object_dab_no_mask'
+folder = '221210_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -23,8 +25,12 @@ epochs = metrics_train['loss'].shape[0]
 epochs_val = metrics_val['loss'].shape[0]
 
 groups = [None]
-if 'loss_ce_object' in losses:
-    groups += ['object']
+
+training_methods = ['dn_track','dn_object','group_object']
+
+for training_method in training_methods:
+    if 'loss_ce_' + training_method in losses:
+        groups += [training_method]
 
 
 # Plot Overall Loss
@@ -42,37 +48,46 @@ plt.savefig(datapath / folder / 'loss_plot_overall_log.png')
 
 
 
-fig,ax = plt.subplots(1,2)
+fig,ax = plt.subplots(max(len(groups),2),2,figsize=(10,15))
 
 min_y = np.inf
 max_y = 0
 for loss in losses:
     if loss == 'loss' or bool(re.search('\d',loss)):
         continue
+    category = [g in loss for g in groups[1:]]
+
+    if sum(category) == 0:
+        g = 0
+    else:
+        g = category.index(True) + 1
+
     train_loss = np.nanmean(metrics_train[loss],axis=-1)
     val_loss = np.nanmean(metrics_val[loss],axis=-1)
-    ax[0].plot(np.arange(1,epochs+1),train_loss,label=loss)
-    ax[1].plot(np.arange(1,epochs_val+1),val_loss,label=loss)
+    ax[g,0].plot(np.arange(1,epochs+1),train_loss,label=loss)
+    ax[g,1].plot(np.arange(1,epochs_val+1),val_loss,label=loss)
     min_y = min((min_y,min(train_loss),min(val_loss)))
     max_y = max((max_y,max(train_loss),max(val_loss)))
 
-for i, dataset in enumerate(['train','val']):
-    ax[i].set_xlabel('Epochs')
-    ax[i].set_ylabel('Loss')
-    ax[i].legend()
-    ax[i].set_title(dataset)
-    ax[0].set_ylim(min_y,max_y)
+for g,group in enumerate(groups):
+    for i, dataset in enumerate(['train','val']):
+        ax[g,i].set_xlabel('Epochs')
+        ax[g,i].set_ylabel('Loss')
+        ax[g,i].legend()
+        ax[g,i].set_title(f'{"Overall" if group is None else group}: {dataset}')
+        ax[g,i].set_ylim(min_y,max_y)
 
 fig.tight_layout()
-plt.savefig(datapath / folder / 'loss_plot_train.png')
+plt.savefig(datapath / folder / 'loss_plot.png')
 
-ax[0].set_yscale('log')
-ax[1].set_yscale('log')
+for g in range(len(groups)):
+    ax[g,0].set_yscale('log')
+    ax[g,1].set_yscale('log')
 
-plt.savefig(datapath / folder / 'loss_plot_train_log.png')
+plt.savefig(datapath / folder / 'loss_plot_log.png')
 
 
-losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice']] # total loss has not auxillary losses
+losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice']] # Auxillary losses does not have mask / dice loss
 
 
 def plot_aux_losses(losses,metrics_train,metrics_val,groups):
@@ -118,19 +133,33 @@ plot_aux_losses(losses,metrics_train,metrics_val,groups=groups)
 
 
 # Plot acc
-fig,ax = plt.subplots()
-colors = ['b','g','r','c']
+fig,ax = plt.subplots(1,2,figsize=(10,5))
+colors = ['b','g','r','c','m','y']
 for midx,metric in enumerate(metrics):
+
+    i = 0 if 'object_det_acc' in metric or 'objects_det_acc' in metric else 1
+    
     train_acc = np.nanmean(metrics_train[metric],axis=-2)
     train_acc = train_acc[:,0] / train_acc[:,1]
     val_acc = np.nanmean(metrics_val[metric],axis=-2)
     val_acc = val_acc[:,0] / val_acc[:,1]
-    ax.plot(np.arange(1,epochs+1),train_acc, color = colors[midx],label='train_' + metric)
-    ax.plot(np.arange(1,epochs_val+1),val_acc, '--', color = colors[midx],label='val_' + metric)
 
-ax.set_xlabel('Epochs')
-ax.set_ylabel('Accuracy')
-ax.legend()
-ax.set_ylim(0,1)
+    replace_word = '_object_det_acc' if i ==0 else '_track_acc'
+    metric = metric.replace(replace_word,'')
+
+    replace_word = '_objects_det_acc' if i ==0 else '_track_acc'
+    metric = metric.replace(replace_word,'')
+
+    ax[i].plot(np.arange(1,epochs+1),train_acc, color = colors[midx] if 'overall' not in metric else 'k',label=metric)
+    ax[i].plot(np.arange(1,epochs_val+1),val_acc, '--', color = colors[midx] if 'overall' not in metric else 'k',)
+
+for i in range(2):
+    ax[i].set_xlabel('Epochs')
+    ax[i].set_ylabel('Accuracy')
+    ax[i].legend()
+    ax[i].set_ylim(0,1)
+
+ax[0].set_title('Object Detection Accuracy')
+ax[1].set_title('Tracking Accuracy')
 
 plt.savefig(datapath / folder / 'acc_plot.png')

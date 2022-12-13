@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import torchvision
 from torch import Tensor
 from visdom import Visdom
+from pathlib import Path
 
 from . import box_ops
 
@@ -31,9 +32,30 @@ if int(re.findall('\d+',(torchvision.__version__[:4]))[-1]) < 7:
     from torchvision.ops import _new_empty_tensor
     from torchvision.ops.misc import _output_size
 
-def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train):
+class box_cxcy_to_xyxy():
+
+    def __init__(self,height,width):
+        self.height = height
+        self.width = width
+
+    def convert(self,boxes):
+
+        boxes[:,1::2] = boxes[:,1::2] * self.height
+        boxes[:,::2] = boxes[:,::2] * self.width
+
+        boxes[:,0] = boxes[:,0] - boxes[:,2] // 2
+        boxes[:,1] = boxes[:,1] - boxes[:,3] // 2
+
+        if boxes.shape[1] > 4:
+            boxes[:,4] = boxes[:,4] - boxes[:,6] // 2
+            boxes[:,5] = boxes[:,5] - boxes[:,7] // 2
+
+        return boxes
+
+def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,meta_data=None):
     
     # show_class_label = True
+    filename = Path(filename)
     height = samples.tensors.shape[-2]
     width = samples.tensors.shape[-1]
     bs = samples.tensors.shape[0]
@@ -45,6 +67,271 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train):
     fontscale = 0.4
     alpha = 0.3
     pred_masks = 'pred_masks' in outputs
+    box_converter = box_cxcy_to_xyxy(height,width)
+
+    if meta_data is not None:
+        meta_data_keys = list(meta_data.keys())
+
+        for meta_data_key in meta_data_keys:
+
+            outputs_TM = meta_data[meta_data_key]['outputs']
+            targets_TM = [target[meta_data_key] for target in targets]
+
+            if meta_data_key == 'dn_track':
+                dn_track = np.zeros((height,(width*6 + spacer)*bs,3))
+                for i in range(bs):
+                    colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+
+                    img = samples.tensors[i].permute(1,2,0)                
+                    
+                    boxes = targets_TM[i]['track_query_boxes_gt'].detach().cpu().numpy()
+                    noised_boxoes = targets_TM[i]['track_query_boxes'].detach().cpu().numpy()
+                
+                    boxes = box_converter.convert(boxes)
+                    noised_boxes = box_converter.convert(noised_boxoes)
+
+                    img = img.detach().cpu().numpy().copy()
+                    img = np.repeat(np.mean(img,axis=-1)[:,:,np.newaxis],3,axis=-1)
+                    img = (255*(img - np.min(img)) / np.ptp(img)).astype(np.uint8)
+                    img_gt = img.copy()
+                    img_noised_gt = img.copy()
+                    img_pred = img.copy()
+                    img_all_pred = img.copy()
+
+                    TP_mask = ~targets_TM[i]['track_queries_fal_pos_mask']
+
+                    previmg = targets[i]['prev_image'].permute(1,2,0).detach().cpu().numpy()
+                    previmg = np.repeat(np.mean(previmg,axis=-1)[:,:,np.newaxis],3,axis=-1)
+                    previmg = (255*(previmg - np.min(previmg)) / np.ptp(previmg)).astype(np.uint8)
+                    previmg_noised = previmg.copy()
+
+                    for idx,bbox in enumerate(boxes):
+                        bounding_box = bbox[:4]
+                        img_gt = cv2.rectangle(
+                            img_gt,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)
+
+                        previmg = cv2.rectangle(
+                            previmg,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)
+
+                    for idx,bbox in enumerate(noised_boxes):
+                        bounding_box = bbox[:4]
+                        img_noised_gt = cv2.rectangle(
+                            img_noised_gt,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)
+
+                        previmg_noised = cv2.rectangle(
+                            previmg_noised,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)
+
+
+                    pred_boxes = outputs_TM['pred_boxes'][i].detach().cpu().numpy()
+                    pred_logits = outputs_TM['pred_logits'][i].sigmoid().detach().cpu().numpy()
+
+                    pred_boxes = box_converter.convert(pred_boxes)
+
+                    for idx,bbox in enumerate(pred_boxes):
+                        bounding_box = bbox[:4]
+                        img_all_pred = cv2.rectangle(
+                            img_all_pred,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)  
+
+                        img_all_pred = cv2.putText(
+                            img_all_pred,
+                            text = f'{pred_logits[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = fontscale,
+                            color = colors[idx] if TP_mask[idx] else (128,128,128),
+                            thickness=1,
+                        )
+
+                        if pred_logits[idx,1] > threshold:
+                            bounding_box = bbox[4:]
+                            img_all_pred = cv2.rectangle(
+                                img_all_pred,
+                                (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                                (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                                color=colors[idx] if TP_mask[idx] else (0,0,0),
+                                thickness = 1)  
+
+                            img_all_pred = cv2.putText(
+                                img_all_pred,
+                                text = f'{pred_logits[idx,1]:.2f}', 
+                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                fontScale = fontscale,
+                                color = colors[idx] if TP_mask[idx] else (128,128,128),
+                                thickness=1,
+                            )
+
+                    keep = pred_logits[:,0] > threshold
+                    where = np.where(pred_logits[:,0] > threshold)[0]
+                    pred_logits = pred_logits[keep]
+                    pred_boxes = pred_boxes[keep]
+
+                    for idx,bbox in enumerate(pred_boxes): 
+                        bounding_box = bbox[:4]
+                        img_pred = cv2.rectangle(
+                            img_pred,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[where[idx]] if TP_mask[where[idx]] else (0,0,0),
+                            thickness = 1)            
+
+                        img_pred = cv2.putText(
+                            img_pred,
+                            text = f'{pred_logits[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = fontscale,
+                            color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
+                            thickness=1,
+                        )
+
+                        if pred_logits[idx,1] > threshold:
+                            bounding_box = bbox[4:]
+                            img_pred = cv2.rectangle(
+                                img_pred,
+                                (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                                (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                                color=colors[where[idx]] if TP_mask[where[idx]] else (0,0,0),
+                                thickness = 1)  
+
+                            img_pred = cv2.putText(
+                                img_pred,
+                                text = f'{pred_logits[idx,1]:.2f}', 
+                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                fontScale = fontscale,
+                                color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
+                                thickness=1,
+                            )
+
+                            
+                    dn_track[:,(width*6+spacer)*i + width*0:(width*6+spacer)*i + width*1] = previmg
+                    dn_track[:,(width*6+spacer)*i + width*1:(width*6+spacer)*i + width*2] = previmg_noised
+                    dn_track[:,(width*6+spacer)*i + width*2:(width*6+spacer)*i + width*3] = img_gt
+                    dn_track[:,(width*6+spacer)*i + width*3:(width*6+spacer)*i + width*4] = img_noised_gt
+                    dn_track[:,(width*6+spacer)*i + width*4:(width*6+spacer)*i + width*5] = img_pred
+                    dn_track[:,(width*6+spacer)*i + width*5:(width*6+spacer)*i + width*6] = img_all_pred
+
+                cv2.imwrite(str(savepath / folder / (filename.stem + '_dn_track' + filename.suffix)),dn_track)
+
+            if meta_data_key == 'dn_object':
+                dn_object = np.zeros((height,(width*5 + spacer)*bs,3))
+                for i in range(bs):
+                    colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+
+                    img = samples.tensors[i].permute(1,2,0)                
+                    
+                    boxes_noised = targets_TM[i]['noised_boxes'].detach().cpu().numpy()
+                    boxes = targets_TM[i]['noised_boxes_gt'].detach().cpu().numpy()
+                    TP_mask = ~targets_TM[i]['track_queries_fal_pos_mask'].cpu().numpy()
+                
+                    boxes = box_converter.convert(boxes)
+                    boxes_noised = box_converter.convert(boxes_noised)
+
+                    img = img.detach().cpu().numpy().copy()
+                    img = np.repeat(np.mean(img,axis=-1)[:,:,np.newaxis],3,axis=-1)
+                    img = (255*(img - np.min(img)) / np.ptp(img)).astype(np.uint8)
+                    img_gt = img.copy()
+                    img_noised_gt = img.copy()
+                    img_pred_all = img.copy()
+                    img_pred = img.copy()
+
+
+                    for idx,bbox in enumerate(boxes):
+                        bounding_box = bbox[:4]
+                        img_gt = cv2.rectangle(
+                            img_gt,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)
+
+
+                    for idx,bbox in enumerate(boxes_noised):
+                        bounding_box = bbox[:4]
+                        img_noised = cv2.rectangle(
+                            img_noised_gt,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)
+
+                    pred_boxes = outputs_TM['pred_boxes'][i].detach().cpu().numpy()
+                    pred_logits = outputs_TM['pred_logits'][i].sigmoid().detach().cpu().numpy()
+
+                    pred_boxes = box_converter.convert(pred_boxes)
+
+                    for idx,bbox in enumerate(pred_boxes):
+                        bounding_box = bbox[:4]
+                        img_pred_all = cv2.rectangle(
+                            img_pred_all,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx] if TP_mask[idx] else (0,0,0),
+                            thickness = 1)  
+                        
+                        img_pred_all = cv2.putText(
+                            img_pred_all,
+                            text = f'{pred_logits[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = fontscale,
+                            color = colors[idx] if TP_mask[idx] else (128,128,128),
+                            thickness=1,
+                        )
+
+                    keep = pred_logits[:,0] > threshold
+                    where = np.where(pred_logits[:,0] > threshold)[0]
+                    pred_boxes = pred_boxes[keep]
+                    pred_logits = pred_logits[keep]
+
+                    for idx,bbox in enumerate(pred_boxes): 
+                        bounding_box = bbox[:4]
+                        img_pred = cv2.rectangle(
+                            img_pred,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[where[idx]] if TP_mask[where[idx]] else (0,0,0),
+                            thickness = 1)            
+
+                        img_pred = cv2.putText(
+                            img_pred,
+                            text = f'{pred_logits[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = fontscale,
+                            color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
+                            thickness=1,
+                        )
+
+                    dn_object[:,(width*5+spacer)*i + width*0:(width*5+spacer)*i + width*1] = img
+                    dn_object[:,(width*5+spacer)*i + width*1:(width*5+spacer)*i + width*2] = img_gt
+                    dn_object[:,(width*5+spacer)*i + width*2:(width*5+spacer)*i + width*3] = img_noised
+                    dn_object[:,(width*5+spacer)*i + width*3:(width*5+spacer)*i + width*4] = img_pred
+                    dn_object[:,(width*5+spacer)*i + width*4:(width*5+spacer)*i + width*5] = img_pred_all
+
+                cv2.imwrite(str(savepath / folder / (filename.stem + '_dn_object' + filename.suffix)),dn_object)
+
 
     for i in range(bs):
 
@@ -984,12 +1271,23 @@ def save_metrics_pkl(metrics_dict,output_dir,dataset):
 
 
 
-def calc_bbox_acc(outputs,targets, cls_thresh = 0.5, iou_thresh = 0.75):
+def calc_bbox_acc(outputs,targets, indices, cls_thresh = 0.5, iou_thresh = 0.75):
     acc = torch.zeros((2),dtype=torch.int32)
     for t,target in enumerate(targets):
         bboxes = target['boxes'].detach().cpu()
         pred_logits = outputs['pred_logits'].sigmoid().detach().cpu()[t]
         pred_boxes = outputs['pred_boxes'].detach().cpu()[t]
+
+        object_detect_only = True if sum(target['track_queries_mask']) == 0 else False
+
+        # We are only interestd in calcualting object detection accuracy; not tracking accuracy
+        ind_out,ind_tgt = indices[t]
+        num_track = target['track_queries_mask'].sum() # count the total number of track queries
+        keep = ind_out > (num_track-1) 
+            
+        bboxes = bboxes[ind_tgt[keep]]
+        pred_logits = pred_logits[ind_out[keep]]
+        pred_boxes = pred_boxes[ind_out[keep]]
 
         if target['empty']: # No objects in image so it should be all zero
             acc[1] += (pred_logits > cls_thresh).sum()
@@ -1034,18 +1332,41 @@ def calc_bbox_acc(outputs,targets, cls_thresh = 0.5, iou_thresh = 0.75):
                 if not match:
                     acc[1] += 1 # Add 1 incorrect for every time it predicts something wrong
 
-    return acc[None,None]
+    acc = acc[None,None]
+
+    if object_detect_only:
+        return acc, torch.zeros_like(acc)
+    else:
+        return torch.zeros_like(acc), acc
 
 def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
+    num_queries = (~targets[0]['track_queries_mask']).sum()
     acc = torch.zeros((2),dtype=torch.int32)
     div_acc = torch.zeros((2),dtype=torch.int32)
     track_div_cell_acc = torch.zeros((2),dtype=torch.int32)
+    cells_leaving_acc = torch.zeros((2,),dtype=torch.int32)
+    rand_FP_acc = torch.zeros((2,),dtype=torch.int32)
     for t,target in enumerate(targets):
         pred_logits = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach().cpu()
         pred_boxes = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach().cpu()
         track_div_cell = target['track_div_mask'][target['track_queries_TP_mask']]
-        if target['empty']: # No objects in image so it should be all zero
-            acc[1] += (pred_logits > cls_thresh).sum()
+
+        assert 'cells_leaving_mask' in target
+
+        # Specifically measures accuracy for cells leaving the frame; ground truth is always 0
+        cell_leaving_pred_logits = outputs['pred_logits'][t][:-num_queries][target['cells_leaving_mask']].sigmoid().detach().cpu()
+        sample_acc = torch.tensor([(cell_leaving_pred_logits[:,0] < cls_thresh).sum(),cell_leaving_pred_logits.shape[0]])
+        cells_leaving_acc += sample_acc
+        acc += sample_acc
+
+        # Specifically measures accuracy for the random generated FP track queries; ground truth is always 0
+        if 'rand_FP_mask' in target:
+            FP_pred_logits = outputs['pred_logits'][t][:-num_queries][target['rand_FP_mask']].sigmoid().detach().cpu()
+            sample_acc = torch.tensor([(FP_pred_logits[:,0] < cls_thresh).sum(),FP_pred_logits.shape[0]])
+            rand_FP_acc += sample_acc
+            acc += sample_acc
+
+        if target['empty']: # No objects to track
             continue
 
         box_matching = target['track_query_match_ids']
@@ -1055,7 +1376,7 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
 
         for p,pred_logit in enumerate(pred_logits):
             if pred_logit[0] < cls_thresh:
-                acc[1] += 1
+                # acc[1] += 1  # error having this here
                 if track_div_cell[p]:
                     track_div_cell_acc[1] += 1
 
@@ -1110,4 +1431,4 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
         FPs = outputs['pred_logits'][t][~target['track_queries_TP_mask'] * target['track_queries_mask']].sigmoid().detach().cpu()
         acc[1] += (FPs > cls_thresh).sum()
 
-    return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None]
+    return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None], cells_leaving_acc[None,None], rand_FP_acc[None,None]

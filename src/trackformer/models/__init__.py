@@ -37,14 +37,24 @@ def build_model(args):
         'num_queries': args.num_queries,
         'aux_loss': args.aux_loss,
         'overflow_boxes': args.overflow_boxes,
+        'device': device,
         'use_dab': args.use_dab,
-        'group_object': args.group_object}
+        'group_object': args.group_object,
+        'dn_object_l1': args.dn_object_l1,
+        'dn_object_l2': args.dn_object_l2,
+        'dn_label': args.dn_label,
+        'refine_object_queries': args.refine_object_queries,}
 
     tracking_kwargs = {
         'track_query_false_positive_prob': args.track_query_false_positive_prob,
         'track_query_false_negative_prob': args.track_query_false_negative_prob,
         'matcher': matcher,
-        'backprop_prev_frame': args.track_backprop_prev_frame,}
+        'backprop_prev_frame': args.track_backprop_prev_frame,
+        'dn_track': args.dn_track,
+        'dn_track_l1': args.dn_track_l1,
+        'dn_track_l2': args.dn_track_l2,
+        'dn_object': args.dn_object,
+        'refine_div_track_queries': args.refine_div_track_queries}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,

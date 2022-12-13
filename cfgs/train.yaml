@@ -48,7 +48,18 @@ dec_n_points: 4
 enc_n_points: 4
 # DAB-DETR
 use_dab: true
-group_object: true
+group_object: false
+dn_track: false
+dn_track_l1: 0.1
+dn_track_l2: 0.05
+dn_object: false
+dn_label: 0.3
+dn_object_l1: 0.2
+dn_object_l2: 0.1
+# Embeddings to differentiate object vs track queries
+refine_track_queries: true
+refine_object_queries: true
+refine_div_track_queries: true
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
@@ -82,16 +93,18 @@ set_cost_giou: 2.0
 aux_loss: true
 return_intermediate_masks: false
 group_object_coef: 1.0
+dn_object_coef: 1.0
+dn_track_coef: 1.0
 mask_loss_coef: 25.0
 mask_weight_cells_coef: 1 #2.0
 mask_weight_target_cell_coef: 10.0
 dice_loss_coef: 2.0
 loss_coef: 1.0 # This is just a formality
-cls_loss_coef: 20.0
+cls_loss_coef: 1.0 #20.0
 bbox_loss_coef: 5.0
-giou_loss_coef: 2
-div_loss_coef: 10
-track_div_loss_coef: 10
+giou_loss_coef: 2.0
+div_loss_coef: 2.0 #10
+track_div_loss_coef: 2.0 #10
 object_queies_loss_coef: 1
 # Relative classification weight of the no-object class
 eos_coef: 0.1
