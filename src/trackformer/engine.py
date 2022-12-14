@@ -410,7 +410,7 @@ def run_pipeline(model, fps, device, output_dir, args):
                                 if args.use_dab:
                                     x,y,w,h = boxes[ridx]
                                 else:
-                                    x,y - boxes[ridx]
+                                    x,y = boxes[ridx]
 
                                 if not(div_track[ridx-1] and  div_track[ridx]):
                                     img_ref_box = cv2.circle(img_ref_box, (int(x*target_size[1]),int(y*target_size[0])), radius=1, color=color[ridx], thickness=-1)
