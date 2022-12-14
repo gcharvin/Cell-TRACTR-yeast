@@ -142,8 +142,9 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                     pred_logits = outputs_TM['pred_logits'][i].sigmoid().detach().cpu().numpy()
 
                     pred_boxes = box_converter.convert(pred_boxes)
+                    pred_boxes_thresh = pred_boxes[pred_logits[:,0] < threshold]
 
-                    for idx,bbox in enumerate(pred_boxes):
+                    for idx,bbox in enumerate(pred_boxes_thresh):
                         bounding_box = bbox[:4]
                         img_all_pred = cv2.rectangle(
                             img_all_pred,
