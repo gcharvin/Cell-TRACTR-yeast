@@ -54,15 +54,15 @@ class box_cxcy_to_xyxy():
 
 def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,meta_data=None):
     
-    # show_class_label = True
+    print_gt = True
     filename = Path(filename)
-    height = samples.tensors.shape[-2]
-    width = samples.tensors.shape[-1]
-    bs = samples.tensors.shape[0]
+    height = samples.shape[-2]
+    width = samples.shape[-1]
+    bs = samples.shape[0]
     spacer = 10
     threshold = 0.5
     folder = 'train_outputs' if train else 'eval_outputs'
-    num_img = 5
+    num_img = 5 + print_gt*2
     blank = np.zeros((height, (width*num_img + spacer)*bs,3))
     fontscale = 0.4
     alpha = 0.3
@@ -82,7 +82,8 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                 for i in range(bs):
                     colors = [tuple((255*np.random.random(3))) for _ in range(50)]
 
-                    img = samples.tensors[i].permute(1,2,0)                
+                    # img = samples.tensors[i].permute(1,2,0)                
+                    img = samples[i].permute(1,2,0)                
                     
                     boxes = targets_TM[i]['track_query_boxes_gt'].detach().cpu().numpy()
                     noised_boxoes = targets_TM[i]['track_query_boxes'].detach().cpu().numpy()
@@ -240,7 +241,8 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                 for i in range(bs):
                     colors = [tuple((255*np.random.random(3))) for _ in range(50)]
 
-                    img = samples.tensors[i].permute(1,2,0)                
+                    # img = samples.tensors[i].permute(1,2,0)                
+                    img = samples[i].permute(1,2,0)                
                     
                     boxes_noised = targets_TM[i]['noised_boxes'].detach().cpu().numpy()
                     boxes = targets_TM[i]['noised_boxes_gt'].detach().cpu().numpy()
@@ -339,85 +341,87 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
         colors = [tuple((255*np.random.random(3))) for _ in range(50)]
 
         previmg = targets[i]['prev_image'].permute(1,2,0)
-        prev_bbs = prev_outputs['pred_boxes'][i].detach().cpu().numpy()
-        prev_classes = prev_outputs['pred_logits'][i].sigmoid().detach().cpu().numpy()
 
-        prev_keep = prev_classes[:,0] > threshold
-        prev_bbs = prev_bbs[prev_keep,]
-        prev_classes = prev_classes[prev_keep]
+        if prev_outputs is not None:
+            prev_bbs = prev_outputs['pred_boxes'][i].detach().cpu().numpy()
+            prev_classes = prev_outputs['pred_logits'][i].sigmoid().detach().cpu().numpy()
 
-        if sum(prev_keep) > 0:
-    
-            prev_bbs[:,1::2] = prev_bbs[:,1::2] * height
-            prev_bbs[:,::2] = prev_bbs[:,::2] * width
-            prev_bbs[:,0] = prev_bbs[:,0] - prev_bbs[:,2] // 2
-            prev_bbs[:,1] = prev_bbs[:,1] - prev_bbs[:,3] // 2
-            prev_bbs[:,4] = prev_bbs[:,4] - prev_bbs[:,6] // 2
-            prev_bbs[:,5] = prev_bbs[:,5] - prev_bbs[:,7] // 2
+            prev_keep = prev_classes[:,0] > threshold
+            prev_bbs = prev_bbs[prev_keep,]
+            prev_classes = prev_classes[prev_keep]
 
-        previmg = previmg.detach().cpu().numpy().copy()
-        previmg = np.repeat(np.mean(previmg,axis=-1)[:,:,np.newaxis],3,axis=-1)
-        previmg = (255*(previmg - np.min(previmg)) / np.ptp(previmg)).astype(np.uint8)
-        previmg_copy = previmg.copy()
+            if sum(prev_keep) > 0:
+        
+                prev_bbs[:,1::2] = prev_bbs[:,1::2] * height
+                prev_bbs[:,::2] = prev_bbs[:,::2] * width
+                prev_bbs[:,0] = prev_bbs[:,0] - prev_bbs[:,2] // 2
+                prev_bbs[:,1] = prev_bbs[:,1] - prev_bbs[:,3] // 2
+                prev_bbs[:,4] = prev_bbs[:,4] - prev_bbs[:,6] // 2
+                prev_bbs[:,5] = prev_bbs[:,5] - prev_bbs[:,7] // 2
 
-        for idx,bbox in enumerate(prev_bbs):
-            bounding_box = bbox[:4]
-            previmg = cv2.rectangle(
-                previmg,
-                (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
-                (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                color=(0,0,0),#colors[idx],
-                thickness = 1)
+            previmg = previmg.detach().cpu().numpy().copy()
+            previmg = np.repeat(np.mean(previmg,axis=-1)[:,:,np.newaxis],3,axis=-1)
+            previmg = (255*(previmg - np.min(previmg)) / np.ptp(previmg)).astype(np.uint8)
+            previmg_copy = previmg.copy()
 
-            previmg = cv2.putText(
-                previmg,
-                text = f'{prev_classes[idx,0]:.2f}', 
-                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = 0.4,
-                color = (128,128,128),#colors[idx],
-                thickness=1,
-            )
-
-            if prev_classes[idx,1] > 0.5:
-                bounding_box = bbox[4:]
+            for idx,bbox in enumerate(prev_bbs):
+                bounding_box = bbox[:4]
                 previmg = cv2.rectangle(
                     previmg,
                     (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                     (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                    color = (128,128,128),
+                    color=(0,0,0),#colors[idx],
                     thickness = 1)
 
                 previmg = cv2.putText(
                     previmg,
-                    text = f'{prev_classes[idx,1]:.2f}', 
+                    text = f'{prev_classes[idx,0]:.2f}', 
                     org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                    fontScale = fontscale,
-                    color = (0,0,0),
+                    fontScale = 0.4,
+                    color = (128,128,128),#colors[idx],
                     thickness=1,
                 )
 
-        track_query_boxes = targets[i]['track_query_boxes'].detach().cpu()
+                if prev_classes[idx,1] > 0.5:
+                    bounding_box = bbox[4:]
+                    previmg = cv2.rectangle(
+                        previmg,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color = (128,128,128),
+                        thickness = 1)
 
-        if track_query_boxes.shape[0] > 0:
-    
-            track_query_boxes[:,1::2] = track_query_boxes[:,1::2] * height
-            track_query_boxes[:,::2] = track_query_boxes[:,::2] * width
-            track_query_boxes[:,0] = track_query_boxes[:,0] - track_query_boxes[:,2] // 2
-            track_query_boxes[:,1] = track_query_boxes[:,1] - track_query_boxes[:,3] // 2
+                    previmg = cv2.putText(
+                        previmg,
+                        text = f'{prev_classes[idx,1]:.2f}', 
+                        org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                        fontScale = fontscale,
+                        color = (0,0,0),
+                        thickness=1,
+                    )
 
-        previmg_track = previmg_copy.copy()
+            track_query_boxes = targets[i]['track_query_boxes'].detach().cpu()
 
-        for idx,bounding_box in enumerate(track_query_boxes):
-            previmg_track = cv2.rectangle(
-                previmg_track,
-                (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
-                (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                color=colors[idx],
-                thickness = 1)
+            if track_query_boxes.shape[0] > 0:
+        
+                track_query_boxes[:,1::2] = track_query_boxes[:,1::2] * height
+                track_query_boxes[:,::2] = track_query_boxes[:,::2] * width
+                track_query_boxes[:,0] = track_query_boxes[:,0] - track_query_boxes[:,2] // 2
+                track_query_boxes[:,1] = track_query_boxes[:,1] - track_query_boxes[:,3] // 2
 
-        img = samples.tensors[i].permute(1,2,0)
+            previmg_track = previmg_copy.copy()
+
+            for idx,bounding_box in enumerate(track_query_boxes):
+                previmg_track = cv2.rectangle(
+                    previmg_track,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+        img = samples[i].permute(1,2,0)
 
         bbs = outputs['pred_boxes'][i].detach().cpu().numpy()
         classes = outputs['pred_logits'][i].sigmoid().detach().cpu().numpy()
@@ -438,8 +442,9 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                 masks_filt[masks_filt > threshold] = 255
                 masks = masks_filt.astype(np.uint8)
 
-        track_keep = keep[:track_query_boxes.shape[0]]
-        colors = [colors[idx] for idx in range(len(track_keep)) if track_keep[idx]] 
+        if prev_outputs is not None:
+            track_keep = keep[:track_query_boxes.shape[0]]
+            colors = [colors[idx] for idx in range(len(track_keep)) if track_keep[idx]] 
 
         if sum(keep) > 0:
 
@@ -506,11 +511,72 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                     mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                     img[mask>0] = img[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
                     
-        blank[:,(width*num_img+spacer)*i + width*0:(width*num_img+spacer)*i + width*1] = previmg_copy
-        blank[:,(width*num_img+spacer)*i + width*1:(width*num_img+spacer)*i + width*2] = previmg
-        blank[:,(width*num_img+spacer)*i + width*2:(width*num_img+spacer)*i + width*3] = previmg_track
+        if prev_outputs is not None:
+            blank[:,(width*num_img+spacer)*i + width*0:(width*num_img+spacer)*i + width*1] = previmg_copy
+            blank[:,(width*num_img+spacer)*i + width*1:(width*num_img+spacer)*i + width*2] = previmg
+            blank[:,(width*num_img+spacer)*i + width*2:(width*num_img+spacer)*i + width*3] = previmg_track
         blank[:,(width*num_img+spacer)*i + width*3:(width*num_img+spacer)*i + width*4] = img
         blank[:,(width*num_img+spacer)*i + width*4:(width*num_img+spacer)*i + width*5] = img_copy
+
+        if print_gt:
+            target = targets[i]
+            colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+            img_gt = img_copy.copy()
+            previmg_gt = previmg_copy.copy()
+
+            bbs = target['boxes'].detach().cpu().numpy()
+            bbs[:,1::2] = bbs[:,1::2] * height
+            bbs[:,::2] = bbs[:,::2] * width
+            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+            for idx, bbox in enumerate(bbs):
+                bounding_box = bbox[:4]
+                img_gt = cv2.rectangle(
+                    img_gt,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+                if bbs[idx,-1] > 0:
+                    bounding_box = bbox[4:]
+                    img_gt = cv2.rectangle(
+                        img_gt,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color=colors[idx],
+                        thickness = 1)
+
+            prev_target = target['prev_target']
+            bbs = prev_target['boxes'].detach().cpu().numpy()
+            bbs[:,1::2] = bbs[:,1::2] * height
+            bbs[:,::2] = bbs[:,::2] * width
+            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            for idx, bbox in enumerate(bbs):
+                bounding_box = bbox[:4]
+                previmg_gt = cv2.rectangle(
+                    previmg_gt,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+                if bbs[idx,-1] > 0:
+                    bounding_box = bbox[4:]
+                    previmg_gt = cv2.rectangle(
+                        previmg_gt,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color= colors[idx],
+                        thickness = 1)
+
+            blank[:,(width*num_img+spacer)*i + width*5:(width*num_img+spacer)*i + width*6] = previmg_gt
+            blank[:,(width*num_img+spacer)*i + width*6:(width*num_img+spacer)*i + width*7] = img_gt
+
 
     cv2.imwrite(str(savepath / folder / filename),blank)
 
@@ -1348,6 +1414,8 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
     cells_leaving_acc = torch.zeros((2,),dtype=torch.int32)
     rand_FP_acc = torch.zeros((2,),dtype=torch.int32)
     for t,target in enumerate(targets):
+        if target['track_queries_mask'].sum() == 0:
+            continue
         pred_logits = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach().cpu()
         pred_boxes = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach().cpu()
         track_div_cell = target['track_div_mask'][target['track_queries_TP_mask']]

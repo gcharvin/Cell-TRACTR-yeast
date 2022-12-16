@@ -24,7 +24,8 @@ class DETRTrackingBase(nn.Module):
                  dn_track_l1 = 0,
                  dn_track_l2 = 0,
                  dn_object = False,
-                 refine_div_track_queries = False,):
+                 refine_div_track_queries = False,
+                 evaluate_dataset_with_no_data_aug=False,):
 
         self._matcher = matcher
         self._track_query_false_positive_prob = track_query_false_positive_prob
@@ -35,6 +36,7 @@ class DETRTrackingBase(nn.Module):
         self.dn_track_l2 = dn_track_l2
         self.dn_object = dn_object
         self.refine_div_track_queries = refine_div_track_queries
+        self.evaluate_dataset_with_no_data_aug = evaluate_dataset_with_no_data_aug
 
         if self.dn_track:
             self.dn_track_embedding = nn.Embedding(1,self.hidden_dim)
@@ -95,8 +97,7 @@ class DETRTrackingBase(nn.Module):
             new_prev_target_ind = torch.zeros((prev_input_boxes.shape[0]))
             tgt_div_mask = torch.zeros((prev_input_boxes.shape[0])).bool()
 
-            if self.refine_div_track_queries:
-                tgt_div_ind = torch.zeros((prev_input_boxes.shape[0])).long()
+            tgt_div_ind = torch.zeros((prev_input_boxes.shape[0])).long()
 
             count = 0
             div = 0
@@ -123,9 +124,8 @@ class DETRTrackingBase(nn.Module):
                     new_prev_target_ind[count+1] = box_input_div_ind
                     tgt_div_mask[count] = True
                     tgt_div_mask[count+1] = True
-                    if self.refine_div_track_queries:
-                        tgt_div_ind[count] = 1
-                        tgt_div_ind[count+1] = 2
+                    tgt_div_ind[count] = div+1
+                    tgt_div_ind[count+1] = div+1
                     count += 2
                     prev_out_ind = torch.cat((prev_out_ind[:i+div],prev_out_ind[i+div:i+div+1],prev_out_ind[i+div:]))
                     div += 1
@@ -135,11 +135,9 @@ class DETRTrackingBase(nn.Module):
             assert len(prev_out_ind) == len(new_prev_target_ind)
             target['prev_ind'] = [prev_out_ind,new_prev_target_ind.long()]
             target['tgt_div_masks'] = tgt_div_mask
+            target['tgt_div_ind'] = tgt_div_ind
 
-            if self.refine_div_track_queries:
-                target['tgt_div_ind'] = tgt_div_ind
-
-    def calc_num_FPs(self,targets,return_FPs=False):
+    def calc_num_FPs(self,targets,return_FPs=False,add_extra_FPs=True):
 
         num_cells = torch.tensor([len(target['prev_ind'][0]) for target in targets])
 
@@ -148,7 +146,7 @@ class DETRTrackingBase(nn.Module):
 
         # num_FPs = torch.tensor([FP for FP in add_FPs])
 
-        if sum(num_cells) != 0: # Only add FPs if it is tracking; it is not realistic to add extra FPs when no cells are being tracked
+        if sum(num_cells) != 0 and add_extra_FPs: # Only add FPs if it is tracking; it is not realistic to add extra FPs when no cells are being tracked
             max_FPs = max(num_FPs)
             num_fps_rand = torch.randint(0,max(3-max_FPs,1),(1,)).item()
             num_FPs += num_fps_rand 
@@ -222,7 +220,7 @@ class DETRTrackingBase(nn.Module):
 
     def add_track_queries_to_targets(self, targets, prev_indices, swap_prev_indices, prev_out, prev_prev_track=False, keep_all_track=False, group_object=False, dn_track=False):
     
-        min_prev_target_ind = min([len(prev_ind[1]) for prev_ind in prev_indices])
+        # min_prev_target_ind = min([len(prev_ind[1]) for prev_ind in prev_indices])
 
         rand_num = random.random()
 
@@ -233,15 +231,24 @@ class DETRTrackingBase(nn.Module):
         for i, (target, prev_ind) in enumerate(zip(targets, prev_indices)):
             prev_out_ind, prev_target_ind = prev_ind
 
-            #### Need to rewrite this; get rid of min_prev_target_ind; FPs are added later so it doesn't matter what min num of cells per chamber is
-            if prev_prev_track or keep_all_track:
+            if prev_prev_track or keep_all_track or self.evaluate_dataset_with_no_data_aug:
                 random_subset_mask = torch.randperm(len(prev_target_ind))
-            elif rand_num > 0.8:  #max number to be tracked since 
-                random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind]
-            elif rand_num < 0.5 and not group_object:
-                random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
+            elif rand_num > 0.3:  #max number to be tracked since 
+                random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)]
+            elif rand_num < 0.2:
+                random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)-1]
             else:
-                random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind - 1]
+                random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)-2]
+
+            # #### Need to rewrite this; get rid of min_prev_target_ind; FPs are added later so it doesn't matter what min num of cells per chamber is
+            # if prev_prev_track or keep_all_track:
+            #     random_subset_mask = torch.randperm(len(prev_target_ind))
+            # elif rand_num > 0.8:  #max number to be tracked since 
+            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind]
+            # elif rand_num < 0.5 and not group_object:
+            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
+            # else:
+            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind - 1]
 
             target['prev_ind'] = [prev_out_ind[random_subset_mask],prev_target_ind[random_subset_mask]]
 
@@ -279,7 +286,7 @@ class DETRTrackingBase(nn.Module):
         # Due to transformers needing the same number of track queries per batch (object queries is always the same), we need to add FPs to offset divisions or number of track queries
         # Only matters if we are using the prev prev frame when a division is tracked from prev prev frame to prev frame. This is because a single decoder output embedding can predict a cell division
         
-        self.calc_num_FPs(targets)
+        self.calc_num_FPs(targets,add_extra_FPs=not self.evaluate_dataset_with_no_data_aug)
 
         if dn_track:
             num_FPs = self.calc_num_FPs([target['dn_track'] for target in targets],return_FPs=True)
@@ -344,6 +351,7 @@ class DETRTrackingBase(nn.Module):
 
             # Add random false positives
             if target['num_FPs'] > 0:
+                assert self.evaluate_dataset_with_no_data_aug == False
                 self.add_FPs(target,i,prev_out)
 
             if 'dn_track' in target and dn_track['num_FPs'] > 0:
@@ -431,8 +439,8 @@ class DETRTrackingBase(nn.Module):
             assert torch.sum(boxes < 0) == 0, 'Bboxes need to have positive values'
 
             if prev_prev_track:
-                for k in range(1,len(target['tgt_div_masks'])):
-                    if target['tgt_div_masks'][k-1] and target['tgt_div_masks'][k]:
+                for k in range(1,len(target['tgt_div_ind'])):
+                    if target['tgt_div_ind'][k-1] > 0 and target['tgt_div_ind'][k-1] == target['tgt_div_ind'][k]:
                         boxes[k,:4] = boxes[k-1,4:] 
                     
             target['track_query_boxes'] = boxes[:,:4]
@@ -452,67 +460,93 @@ class DETRTrackingBase(nn.Module):
                 torch.tensor([False, ] * self.num_queries).to(self.device)
             ]).bool()
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, prev_out=None):
-        prev_prev_track = False
-        if targets is not None and not self._tracking:
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, prev_out=None, tm_threshold=None, evaluate_track=False):     
+        if targets is not None and (not self._tracking or self.evaluate_dataset_with_no_data_aug):
             prev_targets = [target['prev_target'] for target in targets]
 
-            backprop_context = torch.no_grad
-            if self._backprop_prev_frame:
-                backprop_context = nullcontext
+            prev_prev_track = False
 
-            with backprop_context():
-                if all(['prev_prev_image' in t for t in targets]):
-                    for target, prev_target in zip(targets, prev_targets):
-                        prev_target['prev_target'] = target['prev_prev_target']
+            if tm_threshold is None:
+                tm_threshold = 0.25
 
-                    prev_prev_targets = [target['prev_prev_target'] for target in targets]
-                    prev_cur_targets = [target['prev_cur_target'] for target in targets]
+            random_nb = random.random()
 
-                    for target, prev_cur_target in zip(targets, prev_cur_targets):
-                        prev_cur_target['prev_target'] = target['prev_prev_target']
+            if random_nb < tm_threshold:
+                track_cells = False
+            else:
+                track_cells = True
 
-                    # PREV PREV
-                    prev_prev_out, _, prev_prev_features, _, _ = super().forward([t['prev_prev_image'] for t in targets])
+            if track_cells:
+                # print('track')
+                backprop_context = torch.no_grad
+                if self._backprop_prev_frame:
+                    backprop_context = nullcontext
 
-                    prev_prev_outputs_without_aux = {
-                        k: v for k, v in prev_prev_out.items() if 'aux_outputs' not in k}
-                    prev_prev_indices = self._matcher(prev_prev_outputs_without_aux, prev_prev_targets)
+                with backprop_context():
+                    if all(['prev_prev_image' in t for t in targets]):
+                        for target, prev_target in zip(targets, prev_targets):
+                            prev_target['prev_target'] = target['prev_prev_target']
 
-                    prev_prev_indices, swap_prev_prev_indices = threshold_indices(prev_prev_indices,max_ind=prev_prev_out['pred_logits'].shape[1])
+                        prev_prev_targets = [target['prev_prev_target'] for target in targets]
+                        prev_cur_targets = [target['prev_cur_target'] for target in targets]
 
-                    self.add_track_queries_to_targets(
-                        prev_cur_targets, prev_prev_indices, swap_prev_prev_indices, prev_prev_out, keep_all_track=True)
+                        for target, prev_cur_target in zip(targets, prev_cur_targets):
+                            prev_cur_target['prev_target'] = target['prev_prev_target']
 
-                    prev_prev_track = True
+                        # PREV PREV
+                        prev_prev_out, _, prev_prev_features, _, _ = super().forward([t['prev_prev_image'] for t in targets])
 
-                    # PREV
-                    prev_out, _, prev_features, _, _ = super().forward(
-                        [t['prev_image'] for t in targets],
-                        prev_cur_targets,
-                        prev_prev_features)
+                        prev_prev_outputs_without_aux = {
+                            k: v for k, v in prev_prev_out.items() if 'aux_outputs' not in k}
+                        prev_prev_indices = self._matcher(prev_prev_outputs_without_aux, prev_prev_targets)
 
-                    prev_outputs_without_aux = {
-                        k: v for k, v in prev_out.items() if 'aux_outputs' not in k}
+                        prev_prev_indices, swap_prev_prev_indices = threshold_indices(prev_prev_indices,max_ind=prev_prev_out['pred_logits'].shape[1])
 
-                    prev_indices = self._matcher(prev_outputs_without_aux, prev_cur_targets)
+                        self.add_track_queries_to_targets(
+                            prev_cur_targets, prev_prev_indices, swap_prev_prev_indices, prev_prev_out, keep_all_track=True)
 
-                    prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
+                        prev_prev_track = True
 
-                else:
-                    prev_out, _, prev_features, _, _ = super().forward([t['prev_image'] for t in targets])
-                    prev_prev_track = False
+                        # PREV
+                        prev_out, _, prev_features, _, _ = super().forward(
+                            [t['prev_image'] for t in targets],
+                            prev_cur_targets,
+                            prev_prev_features)
 
-                    prev_outputs_without_aux = {
-                        k: v for k, v in prev_out.items() if 'aux_outputs' not in k}
+                        prev_outputs_without_aux = {
+                            k: v for k, v in prev_out.items() if 'aux_outputs' not in k}
 
-                    prev_indices = self._matcher(prev_outputs_without_aux, prev_targets)
+                        prev_indices = self._matcher(prev_outputs_without_aux, prev_cur_targets)
 
-                    prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
+                        prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
 
-                self.add_track_queries_to_targets(targets, prev_indices, swap_prev_indices, prev_outputs_without_aux,
-                                                  prev_prev_track=prev_prev_track, group_object=self.group_object,dn_track=self.dn_track)
+                    else:
+                        prev_out, _, prev_features, _, _ = super().forward([t['prev_image'] for t in targets])
+                        prev_prev_track = False
+                        # print(prev_out['pred_logits'])
+                        prev_outputs_without_aux = {
+                            k: v for k, v in prev_out.items() if 'aux_outputs' not in k}
 
+                        prev_indices = self._matcher(prev_outputs_without_aux, prev_targets)
+
+                        prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
+
+
+                    self.add_track_queries_to_targets(targets, prev_indices, swap_prev_indices, prev_outputs_without_aux,
+                                                    prev_prev_track=prev_prev_track,group_object=self.group_object,dn_track=self.dn_track)
+
+            else: # if we are perforoming object detection, we need to make sure the ground truths are all single cells as divided cells will be grouped as one
+                # print('object detection')
+                for target in targets:
+                    count = 0
+                    for b in range(len(target['boxes'])):
+                        if target['boxes'][b + count,-1] > 0:
+                            self.update_target(target,b+count,update_track_ids=False)
+                            count += 1
+
+                    target['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+
+                    assert (target['boxes'][:,-1] == 0).all()
 
         out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object, dn_object=self.dn_object)
 

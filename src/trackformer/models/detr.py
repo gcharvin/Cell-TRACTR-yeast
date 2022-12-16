@@ -165,7 +165,17 @@ class SetCriterion(nn.Module):
         self.focal_gamma = focal_gamma
         self.tracking = tracking
         self.track_query_false_positive_eos_weight = track_query_false_positive_eos_weight
+        self.device = args.device
         self.args = args
+
+    def update_target(self,target,index):
+
+        target['boxes'] = torch.cat((target['boxes'][:index],torch.cat((target['boxes'][index,:4],torch.zeros(4,).to(self.device)))[None],torch.cat((target['boxes'][index,4:],torch.zeros(4,).to(self.device)))[None],target['boxes'][index+1:]))
+        target['labels'] = torch.cat((target['labels'][:index],torch.cat((target['labels'][index,:1],torch.ones(1,).long().to(self.device)))[None],torch.cat((target['labels'][index,1:],torch.ones(1,).long().to(self.device)))[None],target['labels'][index+1:]))
+        
+        if 'masks' in target:
+            N,_,H,W = target['masks'].shape
+            target['masks'] = torch.cat((target['masks'][:index],torch.cat((target['masks'][index,:1],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],torch.cat((target['masks'][index,1:],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],target['masks'][index+1:]))
 
     def loss_labels(self, outputs, targets, indices, _, track=True, log=True):
         """Classification loss (NLL)
@@ -208,7 +218,7 @@ class SetCriterion(nn.Module):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
-    def loss_labels_focal(self, outputs, targets, indices, swap_indices, num_boxes, track_div, log=True):
+    def loss_labels_focal(self, outputs, targets, indices, swap_indices, num_boxes, track_div, two_stage=False, log=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -232,12 +242,13 @@ class SetCriterion(nn.Module):
 
         #### need update code. Current method is really confusing
         #### This tells me which cells divided from frame t-2 to t-1 which we are trying to track from frame t-1 to t
-        for i in range(len(targets)):
-            track_ind = torch.tensor([int(ind) for ind in indices[i][0] if ind < src_logits.shape[1] - self.args.num_queries])
-            tgt_ind = indices[i][1][indices[i][0].unsqueeze(1).eq(track_ind).nonzero()[:,0]]
+        if not two_stage:
+            for i in range(len(targets)):
+                track_ind = torch.tensor([int(ind) for ind in indices[i][0] if ind < src_logits.shape[1] - self.args.num_queries])
+                tgt_ind = indices[i][1][indices[i][0].unsqueeze(1).eq(track_ind).nonzero()[:,0]]
 
-            if len(track_ind) > 0: 
-                weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
+                if len(track_ind) > 0: 
+                    weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
         
 
         loss_ce = sigmoid_focal_loss(
@@ -250,7 +261,7 @@ class SetCriterion(nn.Module):
         return losses
 
     @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, swap_indices, num_boxes, track_div):
+    def loss_cardinality(self, outputs, targets, indices, swap_indices, num_boxes, track_div, two_stage=False):
         """ Compute the cardinality error, ie the absolute error in the number of
             predicted non-empty boxes. This is not really a loss, it is intended
             for logging purposes only. It doesn't propagate gradients
@@ -264,7 +275,7 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, swap_indices, num_boxes, track_div):
+    def loss_boxes(self, outputs, targets, indices, swap_indices, num_boxes, track_div, two_stage=False):
         """Compute the losses related to the bounding boxes, the L1 regression loss
            and the GIoU loss targets dicts must contain the key "boxes" containing
            a tensor of dim [nb_target_boxes, 4]. The target boxes are expected in
@@ -320,7 +331,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def loss_masks(self, outputs, targets, indices, swap_indices, num_boxes, track_div):
+    def loss_masks(self, outputs, targets, indices, swap_indices, num_boxes, track_div, two_stage=False):
         """Compute the losses related to the masks: the focal loss and the dice loss.
            targets dicts must contain the key "masks" containing a tensor of
            dim [nb_target_boxes, h, w]
@@ -401,7 +412,7 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def get_loss(self, loss, outputs, targets, indices, swap_indices, num_boxes, track_div, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices, swap_indices, num_boxes, track_div, two_stage=False, **kwargs):
         loss_map = {
             'labels': self.loss_labels_focal if self.focal_loss else self.loss_labels,
             'cardinality': self.loss_cardinality,
@@ -410,7 +421,7 @@ class SetCriterion(nn.Module):
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
 
-        return loss_map[loss](outputs, targets, indices, swap_indices, num_boxes, track_div, **kwargs)
+        return loss_map[loss](outputs, targets, indices, swap_indices, num_boxes, track_div, two_stage, **kwargs)
 
 
     def forward(self, outputs, targets, return_bbox_track_acc=True):
@@ -438,6 +449,8 @@ class SetCriterion(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item() 
+
+        assert sum([(target['boxes'][:,0] == 0).sum() for target in targets if not target['empty']]) == 0
 
         sizes = [len(target['labels']) - int(target["empty"]) for target in targets] 
         track_div = torch.zeros((int(num_boxes))).bool()
@@ -492,24 +505,48 @@ class SetCriterion(nn.Module):
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
-        # if 'enc_outputs' in outputs:
-        #     track = False
-        #     enc_outputs = outputs['enc_outputs']
-        #     bin_targets = copy.deepcopy(targets)
-        #     for bt in bin_targets:
-        #         bt['labels'] = torch.zeros_like(bt['labels'])
-        #     indices = self.matcher(enc_outputs, bin_targets, track)
-        #     for loss in self.losses:
-        #         if loss == 'masks':
-        #             # Intermediate masks losses are too costly to compute, we ignore them.
-        #             continue
-        #         kwargs = {}
-        #         if loss == 'labels':
-        #             # Logging is enabled only for the last layer
-        #             kwargs['log'] = False
-        #         l_dict = self.get_loss(loss, enc_outputs, bin_targets, indices, num_boxes, track, **kwargs)
-        #         l_dict = {k + f'_enc': v for k, v in l_dict.items()}
-        #         losses.update(l_dict)
+        if 'enc_outputs' in outputs:
+            enc_outputs = outputs['enc_outputs']
+            B,N,_ = enc_outputs['pred_logits'].shape
+            # bin_targets = copy.deepcopy(targets)
+            bin_targets = [{} for _ in range(len(targets))]
+
+            for b,bin_target in enumerate(bin_targets):
+                bin_target['labels'] = targets[b]['labels'].clone()
+                bin_target['boxes'] = targets[b]['boxes'].clone()
+                bin_target['empty'] = targets[b]['empty'].clone()
+                # if 'track_query_match_ids' in bin_target:
+                #     bin_target.pop('track_query_match_ids')
+                count = 0
+                for b in range(len(bin_target['boxes'])):
+                    if bin_target['boxes'][b + count,-1] > 0:
+                        self.update_target(bin_target,b+count)
+                        count += 1
+
+                if not bin_target['empty']:
+                    assert (bin_target['labels'][0:,0] == 0).all() and (bin_target['labels'][0:,1] == 1).all()
+                    assert (bin_target['boxes'][:,-1] == 0).all()
+
+            enc_outputs['pred_boxes'] = torch.cat((enc_outputs['pred_boxes'],torch.zeros_like(enc_outputs['pred_boxes']).to(self.device)),axis=-1)
+
+            num_boxes = sum(len(t["labels"]) for t in bin_targets) - sum(t["empty"] for t in bin_targets)
+            track_div = torch.zeros((num_boxes)).bool()
+
+            indices = self.matcher(enc_outputs, bin_targets)
+            indices, swap_indices = threshold_indices(indices,max_ind=N)
+            assert sum([len(ind) for ind in swap_indices]) == 0
+            
+            for loss in self.losses:
+                if (loss == 'masks' and 'pred_masks' not in aux_outputs) or (sum(sizes) == 0 and loss != 'labels'):
+                    # Intermediate masks losses are too costly to compute, we ignore them.
+                    continue
+                kwargs = {}
+                if loss == 'labels':
+                    # Logging is enabled only for the last layer
+                    kwargs['log'] = False
+                l_dict = self.get_loss(loss, enc_outputs, bin_targets, indices, swap_indices, num_boxes, track_div, two_stage=True, **kwargs)
+                l_dict = {k + f'_enc': v for k, v in l_dict.items()}
+                losses.update(l_dict)
 
         if return_bbox_track_acc:
             return losses, metrics

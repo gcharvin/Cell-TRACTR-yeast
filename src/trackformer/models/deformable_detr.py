@@ -268,7 +268,6 @@ class DeformableDETR(DETR):
             num_total_queries = query_embeds.shape[1] + num_track_queries 
 
             query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)
-            #query_attn_mask[:num_track_queries,num_track_queries:] = True
 
             #### Group-DETR
             if group_object:

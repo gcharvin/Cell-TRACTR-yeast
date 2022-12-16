@@ -167,6 +167,9 @@ def build_cells(image_set,args):
     transforms, norm_transforms = make_coco_transforms_cells(
         image_set, args.img_transform, args.overflow_boxes)
 
+    if args.evaluate_dataset_with_no_data_aug:
+        transforms = None
+
     dataset = MOT(
         img_folder, ann_file, transforms, norm_transforms,
         prev_frame_range=prev_frame_range,

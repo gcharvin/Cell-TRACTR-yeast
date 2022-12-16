@@ -59,6 +59,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
     model.train()
     criterion.train()
 
+    if epoch > 10:
+        tm_threshold = 0.2
+    elif epoch > 20:
+        tm_threshold = 0.1
+    else:
+        tm_threshold = 0.4
+
     ids = np.random.randint(0,len(data_loader),num_plots)
     ids = np.concatenate((ids,[0]))
 
@@ -69,7 +76,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets)
+        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -86,7 +93,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
             meta_data[training_method]['loss_dict'] = loss_dict_TM
 
         outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
-
 
         loss_dict, acc_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
@@ -119,7 +125,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
 
         if i in ids and (epoch % 5 == 0 or epoch == 1):
-            utils.plot_results(outputs, prev_outputs, targets,samples, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
@@ -137,13 +143,19 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
     ids = np.random.randint(0,len(data_loader),num_plots)
     ids = np.concatenate((ids,[0]))
 
+    if epoch > 10:
+        tm_threshold = 0.4
+    elif epoch > 20:
+        tm_threshold = 0.1
+    else:
+        tm_threshold = 0.2
 
     metrics_dict = {}
     for i, (samples, targets) in enumerate(data_loader):
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets)
+        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -178,7 +190,7 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
         if i in ids and (epoch % 5 == 0 or epoch == 1) and train:
-            utils.plot_results(outputs, prev_outputs, targets,samples, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
@@ -611,6 +623,52 @@ def run_pipeline(model, fps, device, output_dir, args):
         cv2.imwrite(str(output_dir / 'predictions' / (f'{method}_object_query_box_locations.png')),query_frames)
         
 
+
+@torch.no_grad()
+def print_worst(model, criterion, dataset_train, dataset_val, device, output_dir, args):
+    model.eval()
+    model._tracking = True
+    criterion.eval()
+
+    save_folder = 'save_worst_predictions'
+    (output_dir / save_folder).mkdir(exist_ok=True)
+    (output_dir / save_folder / 'train_outputs').mkdir(exist_ok=True)
+    (output_dir / save_folder / 'eval_outputs').mkdir(exist_ok=True)
+
+    for didx,dataset in enumerate([dataset_train,dataset_val]):
+        num_img = len(dataset) // 2
+        store_loss = torch.zeros((num_img))
+
+        for idx in tqdm(range(num_img)):
+            samples, targets = dataset[idx*2]
+            targets = [targets]
+            samples = samples.to(device)
+            targets = [utils.nested_dict_to_device(t, device) for t in targets]
+
+            outputs, targets, features, memory, hs, prev_outputs = model(samples[None],targets,tm_threshold=0,evaluate_track=True)
+
+            loss_dict, acc_dict = criterion(outputs, targets)
+            weight_dict = criterion.weight_dict
+
+            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+            store_loss[idx] = losses.item()
+            # if losses.item() > 10:
+            #     print(didx,idx)
+            #     utils.plot_results(outputs, prev_outputs, targets,samples[None], args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Blah_Loss_{store_loss[idx]:.2f}.png')
+
+        worst_ind = torch.argsort(store_loss)[-50:]
+
+        for ind in worst_ind:
+
+            samples, targets = dataset[int(ind)*2]
+            samples = samples[None]
+            targets = [targets]
+            samples = samples.to(device)
+            targets = [utils.nested_dict_to_device(t, device) for t in targets]
+
+            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0,evaluate_track=True)
+
+            utils.plot_results(outputs, prev_outputs, targets,samples, args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Loss_{store_loss[ind]:.2f}.png')
 
 
 

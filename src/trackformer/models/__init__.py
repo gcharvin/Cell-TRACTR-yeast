@@ -54,7 +54,8 @@ def build_model(args):
         'dn_track_l1': args.dn_track_l1,
         'dn_track_l2': args.dn_track_l2,
         'dn_object': args.dn_object,
-        'refine_div_track_queries': args.refine_div_track_queries}
+        'refine_div_track_queries': args.refine_div_track_queries,
+        'evaluate_dataset_with_no_data_aug': args.evaluate_dataset_with_no_data_aug}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,
@@ -115,6 +116,7 @@ def build_model(args):
 
         if args.two_stage:
             aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
+            aux_weight_dict.pop('loss_enc')
         weight_dict.update(aux_weight_dict)
 
 

@@ -24,7 +24,7 @@ class DeformableTransformer(nn.Module):
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024,
                  dropout=0.1, activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
-                 two_stage=False, two_stage_num_proposals=300,
+                 two_stage=False, num_queries=30,
                  use_dab=False, high_dim_query_update=False, no_sine_embed=False,
                  multi_frame_attention_separate_encoder=False, 
                  refine_track_queries=False, refine_div_track_queries=False):
@@ -33,7 +33,7 @@ class DeformableTransformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
         self.two_stage = two_stage
-        self.two_stage_num_proposals = two_stage_num_proposals
+        self.num_queries = num_queries
         self.num_feature_levels = num_feature_levels
         self.multi_frame_attention_separate_encoder = multi_frame_attention_separate_encoder
         self.use_dab = use_dab
@@ -66,8 +66,12 @@ class DeformableTransformer(nn.Module):
         if two_stage:
             self.enc_output = nn.Linear(d_model, d_model)
             self.enc_output_norm = nn.LayerNorm(d_model)
-            self.pos_trans = nn.Linear(d_model * 2, d_model * 2)
-            self.pos_trans_norm = nn.LayerNorm(d_model * 2)
+            if self.use_dab:
+                self.pos_trans = nn.Linear(d_model * 2, d_model)
+                self.pos_trans_norm = nn.LayerNorm(d_model)
+            else:
+                self.pos_trans = nn.Linear(d_model * 2, d_model * 2)
+                self.pos_trans_norm = nn.LayerNorm(d_model * 2)
         else:
             if not self.use_dab:
                 self.reference_points = nn.Linear(d_model, 2)
@@ -149,7 +153,8 @@ class DeformableTransformer(nn.Module):
 
     def forward(self, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None):
         assert self.two_stage or query_embed is not None
-        assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
+        if not self.two_stage:
+            assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
 
         # prepare input for encoder
         src_flatten = []
@@ -206,16 +211,24 @@ class DeformableTransformer(nn.Module):
 
             # hack implementation for two-stage Deformable DETR
             enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory)[...,:output_proposals.shape[-1]] + output_proposals
 
-            topk = min(self.two_stage_num_proposals,enc_outputs_class.shape[1])
+            assert self.num_queries <= enc_outputs_class.shape[1]
+            topk = self.num_queries
+            # topk = min(self.two_stage_num_proposals,enc_outputs_class.shape[1])
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
             topk_coords_unact = topk_coords_unact.detach()
             reference_points = topk_coords_unact.sigmoid()
             init_reference_out = reference_points
-            pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-            query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+
+            if self.use_dab:
+                tgt = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
+                query_embed = None
+            else:
+                pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
+                query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+
         elif self.use_dab:
             reference_points = query_embed[..., self.d_model:].sigmoid() 
             tgt = query_embed[..., :self.d_model]
@@ -257,14 +270,14 @@ class DeformableTransformer(nn.Module):
                 prev_hs_embed_dn_track = [t['track_query_hs_embeds'] for t in targets_dn_track]
                 prev_boxes_dn_track = torch.stack([t['track_query_boxes'] for t in targets_dn_track])
 
-                if self.refine_div_track_queries:
-                    # We want to inject noise into the divided cells
-                    # I randomly flip because I don't want to memorize
+                # if self.refine_div_track_queries:
+                #     # We want to inject noise into the divided cells
+                #     # I randomly flip because I don't want to memorize
 
-                    for tidx,target in enumerate(targets):
-                        rand_nb = torch.randint(2,(1,))[0]
-                        prev_hs_embed_dn_track[tidx][torch.where(target['tgt_div_ind'] == 1)] += self.div_track_embedding.weight[rand_nb]
-                        prev_hs_embed_dn_track[tidx][torch.where(target['tgt_div_ind'] == 2)] += self.div_track_embedding.weight[1 - rand_nb]
+                #     for tidx,target in enumerate(targets):
+                #         rand_nb = torch.randint(2,(1,))[0]
+                #         prev_hs_embed_dn_track[tidx][torch.where(target['tgt_div_ind'] == 1)] += self.div_track_embedding.weight[rand_nb]
+                #         prev_hs_embed_dn_track[tidx][torch.where(target['tgt_div_ind'] == 2)] += self.div_track_embedding.weight[1 - rand_nb]
 
                 prev_hs_embed_dn_track = torch.stack(prev_hs_embed_dn_track)
 
@@ -544,7 +557,7 @@ def build_deforamble_transformer(args):
         dec_n_points=args.dec_n_points,
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
-        two_stage_num_proposals=args.num_queries,
+        num_queries=args.num_queries,
         use_dab=args.use_dab,
         multi_frame_attention_separate_encoder=args.multi_frame_attention and args.multi_frame_attention_separate_encoder,
         )
