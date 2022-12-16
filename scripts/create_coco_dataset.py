@@ -122,7 +122,7 @@ def create_anno(mask,cell,image_id,track_id,annotation_id,category_id,min_area=2
 
     return annotation
 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells/raw_data_ordered')
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/raw_data_ordered')
 
 anno_folder = 'annotations'
 (datapath.parent / anno_folder).mkdir(exist_ok=True)
