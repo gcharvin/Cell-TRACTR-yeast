@@ -583,8 +583,8 @@ def gen_sineembed_for_position(pos_tensor,d_model):
     # n_query, bs, _ = pos_tensor.size()
     # sineembed_tensor = torch.zeros(n_query, bs, 288)
     scale = 2 * math.pi
-    dim_t = torch.arange((d_model // 2), dtype=torch.float32, device=pos_tensor.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / (d_model // 2))
+    dim_t = torch.arange(torch.div(d_model,2,rounding_mode='floor'), dtype=torch.float32, device=pos_tensor.device)
+    dim_t = 10000 ** (2 * torch.div(dim_t,2,rounding_mode='floor') / torch.div(d_model,2,rounding_mode='floor'))
     x_embed = pos_tensor[:, :, 0] * scale
     y_embed = pos_tensor[:, :, 1] * scale
     pos_x = x_embed[:, :, None] / dim_t
