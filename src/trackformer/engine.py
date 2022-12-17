@@ -53,7 +53,7 @@ def calc_loss_for_training_methods(training_method:str,
     return outputs_TM, loss_dict_TM, groups
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postprocessors,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                    data_loaders: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, args, num_plots=10, interval = 50):
     dataset = 'train'
     model.train()
@@ -66,12 +66,34 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
     else:
         tm_threshold = 0.4
 
-    ids = np.random.randint(0,len(data_loader),num_plots)
+    ids = np.random.randint(0,len(data_loaders[0]),num_plots)
     ids = np.concatenate((ids,[0]))
 
     metrics_dict = {}
 
-    for i, (samples, targets) in enumerate(data_loader):
+    for i,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
+    
+        samples = cur_samples
+        targets = cur_targets
+
+        for t,target in enumerate(targets):
+                target['prev_prev_target'] = prev_prev_targets[t]
+                target['prev_prev_image'] = prev_prev_samples.tensors[t]
+
+                target['prev_cur_target'] = prev_cur_targets[t]
+                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+
+                target['prev_target'] = prev_targets[t]
+                target['prev_image'] = prev_samples.tensors[t]
+
+                target['fut_prev_target'] = fut_prev_targets[t]
+                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+
+                target['fut_target'] = fut_targets[t]
+                target['fut_image'] = fut_samples.tensors[t]
+
+                assert target['image_id'] == prev_prev_targets[t]['image_id']
+                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
 
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
@@ -83,7 +105,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
         meta_data = {}
     
         groups = [0]
-        groups.append(groups[-1] + len(targets[0]['track_queries_mask']))
+        groups.append(groups[-1] + outputs['pred_logits'].shape[1])
 
         for training_method in training_methods:
             meta_data[training_method] = {}
@@ -117,10 +139,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_max_norm)
         optimizer.step()
 
-        metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
+        if i == 0:
+            lr = np.zeros((1,len(optimizer.param_groups)))
+            for p,param_group in enumerate(optimizer.param_groups):
+                lr[0,p] = param_group['lr']
+
+        metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i,lr)
 
         dict_shape = metrics_dict['loss_ce'].shape
         for metrics_dict_key in metrics_dict.keys():
+            if metrics_dict_key == 'lr':
+                continue
             assert metrics_dict[metrics_dict_key].shape[:2] == dict_shape, 'Metrics needed to be added per epoch'
 
 
@@ -128,19 +157,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
             utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
-            utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
+            utils.display_loss(metrics_dict,i,len(data_loaders[0]),epoch=epoch,dataset=dataset)
 
     utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset)  
 
 
+
+
+
 @torch.no_grad()
-def evaluate(model, criterion, data_loader, device, output_dir: str, 
+def evaluate(model, criterion, data_loaders, device, output_dir: str, 
              args, epoch: int = None, train=False, interval=50):
     model.eval()
     criterion.eval()
     dataset = 'val'
     num_plots = 10
-    ids = np.random.randint(0,len(data_loader),num_plots)
+    ids = np.random.randint(0,len(data_loaders[0]),num_plots)
     ids = np.concatenate((ids,[0]))
 
     if epoch > 10:
@@ -151,7 +183,30 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
         tm_threshold = 0.2
 
     metrics_dict = {}
-    for i, (samples, targets) in enumerate(data_loader):
+    for i,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
+        
+        samples = cur_samples
+        targets = cur_targets
+
+        for t,target in enumerate(targets):
+                target['prev_prev_target'] = prev_prev_targets[t]
+                target['prev_prev_image'] = prev_prev_samples.tensors[t]
+
+                target['prev_cur_target'] = prev_cur_targets[t]
+                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+
+                target['prev_target'] = prev_targets[t]
+                target['prev_image'] = prev_samples.tensors[t]
+
+                target['fut_prev_target'] = fut_prev_targets[t]
+                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+
+                target['fut_target'] = fut_targets[t]
+                target['fut_image'] = fut_samples.tensors[t]
+
+                assert target['image_id'] == prev_prev_targets[t]['image_id']
+                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
@@ -162,7 +217,7 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
         meta_data = {}
 
         groups = [0]
-        groups.append(groups[-1] + len(targets[0]['track_queries_mask']))
+        groups.append(groups[-1] + outputs['pred_logits'].shape[1])
 
         for training_method in training_methods:
             meta_data[training_method] = {}
@@ -193,7 +248,7 @@ def evaluate(model, criterion, data_loader, device, output_dir: str,
             utils.plot_results(outputs, prev_outputs, targets,samples.tensors, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
-            utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
+            utils.display_loss(metrics_dict,i,len(data_loaders[0]),epoch=epoch,dataset=dataset)
 
     utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset)  
 

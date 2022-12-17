@@ -32,7 +32,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 def train(args: Namespace) -> None:
 
     
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_group" if args.group_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
+    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_refactored_dataloader_{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_group" if args.group_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
     # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/221208_dn_track_dab_no_mask/checkpoint.pth')
     args.save_model_interval = False
     # args.resume_optim = False
@@ -76,8 +76,6 @@ def train(args: Namespace) -> None:
     seed = args.seed + utils.get_rank()
 
     os.environ['PYTHONHASHSEED'] = str(seed)
-    # os.environ['NCCL_DEBUG'] = 'INFO'
-    # os.environ["NCCL_TREE_THRESHOLD"] = "0"
 
     np.random.seed(seed)
     random.seed(seed)
@@ -127,35 +125,42 @@ def train(args: Namespace) -> None:
     args_drop_num = args.epochs // args.lr_drop
     lr_drop = [args.lr_drop * i for i in range(1,args_drop_num+1)]
 
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, lr_drop, gamma=0.5)
+    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, lr_drop, gamma=0.1)
 
-    dataset_train = build_dataset(split='train', args=args)
-    dataset_val = build_dataset(split='val', args=args)
+    datasets_train = build_dataset(split='train', args=args)
+    datasets_val = build_dataset(split='val', args=args)
 
-    if args.distributed:
-        sampler_train = utils.DistributedWeightedSampler(dataset_train)
-        # sampler_train = DistributedSampler(dataset_train)
-        sampler_val = DistributedSampler(dataset_val, shuffle=False)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    data_loaders_train = []
+    data_loaders_val = []
 
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
+    for dataset_train, dataset_val in zip(datasets_train,datasets_val):
+        gen = torch.Generator(device='cpu')
+        gen.manual_seed(1)
+        if args.distributed:
+            sampler_train = utils.DistributedWeightedSampler(dataset_train)
+            sampler_val = DistributedSampler(dataset_val, shuffle=False)
+        else:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train,generator=gen)
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    data_loader_train = DataLoader(
-        dataset_train,
-        batch_sampler=batch_sampler_train,
-        collate_fn=utils.collate_fn,
-        num_workers=args.num_workers)
-    data_loader_val = DataLoader(
-        dataset_val, args.batch_size,
-        sampler=sampler_val,
-        drop_last=False,
-        collate_fn=utils.collate_fn,
-        num_workers=args.num_workers)
+        batch_sampler_train = torch.utils.data.BatchSampler(
+            sampler_train, args.batch_size, drop_last=True)
 
-    best_val_stats = None
+        data_loader_train = DataLoader(
+            dataset_train,
+            batch_sampler=batch_sampler_train,
+            collate_fn=utils.collate_fn,
+            num_workers=args.num_workers)
+        data_loader_val = DataLoader(
+            dataset_val, args.batch_size,
+            sampler=sampler_val,
+            drop_last=False,
+            collate_fn=utils.collate_fn,
+            num_workers=args.num_workers)
+
+        data_loaders_train.append(data_loader_train)
+        data_loaders_val.append(data_loader_val)
+
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -192,28 +197,10 @@ def train(args: Namespace) -> None:
                     resume_state_dict[k] = v
                     print(f'Load {k} {tuple(v.shape)} from scratch.')
                     continue
-                #     if checkpoint_value.shape[1] * 2 == v.shape[1]:
-                #         # from hidden size 256 to 512
-                #         resume_value = checkpoint_value.repeat(1, 2)
-                #     elif checkpoint_value.shape[0] * 5 == v.shape[0]:
-                #         # from 100 to 500 object queries
-                #         resume_value = checkpoint_value.repeat(5, 1)
-                #     elif checkpoint_value.shape[0] > v.shape[0]:
-                #         resume_value = checkpoint_value[:v.shape[0]]
-                #     elif checkpoint_value.shape[0] < v.shape[0]:
-                #         resume_value = v
-                #     else:
-                #         raise NotImplementedError
                 elif 'linear2' in k or 'input_proj' in k:
                     resume_value = checkpoint_value.repeat((2,) + (num_dims - 1) * (1, ))
                 elif 'class_embed' in k:
-                    # person and no-object class
-                    # resume_value = checkpoint_value[[1, -1]]
-                    # resume_value = checkpoint_value[[0, -1]]
-                    # resume_value = checkpoint_value[[1,]]
                     resume_value = checkpoint_value[list(range(0, 20))]
-                    # resume_value = v
-                    # print(f'Load {k} {tuple(v.shape)} from scratch.')
                 else:
                     raise NotImplementedError(f"No rule for {k} with shape {v.shape}.")
 
@@ -221,10 +208,7 @@ def train(args: Namespace) -> None:
                       f"{tuple(checkpoint_value.shape)}.")
             elif args.resume_shift_neuron and 'class_embed' in k:
                 checkpoint_value = checkpoint_state_dict[k]
-                # no-object class
                 resume_value = checkpoint_value.clone()
-                # no-object class
-                # resume_value[:-2] = checkpoint_value[1:-1].clone()
                 resume_value[:-1] = checkpoint_value[1:].clone()
                 resume_value[-2] = checkpoint_value[0].clone()
                 print(f"Load {k} {tuple(v.shape)} from resume model and "
@@ -265,7 +249,6 @@ def train(args: Namespace) -> None:
                 args.start_epoch = checkpoint['epoch'] + 1
                 print(f"RESUME EPOCH: {args.start_epoch}")
 
-            best_val_stats = checkpoint['best_val_stats']
 
     if args.eval_only:
         evaluate(
@@ -281,22 +264,27 @@ def train(args: Namespace) -> None:
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_one_epoch(
-            model, criterion, postprocessors, data_loader_train, optimizer, device, epoch, args, num_plots)
+            model, criterion, postprocessors, data_loaders_train, optimizer, device, epoch, args, num_plots)
 
         if args.eval_train:
             random_transforms = data_loader_train.dataset._transforms
-            data_loader_train.dataset._transforms = data_loader_val.dataset._transforms
+
+            for data_loader_train in data_loaders_train:
+                data_loader_train.dataset._transforms = data_loaders_val[0].dataset._transforms
+
             evaluate(
-                model, criterion, postprocessors, data_loader_train, device,
+                model, criterion, postprocessors, data_loaders_train, device,
                 output_dir, args, epoch, train=True)
-            data_loader_train.dataset._transforms = random_transforms
+
+            for data_loader_train in data_loaders_train:
+                data_loader_train.dataset._transforms = random_transforms
 
         lr_scheduler.step()
 
         checkpoint_paths = [output_dir / 'checkpoint.pth']
 
         evaluate(
-            model, criterion, data_loader_val, device,
+            model, criterion, data_loaders_val, device,
             output_dir, args, epoch, train=True)
 
         # MODEL SAVING
