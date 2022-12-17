@@ -152,15 +152,17 @@ def create_anno(mask,cell,image_id,track_id,annotation_id,category_id,min_area=2
         'empty': empty,
     }
 
-    if not empty:
+    if not empty and track_id > 0:
         annotation['track_id'] = track_id
 
     return annotation
 
 
-def compile_annotations(prev_gt,cur_gt,prev_annotations,cur_annotations,track_id,anno_ids):
+def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id):
 
-    prev_annotation_id, cur_annotation_id = anno_ids
+    prev_gt,cur_gt = gts
+    prev_annotations,cur_annotations = annotations_old
+    prev_annotation_id, cur_annotation_id = annotation_ids_old
 
     cells_prev = np.unique(prev_gt)[1:]
     cells_cur = np.unique(cur_gt)[1:]
@@ -174,10 +176,12 @@ def compile_annotations(prev_gt,cur_gt,prev_annotations,cur_annotations,track_id
     cells_track = [i for i in cells_prev if i in cells_cur]
     # 2.) Cells that appear in the new frame (this should not happen for mothermachine)
     cells_new = [i for i in cells_cur if i not in cells_prev]
+    assert len(cells_new) == 0
     # 3.) Cells that exit the chamber; The cell exists in the previous frame but is gone in the current frame
     cells_leave = [i for i in cells_prev if i not in cells_cur]
 
     cells_all = cells_track + cells_new + cells_leave
+    assert len(cells_all) == len(set(cells_all))
     
     # First check for empty chambers and make an annotation per empty chamber
     # Images with no objects are trickier to deal; this is a hack implementation
@@ -188,57 +192,59 @@ def compile_annotations(prev_gt,cur_gt,prev_annotations,cur_annotations,track_id
         print('Empty chamber in previous frame only')
         if mothermachine:
             raise Exception('Cells cannot spontaneously spawn in the current frame if they don"t exist in the previous frame')
-        prev_annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
-        prev_annotations.append(prev_annotation)
+        annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
+        prev_annotations.append(annotation)
         prev_annotation_id += 1
 
     elif len(cells_prev) != 0 and len(cells_cur) == 0:
         print('Empty chamber in current frame only')
-        cur_annotation = create_anno(cur_gt,cell,image_id+1,-1,cur_annotation_id,category_id)
-        cur_annotations.append(cur_annotation)
+        annotation = create_anno(cur_gt,cell,image_id,-1,cur_annotation_id,category_id)
+        cur_annotations.append(annotation)
         cur_annotation_id += 1        
 
     elif len(cells_prev) == 0 and len(cells_cur) == 0:
         print('Empty chambers in previous and current frame')
-        prev_annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
-        prev_annotations.append(prev_annotation)
+        annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
+        prev_annotations.append(annotation)
         prev_annotation_id += 1
 
-        cur_annotation = create_anno(cur_gt,cell,image_id+1,-1,cur_annotation_id,category_id)
-        cur_annotations.append(cur_annotation)
+        annotation = create_anno(cur_gt,cell,image_id,-1,cur_annotation_id,category_id)
+        cur_annotations.append(annotation)
         cur_annotation_id += 1
 
     # Then iterate through all cells to create the standard annotations
     for cell in cells_all:
         if cell in cells_track:
 
-            prev_annotation = create_anno(prev_gt,cell,image_id,track_id,prev_annotation_id,category_id)
-            prev_annotations.append(prev_annotation)
+            annotation = create_anno(prev_gt,cell,image_id,track_id,prev_annotation_id,category_id)
+            prev_annotations.append(annotation)
             prev_annotation_id += 1
 
-            cur_annotation = create_anno(cur_gt,cell,image_id+1,track_id,cur_annotation_id,category_id)
-            cur_annotations.append(cur_annotation)                    
+            annotation = create_anno(cur_gt,cell,image_id,track_id,cur_annotation_id,category_id)
+            cur_annotations.append(annotation)                    
             cur_annotation_id += 1
 
             track_id += 1
 
         elif cell in cells_leave:
-            prev_annotation = create_anno(prev_gt,cell,image_id,track_id,prev_annotation_id,category_id)
-            prev_annotations.append(prev_annotation)
+            annotation = create_anno(prev_gt,cell,image_id,track_id,prev_annotation_id,category_id)
+            prev_annotations.append(annotation)
             prev_annotation_id += 1
             track_id += 1
 
         elif cell in cells_new:
-            cur_annotation = create_anno(cur_gt,cell,image_id+1,track_id,cur_annotation_id,category_id)
+            assert False
+            cur_annotation = create_anno(cur_gt,cell,image_id,track_id,cur_annotation_id,category_id)
             cur_annotations.append(cur_annotation)                    
             cur_annotation_id += 1
             track_id += 1
         else:
             print('error')
 
-    anno_ids = [prev_annotation_id,cur_annotation_id]
+    updated_annotation_ids = [prev_annotation_id,cur_annotation_id]
+    updated_annotations = [prev_annotations,cur_annotations]
 
-    return cur_annotations, prev_annotations, track_id, anno_ids
+    return updated_annotations, track_id, updated_annotation_ids
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
 
@@ -308,7 +314,7 @@ val_fns = sorted(fns[split:])
 # Remove old data
 for folder in folders:
 
-    for time_ref in ['fut_','cur_','prev_','prev_prev_']:
+    for time_ref in ['fut_','fut_prev_','cur_','prev_','prev_prev_','prev_cur_']:
         for img_type in ['img','gt']:
             (datapath/ folder / (time_ref + img_type)).mkdir(exist_ok=True)
 
@@ -325,7 +331,6 @@ for folder in folders:
 
 for idx,dataset_fns in enumerate([train_fns,val_fns]):
     # These ids will be automatically increased as we go
-    annotation_id = 0
     image_id = 0
     track_id = 1
     
@@ -385,10 +390,10 @@ for idx,dataset_fns in enumerate([train_fns,val_fns]):
 
         gts = [[prev_prev_gt,prev_cur_gt],[prev_gt,cur_gt],[fut_prev_gt,fut_gt]]
 
-        for k, ((gt_0,gt_1),(anno_0,anno_1),anno_ids) in enumerate(zip(gts,annotations,annotation_ids)):
-            anno_0,anno_1,track_id, anno_ids = compile_annotations(gt_0,gt_1,anno_0,anno_1,track_id,anno_ids)
-            annotations[k] = [anno_0,anno_1]
-            annotation_ids[k] = anno_ids
+        for k in range(len(gts)):
+            updated_annotations,track_id, updated_annotation_ids = compile_annotations(gts[k],annotations[k],annotation_ids[k],track_id,image_id)
+            annotations[k] = updated_annotations
+            annotation_ids[k] = updated_annotation_ids
 
 
         image = {
@@ -399,7 +404,6 @@ for idx,dataset_fns in enumerate([train_fns,val_fns]):
             'id': image_id,
             'frame_id': 0,
             'seq_length': 1,
-            'first_frame_image_id': image_id
             }    
 
         images.append(image)
@@ -407,21 +411,21 @@ for idx,dataset_fns in enumerate([train_fns,val_fns]):
         image_id += 1
 
         cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_img' / fn),prev_prev_img)
-        cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_img' / fn),prev_img)
-        
-        cv2.imwrite(str(datapath / folders[idx] / 'prev_img' / fn),prev_img)
-        cv2.imwrite(str(datapath / folders[idx] / 'cur_img' / fn),cur_img)
-
-        cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_img' / fn),cur_img)
-        cv2.imwrite(str(datapath / folders[idx] / 'fut_img' / fn),fut_img)
-
-        cv2.imwrite(str(datapath / folders[idx] / 'prev_gt' / fn),prev_gt)
-        cv2.imwrite(str(datapath / folders[idx] / 'cur_gt' / fn),cur_gt)
-
         cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_gt' / fn),prev_prev_gt)
+
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_img' / fn),prev_img)        
         cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_gt' / fn),prev_cur_gt)
 
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_img' / fn),prev_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_gt' / fn),prev_gt)
+
+        cv2.imwrite(str(datapath / folders[idx] / 'cur_img' / fn),cur_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'cur_gt' / fn),cur_gt)
+        
+        cv2.imwrite(str(datapath / folders[idx] / 'fut_img' / fn),fut_img)
         cv2.imwrite(str(datapath / folders[idx] / 'fut_gt' / fn),fut_gt)
+
+        cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_img' / fn),cur_img)
         cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_gt' / fn),fut_prev_gt)
     
     json_folders = ['prev_prev','prev_cur','prev','cur','fut_prev','fut']
