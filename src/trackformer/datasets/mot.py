@@ -152,25 +152,10 @@ def build_cells(image_set,args):
 
     split = image_set
 
-    # img_folder = root / split / 'cur_img'
-    # ann_file = root / 'annotations'/ split / "cur.json"
-
-    transforms, norm_transforms = make_coco_transforms_cells(
-        image_set, args.img_transform, args.overflow_boxes)
+    transforms, norm_transforms = make_coco_transforms_cells(image_set)
 
     if args.evaluate_dataset_with_no_data_aug:
         transforms = None
-
-    # dataset = MOT(
-    #     img_folder, ann_file, transforms, norm_transforms,
-    #     prev_frame_range=prev_frame_range,
-    #     return_masks=args.masks,
-    #     overflow_boxes=args.overflow_boxes,
-    #     remove_no_obj_imgs=False,
-    #     prev_frame=args.tracking,
-    #     prev_frame_rnd_augs=prev_frame_rnd_augs,
-    #     prev_prev_frame=prev_prev_frame,
-    #     )
 
     datasets = []
     img_folders = ['prev_prev_img', 'prev_cur_img', 'prev_img', 'cur_img', 'fut_prev_img', 'fut_img']

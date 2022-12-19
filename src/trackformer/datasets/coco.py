@@ -80,26 +80,6 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
         return img, target
 
-    # def __getitem__(self, idx):
-    #     random_state = {
-    #         'random': random.getstate(),
-    #         'torch': torch.random.get_rng_state()}
-    #     img, target = self._getitem_from_id(idx, random_state, random_jitter=False)
-
-    #     if self._prev_frame:
-    #         # PREV
-    #         prev_img, prev_target = self._getitem_from_id(idx, random_state)
-    #         target[f'prev_image'] = prev_img
-    #         target[f'prev_target'] = prev_target
-
-    #         if self._prev_prev_frame:
-    #             # PREV PREV
-    #             prev_prev_img, prev_prev_target = self._getitem_from_id(idx, random_state)
-    #             target[f'prev_prev_image'] = prev_prev_img
-    #             target[f'prev_prev_target'] = prev_prev_target
-
-    #     return img, target
-
     def write_result_files(self, *args):
         pass
 
@@ -123,7 +103,6 @@ def convert_coco_poly_to_mask(segmentations, height, width):
         for r,rles in enumerate(rles_list):
             if len(rles) > 0:
                 mask[:,:,r,0] = torch.from_numpy(coco_mask.decode(rles)[:,:,0])
-        # mask = torch.as_tensor(mask, dtype=torch.uint8)
         mask = mask.any(dim=-1)
         masks.append(mask)
     if masks:
@@ -168,13 +147,6 @@ class ConvertCocoPolysToMask(object):
             masks = convert_coco_poly_to_mask(segmentations, h, w)
 
         if not empty:
-            # keypoints = None
-            # if anno and "keypoints" in anno[0]:
-            #     keypoints = [obj["keypoints"] for obj in anno]
-            #     keypoints = torch.as_tensor(keypoints, dtype=torch.float32)
-            #     num_keypoints = keypoints.shape[0]
-            #     if num_keypoints:
-            #         keypoints = keypoints.view(num_keypoints, -1, 3)
 
             keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0]) 
             keep_2 = (((boxes[:, 7] > boxes[:, 5]) & (boxes[:, 6] > boxes[:, 4])) + (torch.sum(boxes[:,4:],axis=1) == 0)) > 0
@@ -186,8 +158,6 @@ class ConvertCocoPolysToMask(object):
             classes = classes[keep]
             if self.return_masks:
                 masks = masks[keep]
-            # if keypoints is not None:
-            #     keypoints = keypoints[keep]
 
         target = {}
         target["boxes"] = boxes
@@ -196,8 +166,6 @@ class ConvertCocoPolysToMask(object):
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
-        # if keypoints is not None:
-        #     target["keypoints"] = keypoints
 
         if anno and "track_id" in anno[0]:
             track_ids = torch.tensor([obj["track_id"] for obj in anno])
@@ -226,7 +194,7 @@ class ConvertCocoPolysToMask(object):
         return image, target
 
 
-def make_coco_transforms_cells(image_set, img_transform=None, overflow_boxes=False):
+def make_coco_transforms_cells(image_set):
     normalize = T.Compose([
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
