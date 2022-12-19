@@ -680,7 +680,7 @@ def run_pipeline(model, fps, device, output_dir, args):
 
 
 @torch.no_grad()
-def print_worst(model, criterion, dataset_train, dataset_val, device, output_dir, args):
+def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, output_dir, args):
     model.eval()
     model._tracking = True
     criterion.eval()
@@ -690,40 +690,89 @@ def print_worst(model, criterion, dataset_train, dataset_val, device, output_dir
     (output_dir / save_folder / 'train_outputs').mkdir(exist_ok=True)
     (output_dir / save_folder / 'eval_outputs').mkdir(exist_ok=True)
 
-    for didx,dataset in enumerate([dataset_train,dataset_val]):
-        num_img = len(dataset) // 2
-        store_loss = torch.zeros((num_img))
+    for didx, data_loaders in enumerate([data_loaders_train,data_loaders_val]):
+        store_loss = torch.zeros((len(data_loaders[0])))
+        for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in tqdm(enumerate(zip(*data_loaders))):
+            
+            samples = cur_samples
+            targets = cur_targets
 
-        for idx in tqdm(range(num_img)):
-            samples, targets = dataset[idx*2]
-            targets = [targets]
+            assert samples.tensors.shape[0] == 1
+
+            for t,target in enumerate(targets):
+                target['prev_prev_target'] = prev_prev_targets[t]
+                target['prev_prev_image'] = prev_prev_samples.tensors[t]
+
+                target['prev_cur_target'] = prev_cur_targets[t]
+                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+
+                target['prev_target'] = prev_targets[t]
+                target['prev_image'] = prev_samples.tensors[t]
+
+                target['fut_prev_target'] = fut_prev_targets[t]
+                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+
+                target['fut_target'] = fut_targets[t]
+                target['fut_image'] = fut_samples.tensors[t]
+
+                assert target['image_id'] == prev_prev_targets[t]['image_id']
+                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples[None],targets,tm_threshold=0,evaluate_track=True)
+            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0)
 
             loss_dict, acc_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             store_loss[idx] = losses.item()
-            # if losses.item() > 10:
-            #     print(didx,idx)
-            #     utils.plot_results(outputs, prev_outputs, targets,samples[None], args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Blah_Loss_{store_loss[idx]:.2f}.png')
+
 
         worst_ind = torch.argsort(store_loss)[-50:]
 
-        for ind in worst_ind:
+        for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
+            
+            if idx not in worst_ind:
+                continue
 
-            samples, targets = dataset[int(ind)*2]
-            samples = samples[None]
-            targets = [targets]
+            samples = cur_samples
+            targets = cur_targets
+
+            for t,target in enumerate(targets):
+                target['prev_prev_target'] = prev_prev_targets[t]
+                target['prev_prev_image'] = prev_prev_samples.tensors[t]
+
+                target['prev_cur_target'] = prev_cur_targets[t]
+                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+
+                target['prev_target'] = prev_targets[t]
+                target['prev_image'] = prev_samples.tensors[t]
+
+                target['fut_prev_target'] = fut_prev_targets[t]
+                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+
+                target['fut_target'] = fut_targets[t]
+                target['fut_image'] = fut_samples.tensors[t]
+
+                assert target['image_id'] == prev_prev_targets[t]['image_id']
+                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0,evaluate_track=True)
+            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0)
 
-            utils.plot_results(outputs, prev_outputs, targets,samples, args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Loss_{store_loss[ind]:.2f}.png')
+            loss_dict, acc_dict = criterion(outputs, targets)
+            weight_dict = criterion.weight_dict
+
+            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+
+            if not np.round(losses.item(),3) == np.round(store_loss[idx],3):
+                print(np.round(losses.item(),3),np.round(store_loss[idx],3))
+
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Loss_{store_loss[idx]:.2f}.png')
 
 
 

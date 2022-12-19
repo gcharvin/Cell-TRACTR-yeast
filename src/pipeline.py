@@ -11,6 +11,8 @@ import sacred
 import torch
 import yaml
 
+from torch.utils.data import DataLoader, DistributedSampler
+
 import trackformer.util.misc as utils
 from trackformer.engine import run_pipeline, print_worst
 from trackformer.models import build_model
@@ -25,12 +27,11 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '221214_update__dab_no_mask'
+    modelname = '221216_refactored_dataloader__dab_no_mask'
 
     args.dn_track = False
     args.dn_object = False
     args.group_object = False
-    args.evaluate_dataset_with_no_data_aug = True
     args.output_dir = Path(args.output_dir) / modelname
     print(args.output_dir)
     args.save_model_interval = False
@@ -42,6 +43,8 @@ def train(args: Namespace) -> None:
 
     display_worst = True
     run_movie = False
+    if display_worst:
+        args.evaluate_dataset_with_no_data_aug = True
     print(args)
 
     args.output_dir.mkdir(exist_ok=True)
@@ -166,9 +169,39 @@ def train(args: Namespace) -> None:
         run_pipeline(model, fps, device, output_dir, args)
     
     if display_worst:
-        dataset_train = build_dataset(split='train', args=args)
-        dataset_val = build_dataset(split='val', args=args)
-        print_worst(model,criterion,dataset_train,dataset_val,device,output_dir,args)
+
+        datasets_train = build_dataset(split='train', args=args)
+        datasets_val = build_dataset(split='val', args=args)
+
+        data_loaders_train = []
+        data_loaders_val = []
+
+        for dataset_train, dataset_val in zip(datasets_train,datasets_val):
+            if args.distributed:
+                sampler_train = DistributedSampler(dataset_train, shuffle=False)
+                sampler_val = DistributedSampler(dataset_val, shuffle=False)
+            else:
+                sampler_train = torch.utils.data.SequentialSampler(dataset_train)
+                sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_size = 1,
+                sampler=sampler_train,
+                collate_fn=utils.collate_fn,
+                num_workers=args.num_workers)
+            data_loader_val = DataLoader(
+                dataset_val, 
+                batch_size = 1,
+                sampler=sampler_val,
+                drop_last=False,
+                collate_fn=utils.collate_fn,
+                num_workers=args.num_workers)
+
+            data_loaders_train.append(data_loader_train)
+            data_loaders_val.append(data_loader_val)
+
+        print_worst(model,criterion,data_loaders_train,data_loaders_val,device,output_dir,args)
 
 
 
