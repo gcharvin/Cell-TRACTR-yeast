@@ -7,6 +7,7 @@ from torchvision.ops.boxes import box_area
 
 
 def box_cxcywh_to_xyxy(x):
+
     x_c, y_c, w, h = x.unbind(-1)
     b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
          (x_c + 0.5 * w), (y_c + 0.5 * h)]
@@ -46,6 +47,13 @@ def generalized_box_iou(boxes1, boxes2, return_iou_only = False):
     Returns a [N, M] pairwise matrix, where N = len(boxes1)
     and M = len(boxes2)
     """
+
+    if boxes1.dim() == 1:
+        boxes1 = boxes1[None]
+        
+    if boxes2.dim() == 1:
+        boxes2 = boxes2[None]
+
     # degenerate boxes gives inf / nan results
     # so do an early check
     assert (boxes1[:, 2:] >= boxes1[:, :2]).all()

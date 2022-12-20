@@ -100,6 +100,64 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
+        # check for early / late cell division and adjust ground truths as necessary
+        # def check_for_early_or_late_cell_divisions():
+        for t,target in enumerate(targets):
+
+            if 'track_query_match_ids' in target:
+                # Get all prdictions for TP track queries
+                pred_boxes_track = outputs['pred_boxes'][0][target['track_queries_TP_mask']].detach()
+                pred_logits_track = outputs['pred_logits'][0][target['track_queries_TP_mask']].detach()
+                # Check to see if there were any divisions in the future frame; if not, we skip to check for early division
+                test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
+
+                for p, pred_box in enumerate(pred_boxes_track):
+                    box = target['boxes'][target['track_query_match_ids'][p]]
+
+                    # First check if the model predicted a single cell instead of a division
+                    if box[-1] > 0 and pred_logits_track[p,-1] < 0.5: #division
+                        prev_box = target['prev_target']['boxes'][target['prev_ind'][1]][p]
+                        combined_box = utils.combine_div_boxes(box,prev_box)
+
+                        if utils.calc_iou(combined_box,box) < 0.6:
+                            continue
+
+                        iou_div = utils.calc_iou(box,pred_box)
+
+                        pred_box[4:] = 0
+                        iou_combined = utils.calc_iou(combined_box,pred_box)
+
+                        if iou_combined - iou_div > 0.25: 
+                            target['boxes'][target['track_query_match_ids'][p]] = combined_box
+
+                    elif box[-1] == 0 and test_early_div and pred_logits_track[p,-1] > 0.5:
+                        # if model predcitions division, check future and frame and see if there is a division
+                        fut_prev_boxes = target['fut_prev_target']['boxes']
+                        box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
+                        fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
+
+                        #### TODO maybe add feature to allow division possible
+                        if fut_prev_track_id not in target['fut_target']['track_ids']:
+                            continue  # Cell leaves chamber in future frame
+
+                        fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
+                        fut_box = target['fut_target']['boxes'][fut_box_ind]
+
+                        if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
+
+                            div_box = utils.divide_box(box,fut_box)
+
+                            if utils.calc_iou(box,div_box) < 0.6:
+                                continue
+
+                            iou_div = utils.calc_iou(div_box,pred_box.detach())
+                            pred_box[4:] = 0
+                            iou = utils.calc_iou(box,pred_box.detach())
+
+                            if iou_div - iou > 0.25:
+                                target['boxes'][target['track_query_match_ids'][p]] = div_box
+
+
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
         meta_data = {}

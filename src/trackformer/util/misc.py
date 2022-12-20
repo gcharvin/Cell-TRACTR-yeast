@@ -1509,3 +1509,115 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
         acc[1] += (FPs > cls_thresh).sum()
 
     return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None], cells_leaving_acc[None,None], rand_FP_acc[None,None]
+
+
+def combine_div_boxes(box, prev_box):
+
+    new_box = prev_box.clone()
+
+    min_y = min(box[1] - box[3] / 2, box[5] - box[7] / 2)
+    max_y = max(box[1] + box[3] / 2, box[5] + box[7] / 2)
+    avg_y = (min_y + max_y) / 2
+    new_box[1] = avg_y
+
+    min_x = min(box[0] - box[2] / 2, box[4] - box[6] / 2)
+    max_x = max(box[0] + box[2] / 2, box[4] + box[6] / 2)
+    avg_x = (min_x + max_x) / 2
+    new_box[0] = avg_x
+
+    return new_box
+
+def divide_box(box,fut_box):
+
+    new_box = torch.zeros_like(box)
+
+    new_box[2:4] = fut_box[2:4]
+    new_box[6:8] = fut_box[6:8]
+
+    min_y = min(fut_box[1] - fut_box[3] / 2, fut_box[5] - fut_box[7] / 2)
+    max_y = max(fut_box[1] + fut_box[3] / 2, fut_box[5] + fut_box[7] / 2)
+    avg_y = (min_y + max_y) / 2
+    dif_y = box[1] - avg_y
+
+    min_x = min(fut_box[0] - fut_box[2] / 2, fut_box[4] - fut_box[6] / 2)
+    max_x = max(fut_box[0] + fut_box[2] / 2, fut_box[4] + fut_box[6] / 2)
+    avg_x = (min_x + max_x) / 2
+    dif_x = box[0] - avg_x
+
+    new_box[0::4] = fut_box[0::4] + dif_x
+    new_box[1::4] = fut_box[1::4] + dif_y
+
+    return new_box
+
+
+def calc_iou(box_1,box_2):
+
+    if box_1[-1] > 0 and box_2[-1] == 0:
+        iou_1 = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[:4]),
+            box_ops.box_cxcywh_to_xyxy(box_2[:4]),
+            return_iou_only=True
+        )
+
+        iou_2 = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[4:]),
+            box_ops.box_cxcywh_to_xyxy(box_2[:4]),
+            return_iou_only=True
+        )
+
+        iou = iou_1 + iou_2
+
+    elif box_1[-1] == 0 and box_2[-1] > 0:
+        iou_1 = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[:4]),
+            box_ops.box_cxcywh_to_xyxy(box_2[:4]),
+            return_iou_only=True
+        )
+
+        iou_2 = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[:4]),
+            box_ops.box_cxcywh_to_xyxy(box_2[4:]),
+            return_iou_only=True
+        )
+
+        iou = iou_1 + iou_2
+
+    elif box_1[-1] == 0 and box_2[-1] == 0:
+        iou = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[:4]),
+            box_ops.box_cxcywh_to_xyxy(box_2[:4]),
+            return_iou_only=True
+        )
+
+    elif box_1[-1] > 0 and box_2[-1] > 0:
+        iou_1 = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[:4]),
+            box_ops.box_cxcywh_to_xyxy(box_2[:4]),
+            return_iou_only=True
+        )
+
+        iou_2 = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[4:]),
+            box_ops.box_cxcywh_to_xyxy(box_2[4:]),
+            return_iou_only=True
+        )
+
+        iou = iou_1 + iou_2
+
+        iou_1_flip = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[:4]),
+            box_ops.box_cxcywh_to_xyxy(box_2[4:]),
+            return_iou_only=True
+        )
+
+        iou_2_flip = box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(box_1[4:]),
+            box_ops.box_cxcywh_to_xyxy(box_2[:4]),
+            return_iou_only=True
+        )
+
+        iou_flip = iou_1_flip + iou_2_flip
+
+        iou = max(iou,iou_flip)
+
+    return iou

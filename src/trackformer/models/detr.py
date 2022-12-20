@@ -7,12 +7,13 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch import nn
+from scipy.optimize import linear_sum_assignment
 
 from ..util import box_ops
 from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
                          interpolate, is_dist_avail_and_initialized,
                          nested_tensor_from_tensor_list, sigmoid_focal_loss,threshold_indices,
-                         calc_bbox_acc, calc_track_acc)
+                         calc_bbox_acc, calc_track_acc,combine_div_boxes,calc_iou,divide_box)
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection. """
@@ -441,10 +442,160 @@ class SetCriterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         indices, swap_indices = threshold_indices(indices,max_ind=N)
 
+        for i, (target,(ind_out,ind_tgt)) in enumerate(zip(targets,indices)):
+
+            if 'object_detection_div_mask' in target:
+                ind_out_clone = ind_out.clone()
+                ind_tgt_clone = ind_tgt.clone()
+                boxes_clone = target['boxes']
+                track_ids_clone = target['track_ids']
+                object_detection_div_mask = target['object_detection_div_mask'].clone()
+                skip = []
+                ind_tgt_blah = ind_tgt.clone()
+                for idx in range(len(ind_tgt_clone)):
+                    ind_tgt_box_1 = ind_tgt_clone[idx]
+                    if object_detection_div_mask[ind_tgt_box_1] in skip:
+                        continue
+                    elif object_detection_div_mask[ind_tgt_box_1]: # check to see if a single cell was detected instead of two cells; we only where there was a division from preivous to current frame
+                        box_1 = boxes_clone[ind_tgt_box_1][:4]
+                        box_label = object_detection_div_mask[ind_tgt_box_1]
+                        ind_tgt_box_2 = torch.tensor([num for num in range(len(object_detection_div_mask)) if (object_detection_div_mask[num] == box_label and num != ind_tgt_box_1)])[0]
+                        box_2 = boxes_clone[ind_tgt_box_2][:4]
+                        sep_box = torch.cat((box_1,box_2),axis=-1)
+
+                        ind_out_box_1 = ind_out_clone[idx]
+                        pred_box_1 = outputs['pred_boxes'][i,ind_out_box_1].detach()
+
+                        pred_box_2_ind = (ind_tgt_clone == ind_tgt_box_2).nonzero()[0][0]
+                        ind_out_box_2 = ind_out_clone[pred_box_2_ind]
+                        pred_box_2 = outputs['pred_boxes'][i,ind_out_box_2].detach()
+
+                        skip.append(box_label)
+
+                        pred_boxes_sep = torch.cat((pred_box_1[:4],pred_box_2[:4]),axis=-1)
+
+                        iou = calc_iou(pred_boxes_sep,sep_box)
+
+                        track_id = track_ids_clone[ind_tgt_box_1]
+
+                        if track_id == -1:
+                            track_id = track_ids_clone[ind_tgt_box_2]
+
+                        prev_box_ind = target['prev_target']['track_ids'].eq(track_id).nonzero()[0][0]
+                        prev_box = target['prev_target']['boxes'][prev_box_ind]
+
+                        combined_box = combine_div_boxes(sep_box,prev_box)
+
+                        unused_object_query_indices = torch.tensor([ind_out_box_1,ind_out_box_2] + [oq_id for oq_id in torch.arange(N-self.args.num_queries,N) if (oq_id not in ind_out_clone and outputs['pred_logits'][i,oq_id,0].detach() > 0.5)])
+            
+                        unused_pred_boxes = outputs['pred_boxes'][i,unused_object_query_indices].detach() 
+
+                        iou_combined = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(unused_pred_boxes[:,:4]),box_ops.box_cxcywh_to_xyxy(combined_box[None,:4]),return_iou_only=True)
+
+                        max_ind = torch.argmax(iou_combined)
+
+                        if iou_combined[max_ind] > iou:
+
+                            query_id = unused_object_query_indices[max_ind]
+                            
+                            if max_ind == 1:
+                                ind_out_box_1,ind_out_box_2 = ind_out_box_2,ind_out_box_1
+                                ind_tgt_box_1,ind_tgt_box_2 = ind_tgt_box_2,ind_tgt_box_1
+                            
+                            ind_out[ind_out == ind_out_box_1] = query_id
+
+                            assert (ind_out == ind_out_box_2).sum() == 1
+
+                            ind_out = ind_out[ind_out != ind_out_box_2]                                
+
+                            ind_tgt_box_1_new = ind_tgt[(ind_tgt_blah == ind_tgt_box_1).nonzero()[0][0]]
+                            ind_tgt_box_2_new = ind_tgt[(ind_tgt_blah == ind_tgt_box_2).nonzero()[0][0]]
+
+                            ind_tgt = ind_tgt[ind_tgt != ind_tgt_box_2_new]
+                            ind_tgt[ind_tgt > ind_tgt_box_2_new] = ind_tgt[ind_tgt > ind_tgt_box_2_new] - 1
+
+                            assert len(ind_tgt) + 1 == len(ind_tgt_blah)
+
+                            ind_tgt_blah = ind_tgt_blah[ind_tgt_blah != ind_tgt_box_2]
+
+                            target['boxes'][ind_tgt_box_1_new] = combined_box
+                            ind_tgt_boxes = torch.tensor([ind_tgt_box for ind_tgt_box in range(len(target['boxes'])) if ind_tgt_box != ind_tgt_box_2_new])
+                            target['boxes'] = target['boxes'][ind_tgt_boxes]
+                            target['labels'] = target['labels'][ind_tgt_boxes]
+                            target['track_ids'] = target['track_ids'][ind_tgt_boxes]
+                            target['object_detection_div_mask'] = target['object_detection_div_mask'][ind_tgt_boxes]
+                            assert len(ind_out) == len(ind_tgt)
+
+                            indices[i] = (ind_out,ind_tgt)
+
+                            if 'track_query_match_ids' in target:
+                                prev_track_ids = target['prev_target']['track_ids'][target['prev_ind'][1]]
+                                target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
+                                target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
+                                target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
+                                
+                                target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
+
+            test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
+            
+            if test_early_div: # quick check to see if any cells divided in the future frame
+                pred_boxes = outputs['pred_boxes'].detach()
+                ind_tgt_clone = ind_tgt.clone()
+                ind_out_clone = ind_out.clone()
+                boxes = target['boxes'].clone()
+                for idx in range(len(ind_tgt)):
+                    if (~target['track_queries_mask'])[ind_out_clone[idx]] and target['object_detection_div_mask'][ind_tgt_clone[idx]] == 0.: # check that we are looking at non tracked cells
+
+                        box = boxes[ind_tgt_clone[idx]]
+
+                        fut_prev_boxes = target['fut_prev_target']['boxes']
+                        box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
+                        fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
+
+                        #### TODO maybe add feature to allow division possible
+                        if fut_prev_track_id not in target['fut_target']['track_ids']:
+                            continue  # Cell leaves chamber in future frame
+
+                        fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
+                        fut_box = target['fut_target']['boxes'][fut_box_ind]
+
+                        if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
+
+                            div_box = divide_box(box,fut_box)
+
+                            unused_object_query_indices = torch.tensor([ind_out[idx]] + [oq_id for oq_id in torch.arange(N-self.args.num_queries,N) if (oq_id not in ind_out)])# and outputs['pred_logits'][i,oq_id,0].detach() > 0.5)])
+                
+                            if len(unused_object_query_indices) > 1:
+
+                                unused_pred_boxes = pred_boxes[i,unused_object_query_indices]
+
+                                iou_div_all = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(unused_pred_boxes[:,:4]),box_ops.box_cxcywh_to_xyxy(torch.cat((div_box[None,:4],div_box[None,4:]),axis=0)),return_iou_only=True)
+
+                                match_ind = torch.argmax(iou_div_all,axis=0).to('cpu')
+
+                                if len(torch.unique(match_ind)) == 2:
+                                    selected_pred_boxes = pred_boxes[i,match_ind,:4]
+                                    iou_div = calc_iou(div_box, torch.cat((selected_pred_boxes[0],selected_pred_boxes[1])))
+
+                                    iou = calc_iou(box,pred_boxes[i,ind_out[idx]])
+
+                                    if iou_div - iou > 0.25:
+                                        target['boxes'][ind_tgt_clone[idx]] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
+                                        target['boxes'] = torch.cat((target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
+
+                                        ind_out[ind_out == ind_out_clone[idx]] = match_ind[0]
+                                        ind_out = torch.cat((ind_out,torch.tensor([match_ind[1]])))
+                                        ind_tgt = torch.cat((ind_tgt,torch.tensor([target['boxes'].shape[0]-1])))                    
+
+                                        assert len(ind_out) == len(ind_tgt)
+
+                                        indices[i] = (ind_out,ind_tgt)
+
+
+
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets) - sum(t["empty"] for t in targets) # Empty chambers have an empty box and label as placeholder so we need to subtract it as a box
         num_boxes = torch.as_tensor(
-            # [num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
             [num_boxes], dtype=torch.float, device=outputs['pred_logits'].device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)

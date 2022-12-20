@@ -240,16 +240,6 @@ class DETRTrackingBase(nn.Module):
             else:
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)-2]
 
-            # #### Need to rewrite this; get rid of min_prev_target_ind; FPs are added later so it doesn't matter what min num of cells per chamber is
-            # if prev_prev_track or keep_all_track:
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))
-            # elif rand_num > 0.8:  #max number to be tracked since 
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind]
-            # elif rand_num < 0.5 and not group_object:
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
-            # else:
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind - 1]
-
             target['prev_ind'] = [prev_out_ind[random_subset_mask],prev_target_ind[random_subset_mask]]
 
             if dn_track:
@@ -338,12 +328,21 @@ class DETRTrackingBase(nn.Module):
             # If there is a FN for a cell in the previous frame that divides, then the labels/boxes/masks need to be adjusted for object detection to detect the divided cells separately
             if len(target_ind_not_matched_idx) > 0:
                 count = 0
+                store_div_ind = []
                 for nidx in range(len(target_ind_not_matched_idx)):
                     target_ind_not_matched_i = target_ind_not_matched_idx[nidx] + count
                     if target['boxes'][target_ind_not_matched_i][-1] > 0:
                         
                         self.update_target(target,target_ind_not_matched_i)
+                        store_div_ind.append(int(target_ind_not_matched_i))
+                        store_div_ind.append(int(target_ind_not_matched_i+1))
                         count += 1
+
+                target['object_detection_div_mask'] = torch.zeros(target['boxes'].shape[0]).to(self.device)
+
+                if len(store_div_ind) > 0:
+                    for s in range(len(store_div_ind) // 2):
+                        target['object_detection_div_mask'][torch.tensor(store_div_ind[s*2:(s+1)*2])] = s + 1
 
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
@@ -477,13 +476,13 @@ class DETRTrackingBase(nn.Module):
                 track_cells = True
 
             if track_cells:
-                # print('track')
+
                 backprop_context = torch.no_grad
                 if self._backprop_prev_frame:
                     backprop_context = nullcontext
 
                 with backprop_context():
-                    if all(['prev_prev_image' in t for t in targets]):
+                    if False:
                         for target, prev_target in zip(targets, prev_targets):
                             prev_target['prev_target'] = target['prev_prev_target']
 
@@ -523,7 +522,7 @@ class DETRTrackingBase(nn.Module):
                     else:
                         prev_out, _, prev_features, _, _ = super().forward([t['prev_image'] for t in targets])
                         prev_prev_track = False
-                        # print(prev_out['pred_logits'])
+
                         prev_outputs_without_aux = {
                             k: v for k, v in prev_out.items() if 'aux_outputs' not in k}
 
@@ -538,13 +537,25 @@ class DETRTrackingBase(nn.Module):
             else: # if we are perforoming object detection, we need to make sure the ground truths are all single cells as divided cells will be grouped as one
                 # print('object detection')
                 for target in targets:
+                    
                     count = 0
+                    store_div_ind = []
                     for b in range(len(target['boxes'])):
                         if target['boxes'][b + count,-1] > 0:
-                            self.update_target(target,b+count,update_track_ids=False)
+                            self.update_target(target,b+count)
+                            store_div_ind.append(b+count)
+                            store_div_ind.append(b+count+1)
                             count += 1
 
+                    target['object_detection_div_mask'] = torch.zeros(target['boxes'].shape[0]).to(self.device)
+
+                    if len(store_div_ind) > 0:
+                        for s in range(len(store_div_ind) // 2):
+                            target['object_detection_div_mask'][torch.tensor(store_div_ind[s*2:(s+1)*2])] = s + 1
+
                     target['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+
+                    
 
                     assert (target['boxes'][:,-1] == 0).all()
 
