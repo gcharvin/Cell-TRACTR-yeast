@@ -52,7 +52,7 @@ class box_cxcy_to_xyxy():
 
         return boxes
 
-def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,meta_data=None):
+def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filename,train,meta_data=None):
     
     print_gt = True
     filename = Path(filename)
@@ -62,8 +62,7 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
     spacer = 10
     threshold = 0.5
     folder = 'train_outputs' if train else 'eval_outputs'
-    num_img = 5 + print_gt*2
-    blank = np.zeros((height, (width*num_img + spacer)*bs,3))
+    blank = None
     fontscale = 0.4
     alpha = 0.3
     pred_masks = 'pred_masks' in outputs
@@ -338,10 +337,17 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
 
     for i in range(bs):
 
+        if i > 0:
+            blank = np.concatenate((blank,np.zeros((blank.shape[0],15,3))),axis=1)
+
         colors = [tuple((255*np.random.random(3))) for _ in range(50)]
 
         previmg = targets[i]['prev_image'].permute(1,2,0)
-
+        previmg = previmg.detach().cpu().numpy().copy()
+        previmg = np.repeat(np.mean(previmg,axis=-1)[:,:,np.newaxis],3,axis=-1)
+        previmg = (255*(previmg - np.min(previmg)) / np.ptp(previmg)).astype(np.uint8)
+        previmg_copy = previmg.copy()
+        
         if prev_outputs is not None:
             prev_bbs = prev_outputs['pred_boxes'][i].detach().cpu().numpy()
             prev_classes = prev_outputs['pred_logits'][i].sigmoid().detach().cpu().numpy()
@@ -359,10 +365,7 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                 prev_bbs[:,4] = prev_bbs[:,4] - prev_bbs[:,6] // 2
                 prev_bbs[:,5] = prev_bbs[:,5] - prev_bbs[:,7] // 2
 
-            previmg = previmg.detach().cpu().numpy().copy()
-            previmg = np.repeat(np.mean(previmg,axis=-1)[:,:,np.newaxis],3,axis=-1)
-            previmg = (255*(previmg - np.min(previmg)) / np.ptp(previmg)).astype(np.uint8)
-            previmg_copy = previmg.copy()
+
 
             for idx,bbox in enumerate(prev_bbs):
                 bounding_box = bbox[:4]
@@ -419,7 +422,14 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                     (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                     (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
                     color=colors[idx],
-                    thickness = 1)
+                    thickness = 1 if targets[i]['track_queries_TP_mask'][targets[i]['track_queries_mask']][idx] else 1)
+
+            if blank is None:
+                blank = previmg_copy
+            else:
+                blank = np.concatenate((blank,previmg_copy),axis=1)
+
+            blank = np.concatenate((blank,previmg,previmg_track),axis=1)
 
         img = samples[i].permute(1,2,0)
 
@@ -511,18 +521,115 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                     mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                     img[mask>0] = img[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
                     
-        if prev_outputs is not None:
-            blank[:,(width*num_img+spacer)*i + width*0:(width*num_img+spacer)*i + width*1] = previmg_copy
-            blank[:,(width*num_img+spacer)*i + width*1:(width*num_img+spacer)*i + width*2] = previmg
-            blank[:,(width*num_img+spacer)*i + width*2:(width*num_img+spacer)*i + width*3] = previmg_track
-        blank[:,(width*num_img+spacer)*i + width*3:(width*num_img+spacer)*i + width*4] = img
-        blank[:,(width*num_img+spacer)*i + width*4:(width*num_img+spacer)*i + width*5] = img_copy
+
+        if blank is None:
+            blank = img
+        else:
+            blank = np.concatenate((blank,img),axis=1)
+
+        blank = np.concatenate((blank,img_copy),axis=1)
 
         if print_gt:
-            target = targets[i]
-            colors = [tuple((255*np.random.random(3))) for _ in range(50)]
-            img_gt = img_copy.copy()
 
+            target = targets[i]
+            target_og = targets_og[i]
+            colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+
+            if prev_outputs is not None:
+                # If just object detection, then just current frame is used so two frames back gives us no valuable information
+                prev_prev_img_gt = target['prev_prev_image'].permute(1,2,0).cpu().numpy()
+
+                prev_prev_img_gt = np.repeat(np.mean(prev_prev_img_gt,axis=-1)[:,:,np.newaxis],3,axis=-1)
+                prev_prev_img_gt = (255*(prev_prev_img_gt - np.min(prev_prev_img_gt)) / np.ptp(prev_prev_img_gt)).astype(np.uint8)
+
+                prev_prev_img_gt_copy = prev_prev_img_gt.copy()
+
+                bbs = target_og['prev_prev_boxes'].detach().cpu().numpy()
+                bbs[:,1::2] = bbs[:,1::2] * height
+                bbs[:,::2] = bbs[:,::2] * width
+                bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+                bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+                bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+                bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+
+                for idx, bbox in enumerate(bbs):
+                    bounding_box = bbox[:4]
+                    prev_prev_img_gt = cv2.rectangle(
+                        prev_prev_img_gt,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color=colors[idx],
+                        thickness = 1)
+
+                    if bbs[idx,-1] > 0:
+                        bounding_box = bbox[4:]
+                        prev_prev_img_gt = cv2.rectangle(
+                            prev_prev_img_gt,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx],
+                            thickness = 1)
+
+                blank = np.concatenate((blank,prev_prev_img_gt_copy,prev_prev_img_gt),axis=1)
+            
+
+            previmg_gt = previmg_copy.copy()
+
+            prev_target = target['prev_target']
+            bbs = prev_target['boxes'].detach().cpu().numpy()
+            bbs[:,1::2] = bbs[:,1::2] * height
+            bbs[:,::2] = bbs[:,::2] * width
+            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            for idx, bbox in enumerate(bbs):
+                bounding_box = bbox[:4]
+                previmg_gt = cv2.rectangle(
+                    previmg_gt,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+                if bbs[idx,-1] > 0:
+                    bounding_box = bbox[4:]
+                    previmg_gt = cv2.rectangle(
+                        previmg_gt,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color= colors[idx],
+                        thickness = 1)
+
+        
+            previmg_gt_og = previmg_copy.copy()
+
+            bbs = target_og['prev_boxes'].detach().cpu().numpy()
+            bbs[:,1::2] = bbs[:,1::2] * height
+            bbs[:,::2] = bbs[:,::2] * width
+            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            for idx, bbox in enumerate(bbs):
+                bounding_box = bbox[:4]
+                previmg_gt_og = cv2.rectangle(
+                    previmg_gt_og,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+                if bbs[idx,-1] > 0:
+                    bounding_box = bbox[4:]
+                    previmg_gt_og = cv2.rectangle(
+                        previmg_gt_og,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color= colors[idx],
+                        thickness = 1)
+
+            blank = np.concatenate((blank,previmg_gt,previmg_gt_og),axis=1) 
+
+            img_gt = img_copy.copy()
 
             bbs = target['boxes'].detach().cpu().numpy()
             bbs[:,1::2] = bbs[:,1::2] * height
@@ -531,6 +638,7 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
             bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
             bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
             bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+
             for idx, bbox in enumerate(bbs):
                 bounding_box = bbox[:4]
                 img_gt = cv2.rectangle(
@@ -549,37 +657,69 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,train,me
                         color=colors[idx],
                         thickness = 1)
 
-            blank[:,(width*num_img+spacer)*i + width*6:(width*num_img+spacer)*i + width*7] = img_gt
 
-            if prev_outputs is not None:
-                previmg_gt = previmg_copy.copy()
+            img_gt_og = img_copy.copy()
+            bbs = target_og['boxes'].detach().cpu().numpy()
+            bbs[:,1::2] = bbs[:,1::2] * height
+            bbs[:,::2] = bbs[:,::2] * width
+            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
 
-                prev_target = target['prev_target']
-                bbs = prev_target['boxes'].detach().cpu().numpy()
-                bbs[:,1::2] = bbs[:,1::2] * height
-                bbs[:,::2] = bbs[:,::2] * width
-                bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-                bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-                bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
-                for idx, bbox in enumerate(bbs):
-                    bounding_box = bbox[:4]
-                    previmg_gt = cv2.rectangle(
-                        previmg_gt,
+            for idx, bbox in enumerate(bbs):
+                bounding_box = bbox[:4]
+                img_gt_og = cv2.rectangle(
+                    img_gt_og,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+                if bbs[idx,-1] > 0:
+                    bounding_box = bbox[4:]
+                    img_gt_og = cv2.rectangle(
+                        img_gt_og,
                         (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                         (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
                         color=colors[idx],
                         thickness = 1)
 
-                    if bbs[idx,-1] > 0:
-                        bounding_box = bbox[4:]
-                        previmg_gt = cv2.rectangle(
-                            previmg_gt,
-                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
-                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                            color= colors[idx],
-                            thickness = 1)
+            blank = np.concatenate((blank,img_gt,img_gt_og),axis=1)
 
-                blank[:,(width*num_img+spacer)*i + width*5:(width*num_img+spacer)*i + width*6] = previmg_gt
+            fut_img_gt = target['fut_image'].permute(1,2,0).cpu().numpy()
+            fut_img_gt = np.repeat(np.mean(fut_img_gt,axis=-1)[:,:,np.newaxis],3,axis=-1)
+            fut_img_gt = (255*(fut_img_gt - np.min(fut_img_gt)) / np.ptp(fut_img_gt)).astype(np.uint8)
+
+            fut_img_gt_copy = fut_img_gt.copy()
+
+            bbs = target_og['fut_boxes'].detach().cpu().numpy()
+            bbs[:,1::2] = bbs[:,1::2] * height
+            bbs[:,::2] = bbs[:,::2] * width
+            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
+            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+
+            for idx, bbox in enumerate(bbs):
+                bounding_box = bbox[:4]
+                fut_img_gt = cv2.rectangle(
+                    fut_img_gt,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=colors[idx],
+                    thickness = 1)
+
+                if bbs[idx,-1] > 0:
+                    bounding_box = bbox[4:]
+                    fut_img_gt = cv2.rectangle(
+                        fut_img_gt,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color=colors[idx],
+                        thickness = 1)
+
+            blank = np.concatenate((blank,fut_img_gt,fut_img_gt_copy),axis=1)
 
 
     cv2.imwrite(str(savepath / folder / filename),blank)
@@ -1241,7 +1381,7 @@ def nested_dict_to_device(dictionary, device):
         return output
     return dictionary.to(device)
 
-def threshold_indices(indices,max_ind):
+def threshold_indices(indices,targets,max_ind):
     '''
     indices: output from Hungarian matcher
     max_ind: the number of predictions in current batch
@@ -1251,19 +1391,22 @@ def threshold_indices(indices,max_ind):
     The swap_indices tells which boxes/class predictions need to be flipped.
     '''
 
-    swap_indices = [[],[]]
-
-    for idx,(ind_out,ind_tgt) in enumerate(indices):
+    for (ind_out,ind_tgt),target in zip(indices,targets):
 
         for i in range(len(ind_out)):
           
             if ind_out[i] >= max_ind:
                 ind_out[i] -= max_ind
-                swap_indices[idx].append(ind_out[i])
 
-        swap_indices[idx] = torch.tensor(swap_indices[idx])
+                assert target['boxes'][ind_tgt[i]][-1] > 0, 'Currently, this only swaps boxes where divisions have occurred. Need to update matcher.py to do swapping for regular object detection. not sure if that"s the best idea'
 
-    return indices, swap_indices
+                target['boxes'][ind_tgt[i]] = torch.cat((target['boxes'][ind_tgt[i],4:],target['boxes'][ind_tgt[i],:4]),axis=-1)
+                target['labels'][ind_tgt[i]] = torch.cat((target['labels'][ind_tgt[i],1:],target['labels'][ind_tgt[i],:1]),axis=-1)
+
+                if 'masks' in target:
+                    raise NotImplementedError
+
+    return indices, targets
 
 
 def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_dict:dict,i,lr=None):
@@ -1308,6 +1451,8 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
             if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
                 metrics_dict[weight_dict_key] = np.concatenate((metrics_dict[weight_dict_key],np.array(np.nan)[None,None]),axis=1)
 
+    assert metrics_dict['loss'].shape[0] == 1, 'Only one epoch worth of loss / metric info should be added'
+
     return metrics_dict
 
 def display_loss(metrics_dict:dict,i,i_total,epoch,dataset):
@@ -1328,17 +1473,21 @@ def display_loss(metrics_dict:dict,i,i_total,epoch,dataset):
     print(f'{dataset}  Epoch: {epoch} ({i:0{pad}}/{i_total})',display_loss)
 
 
-def save_metrics_pkl(metrics_dict,output_dir,dataset):
+def save_metrics_pkl(metrics_dict,output_dir,dataset,epoch):
 
-    if not (output_dir / ('metrics_' + dataset + '.pkl')).exists():
+    if not (output_dir / ('metrics_' + dataset + '.pkl')).exists() or epoch == 1:
         with open(output_dir / ('metrics_' + dataset + '.pkl'), 'wb') as f:
             pickle.dump(metrics_dict, f)
     else:
         with open(output_dir / ('metrics_' + dataset + '.pkl'), 'rb') as f:
             loaded_metrics_dict = pickle.load(f)
 
+            assert loaded_metrics_dict['loss'].shape[0] == epoch - 1
+
             for metrics_dict_key in metrics_dict.keys():
                 loaded_metrics_dict[metrics_dict_key] = np.concatenate((loaded_metrics_dict[metrics_dict_key],metrics_dict[metrics_dict_key]),axis=0)
+
+            assert loaded_metrics_dict['loss'].shape[0] == epoch
         
         with open(output_dir / ('metrics_' + dataset + '.pkl'), 'wb') as f:
             pickle.dump(loaded_metrics_dict, f)
@@ -1525,6 +1674,22 @@ def combine_div_boxes(box, prev_box):
     avg_x = (min_x + max_x) / 2
     new_box[0] = avg_x
 
+    h = torch.tensor([new_box[1] - new_box[3] / 2, new_box[1] + new_box[3] / 2])
+    if h[0] < 0:
+        new_box[1] = new_box[1] - h[0] / 2 
+        new_box[3] = new_box[3] + h[0] 
+    elif h[1] > 1: 
+        new_box[1] = new_box[1] - (h[1]-1) / 2 
+        new_box[3] = new_box[3] - (h[1]-1)
+
+    w = torch.tensor([new_box[0] - new_box[2] / 2, new_box[0] + new_box[2] / 2])
+    if w[0] < 0:
+        new_box[0] = new_box[0] - w[0] / 2 
+        new_box[2] = new_box[2] + w[0] 
+    elif w[1] > 1: 
+        new_box[0] = new_box[0] - (w[1]-1) / 2 
+        new_box[2] = new_box[2] - (w[1]-1)
+
     return new_box
 
 def divide_box(box,fut_box):
@@ -1550,9 +1715,10 @@ def divide_box(box,fut_box):
     return new_box
 
 
-def calc_iou(box_1,box_2):
+def calc_iou(box_1,box_2,return_flip=False):
 
     if box_1[-1] > 0 and box_2[-1] == 0:
+        raise NotImplementedError
         iou_1 = box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(box_1[:4]),
             box_ops.box_cxcywh_to_xyxy(box_2[:4]),
@@ -1568,6 +1734,7 @@ def calc_iou(box_1,box_2):
         iou = iou_1 + iou_2
 
     elif box_1[-1] == 0 and box_2[-1] > 0:
+        raise NotImplementedError
         iou_1 = box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(box_1[:4]),
             box_ops.box_cxcywh_to_xyxy(box_2[:4]),
@@ -1602,7 +1769,7 @@ def calc_iou(box_1,box_2):
             return_iou_only=True
         )
 
-        iou = iou_1 + iou_2
+        iou = (iou_1 + iou_2) / 2
 
         iou_1_flip = box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(box_1[:4]),
@@ -1616,8 +1783,12 @@ def calc_iou(box_1,box_2):
             return_iou_only=True
         )
 
-        iou_flip = iou_1_flip + iou_2_flip
+        iou_flip = (iou_1_flip + iou_2_flip) / 2
 
         iou = max(iou,iou_flip)
+        flip = iou_flip == iou
+
+        if return_flip:
+            return iou, flip
 
     return iou

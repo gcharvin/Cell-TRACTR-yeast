@@ -52,6 +52,83 @@ def calc_loss_for_training_methods(training_method:str,
 
     return outputs_TM, loss_dict_TM, groups
 
+
+def update_early_or_late_track_divisions(targets,outputs):
+
+    # check for early / late cell division and adjust ground truths as necessary
+    # def check_for_early_or_late_cell_divisions():
+    #### Need to update this to work for dn_track as well (just make it a function that works for all groups; if statement will automatically exlcue dn_object + dn_group)
+    for t,target in enumerate(targets):
+
+        if 'track_query_match_ids' in target:
+            # Get all prdictions for TP track queries
+            pred_boxes_track = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach()
+            pred_logits_track = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach()
+            # Check to see if there were any divisions in the future frame; if not, we skip to check for early division
+            test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
+
+            for p, pred_box in enumerate(pred_boxes_track):
+                box = target['boxes'][target['track_query_match_ids'][p]]
+
+                # First check if the model predicted a single cell instead of a division
+                if box[-1] > 0 and pred_logits_track[p,-1] < 0.5: #division
+                    prev_box = target['prev_target']['boxes'][target['prev_ind'][1]][p]
+                    combined_box = utils.combine_div_boxes(box,prev_box)
+
+                    # not sure if this matters. It's a quick check that the combined_box is reasonble 
+                    # should update to calculate iou based on shape only not location because cells can shift quite a bit in one frame
+                    # if utils.calc_iou(combined_box,box) < 0.6:
+                    #     continue
+
+                    iou_div = utils.calc_iou(box,pred_box)
+
+                    pred_box[4:] = 0
+                    iou_combined = utils.calc_iou(combined_box,pred_box)
+
+                    if iou_combined - iou_div > 0: 
+                        target['boxes'][target['track_query_match_ids'][p]] = combined_box
+                        target['labels'][target['track_query_match_ids'][p]] = torch.tensor([0,1]).to(outputs['pred_logits'].device)
+
+                        if 'masks' in target:
+                            raise NotImplementedError
+                            
+                elif box[-1] == 0 and test_early_div and pred_logits_track[p,-1] > 0.5:
+                    # if model predcitions division, check future frame and see if there is a division
+                    fut_prev_boxes = target['fut_prev_target']['boxes']
+                    box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
+                    fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
+
+                    if fut_prev_track_id not in target['fut_target']['track_ids']:
+                        continue  # Cell leaves chamber in future frame
+
+                    fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
+                    fut_box = target['fut_target']['boxes'][fut_box_ind]
+
+                    if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
+                        div_box = utils.divide_box(box,fut_box)
+
+                    # not sure if this matters. It's a quick check that the combined_box is reasonble 
+                    # should update to calculate iou based on shape only not location because cells can shift quite a bit in one frame
+                        # if utils.calc_iou(box,div_box) < 0.6:
+                        #     continue
+
+                        iou_div, flip = utils.calc_iou(div_box,pred_box,return_flip=True)
+                        pred_box[4:] = 0
+                        iou = utils.calc_iou(box,pred_box)
+
+                        # We flip target div boxes even though the matcher should be able to handle this 
+                        if flip:
+                            div_box = torch.cat((div_box[4:],div_box[:4]))
+
+                        if iou_div - iou > 0:
+                            target['boxes'][target['track_query_match_ids'][p]] = div_box
+                            target['labels'][target['track_query_match_ids'][p]] = torch.tensor([0,0]).to(outputs['pred_logits'].device)
+
+                            if 'masks' in target:
+                                raise NotImplementedError
+
+    return targets
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postprocessors,
                     data_loaders: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, args, num_plots=10, interval = 50):
@@ -76,87 +153,39 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
         samples = cur_samples
         targets = cur_targets
 
+        targets_og = [{},{}]
+
         for t,target in enumerate(targets):
-                target['prev_prev_target'] = prev_prev_targets[t]
-                target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
-                target['prev_cur_target'] = prev_cur_targets[t]
-                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+            targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
+            targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
 
-                target['prev_target'] = prev_targets[t]
-                target['prev_image'] = prev_samples.tensors[t]
+            target['prev_prev_target'] = prev_prev_targets[t]
+            target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
-                target['fut_prev_target'] = fut_prev_targets[t]
-                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+            target['prev_cur_target'] = prev_cur_targets[t]
+            target['prev_cur_image'] = prev_cur_samples.tensors[t]
 
-                target['fut_target'] = fut_targets[t]
-                target['fut_image'] = fut_samples.tensors[t]
+            target['prev_target'] = prev_targets[t]
+            target['prev_image'] = prev_samples.tensors[t]
 
-                assert target['image_id'] == prev_prev_targets[t]['image_id']
-                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+            target['fut_prev_target'] = fut_prev_targets[t]
+            target['fut_prev_image'] = fut_prev_samples.tensors[t]
+
+            target['fut_target'] = fut_targets[t]
+            target['fut_image'] = fut_samples.tensors[t]
+
+            assert target['image_id'] == prev_prev_targets[t]['image_id']
+            assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
 
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
-        # check for early / late cell division and adjust ground truths as necessary
-        # def check_for_early_or_late_cell_divisions():
-        for t,target in enumerate(targets):
-
-            if 'track_query_match_ids' in target:
-                # Get all prdictions for TP track queries
-                pred_boxes_track = outputs['pred_boxes'][0][target['track_queries_TP_mask']].detach()
-                pred_logits_track = outputs['pred_logits'][0][target['track_queries_TP_mask']].detach()
-                # Check to see if there were any divisions in the future frame; if not, we skip to check for early division
-                test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
-
-                for p, pred_box in enumerate(pred_boxes_track):
-                    box = target['boxes'][target['track_query_match_ids'][p]]
-
-                    # First check if the model predicted a single cell instead of a division
-                    if box[-1] > 0 and pred_logits_track[p,-1] < 0.5: #division
-                        prev_box = target['prev_target']['boxes'][target['prev_ind'][1]][p]
-                        combined_box = utils.combine_div_boxes(box,prev_box)
-
-                        if utils.calc_iou(combined_box,box) < 0.6:
-                            continue
-
-                        iou_div = utils.calc_iou(box,pred_box)
-
-                        pred_box[4:] = 0
-                        iou_combined = utils.calc_iou(combined_box,pred_box)
-
-                        if iou_combined - iou_div > 0.25: 
-                            target['boxes'][target['track_query_match_ids'][p]] = combined_box
-
-                    elif box[-1] == 0 and test_early_div and pred_logits_track[p,-1] > 0.5:
-                        # if model predcitions division, check future and frame and see if there is a division
-                        fut_prev_boxes = target['fut_prev_target']['boxes']
-                        box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
-                        fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
-
-                        #### TODO maybe add feature to allow division possible
-                        if fut_prev_track_id not in target['fut_target']['track_ids']:
-                            continue  # Cell leaves chamber in future frame
-
-                        fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
-                        fut_box = target['fut_target']['boxes'][fut_box_ind]
-
-                        if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
-
-                            div_box = utils.divide_box(box,fut_box)
-
-                            if utils.calc_iou(box,div_box) < 0.6:
-                                continue
-
-                            iou_div = utils.calc_iou(div_box,pred_box.detach())
-                            pred_box[4:] = 0
-                            iou = utils.calc_iou(box,pred_box.detach())
-
-                            if iou_div - iou > 0.25:
-                                target['boxes'][target['track_query_match_ids'][p]] = div_box
-
+        targest = update_early_or_late_track_divisions(target,outputs)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -212,12 +241,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
 
         if i in ids and (epoch % 5 == 0 or epoch == 1):
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
             utils.display_loss(metrics_dict,i,len(data_loaders[0]),epoch=epoch,dataset=dataset)
 
-    utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset)  
+    utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset,epoch=epoch)  
 
 
 
@@ -246,7 +275,15 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
         samples = cur_samples
         targets = cur_targets
 
+        targets_og = [{},{}]
+
         for t,target in enumerate(targets):
+
+                targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
+                targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
+                targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
+                targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
                 target['prev_prev_target'] = prev_prev_targets[t]
                 target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
@@ -264,11 +301,14 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
                 assert target['image_id'] == prev_prev_targets[t]['image_id']
                 assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+        
 
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+
+        targets = update_early_or_late_track_divisions(targets,outputs)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -303,12 +343,12 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
         if i in ids and (epoch % 5 == 0 or epoch == 1) and train:
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
 
         if i > 0 and i % interval == 0:
             utils.display_loss(metrics_dict,i,len(data_loaders[0]),epoch=epoch,dataset=dataset)
 
-    utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset)  
+    utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset,epoch=epoch)  
 
 
 @torch.no_grad()
@@ -752,12 +792,23 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
         store_loss = torch.zeros((len(data_loaders[0])))
         for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in tqdm(enumerate(zip(*data_loaders))):
             
+            # if idx not in [844]:
+            #     continue
+
             samples = cur_samples
             targets = cur_targets
 
             assert samples.tensors.shape[0] == 1
 
+            targets_og = [{},{}]
+
             for t,target in enumerate(targets):
+
+                targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
+                targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
+                targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
+                targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
                 target['prev_prev_target'] = prev_prev_targets[t]
                 target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
@@ -780,6 +831,8 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
             outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0)
+
+            targets = update_early_or_late_track_divisions(targets,outputs)
 
             loss_dict, acc_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
@@ -798,7 +851,15 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = cur_samples
             targets = cur_targets
 
+            targets_og = [{},{}]
+
             for t,target in enumerate(targets):
+
+                targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
+                targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
+                targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
+                targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
                 target['prev_prev_target'] = prev_prev_targets[t]
                 target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
@@ -822,15 +883,17 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
 
             outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0)
 
+            targets = update_early_or_late_track_divisions(targets,outputs)
+
             loss_dict, acc_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
             if not np.round(losses.item(),3) == np.round(store_loss[idx],3):
-                print(np.round(losses.item(),3),np.round(store_loss[idx],3))
+                print(idx, np.round(losses.item(),3),np.round(store_loss[idx],3))
 
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Loss_{store_loss[idx]:.2f}.png')
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Loss_{store_loss[idx]:06.2f}_ind{idx}_.png')
 
 
 
