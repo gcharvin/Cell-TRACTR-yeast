@@ -728,10 +728,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=None,track=True):
 
     img = np.array(img)
-    img_copy = img.copy()
     height = img.shape[0]
     width = img.shape[1]
-    blank = np.zeros((height, 2*width,3))
     fontscale = 0.4
     mask_threshold = 0.5
     alpha = 0.4
@@ -758,7 +756,6 @@ def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=No
 
     for idx,bounding_box in enumerate(bbs):
 
-
         thickness = 2 if new_cells is not None and new_cells[idx] == True else 1
         img = cv2.rectangle(
             img,
@@ -783,12 +780,12 @@ def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=No
                 color = colors[idx],
                 thickness=1,
             )
+    # if track ; currently want to see how much object uses divisions
+    if div_track is not None and (div_track != -1).sum() > 0:
+        div_track_nbs = np.unique(div_track[div_track != -1])
 
-    if track and div_track is not None and sum(div_track) > 0:
-        div_track_nbs = np.unique(div_track)
-        div_track_nbs = [d for d in div_track_nbs if d != 0] 
         for div_track_nb in div_track_nbs:
-            div_loc = np.where(div_track == div_track_nb)[0]
+            div_loc = (div_track == div_track_nb).nonzero()[0]
             cell_1 = bbs[div_loc[0]]
             cell_2 = bbs[div_loc[1]]
 
@@ -799,10 +796,6 @@ def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=No
                 color=(1, 1, 1),
                 thickness=1,
             )
-
-
-    blank[:,:width] = img_copy
-    blank[:,width:width*2] = img
 
     return img
 
