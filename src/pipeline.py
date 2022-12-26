@@ -14,7 +14,7 @@ import yaml
 from torch.utils.data import DataLoader, DistributedSampler
 
 import trackformer.util.misc as utils
-from trackformer.engine import run_pipeline, print_worst
+from trackformer.engine import pipeline, print_worst
 from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
 from trackformer.datasets import build_dataset
@@ -27,7 +27,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '221216_refactored_dataloader__dab_no_mask'
+    modelname = '221224_div_ref_pts__dab_no_mask'
 
     args.dn_track = False
     args.dn_object = False
@@ -41,10 +41,9 @@ def train(args: Namespace) -> None:
     datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/predictions/2022-04-24_TrainingSet8/img')
     fps = sorted(list((datapath).glob('*.png')))
 
-    display_worst = True
-    run_movie = False
-    if display_worst:
-        args.evaluate_dataset_with_no_data_aug = True
+    display_worst = False
+    run_movie = True
+
     print(args)
 
     args.output_dir.mkdir(exist_ok=True)
@@ -166,9 +165,13 @@ def train(args: Namespace) -> None:
     model_without_ddp.load_state_dict(resume_state_dict)
 
     if run_movie:
-        run_pipeline(model, fps, device, output_dir, args)
+        model.evaluate_dataset_with_no_data_aug = False
+        Pipeline = pipeline(model, fps, device, output_dir, args)
+        Pipeline.forward()
     
     if display_worst:
+
+        model.evaluate_dataset_with_no_data_aug = True
 
         datasets_train = build_dataset(split='train', args=args)
         datasets_val = build_dataset(split='val', args=args)
