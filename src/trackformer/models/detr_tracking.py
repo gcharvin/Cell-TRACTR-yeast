@@ -137,26 +137,28 @@ class DETRTrackingBase(nn.Module):
 
     def calc_num_FPs(self,targets,return_FPs=False,add_extra_FPs=True):
 
+        # Number of cells being tracked per batch
         num_cells = torch.tensor([len(target['prev_ind'][0]) for target in targets])
 
+        # Calculate the FPs necessary for batching to work. There needs to be an equal amount of track queries per batch so FPs are added to offset a sample with less cells
         max_track = max(num_cells)
         num_FPs = max_track - num_cells
 
-        # num_FPs = torch.tensor([FP for FP in add_FPs])
-
-        if sum(num_cells) != 0 and add_extra_FPs: # Only add FPs if it is tracking; it is not realistic to add extra FPs when no cells are being tracked
-            max_FPs = max(num_FPs)
-            num_fps_rand = torch.randint(0,max(3-max_FPs,1),(1,)).item()
+        # Only add FPs if it is tracking; it is not realistic to add extra FPs when no cells are being tracked
+        if sum(num_cells) != 0 and add_extra_FPs: 
+            # If 3 or more FPs are being added then we do not add more as we don't want to litter the sample with FPs causing an unrealistic sample and waste computational resources
+            num_fps_rand = torch.randint(0,max(3-max(num_FPs),1),(1,)).item()
             num_FPs += num_fps_rand 
 
-        if return_FPs:
-            return num_FPs
-        else:
-            for t,target in enumerate(targets):
-                target['num_FPs'] = num_FPs[t]
+        # if return_FPs:
+        #     return num_FPs
+        # else:
+        for t,target in enumerate(targets):
+            target['num_FPs'] = num_FPs[t]
 
     def add_FPs(self,target,i,prev_out):
         # Due to divisions, we do not want a repeat false positive which would occur with the current code below
+        # With divisions, target['prev_ind][0] can point to the 
         prev_out_ind_uni = torch.unique(target['prev_ind'][0])
         
         prev_boxes_matched = prev_out['pred_boxes'][i,prev_out_ind_uni]
@@ -247,6 +249,8 @@ class DETRTrackingBase(nn.Module):
                 dn_track['boxes'] = target['boxes'].clone()
                 dn_track['empty'] = target['empty'].clone()
                 dn_track['prev_target'] = target['prev_target']
+                dn_track['fut_target'] = target['fut_target']
+                dn_track['fut_prev_target'] = target['fut_prev_target']
                 
                 random_subset_mask = torch.randperm(len(prev_target_ind))
                 dn_track['prev_ind'] = [prev_out_ind[random_subset_mask],prev_target_ind[random_subset_mask]]
@@ -275,12 +279,13 @@ class DETRTrackingBase(nn.Module):
         # Only matters if we are using the prev prev frame when a division is tracked from prev prev frame to prev frame. This is because a single decoder output embedding can predict a cell division
         
         self.calc_num_FPs(targets,add_extra_FPs=not self.evaluate_dataset_with_no_data_aug)
+        assert sum(['num_FPs' in target for target in targets]) == len(targets), 'False Positives were not properly added to target'
 
         if dn_track:
-            num_FPs = self.calc_num_FPs([target['dn_track'] for target in targets],return_FPs=True)
-
-            for i,target in enumerate(targets):
-                target['dn_track']['num_FPs'] = num_FPs[i]
+            self.calc_num_FPs([target['dn_track'] for target in targets])
+            assert sum(['num_FPs' in target['dn_track'] for target in targets]) == len(targets), 'False Positives were not properly added to dn_target '
+            # for i,target in enumerate(targets):
+            #     target['dn_track']['num_FPs'] = num_FPs[i]
 
             
         for i, target in enumerate(targets):
@@ -295,7 +300,7 @@ class DETRTrackingBase(nn.Module):
                 # match track ids between frames
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 dn_track['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
-                #dn_track['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['dn_track']['num_FPs'])).bool().to(self.device)))
+                dn_track['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * dn_track['num_FPs'])).bool().to(self.device)))
                 dn_track['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
             prev_track_ids = track_ids[target['prev_ind'][1]]
@@ -317,6 +322,7 @@ class DETRTrackingBase(nn.Module):
 
                 if 'masks' in target:
                     group_object['masks'] = target['masks'].clone()
+
                 count = 0
                 for b in range(len(target['boxes'])):
                     if target['boxes'][b,-1] > 0:
@@ -342,8 +348,10 @@ class DETRTrackingBase(nn.Module):
                     for s in range(len(store_div_ind) // 2):
                         target['object_detection_div_mask'][torch.tensor(store_div_ind[s*2:(s+1)*2])] = s + 1
 
+                # target['track_ids'] has change since FP divided cells have been separated into two boxes
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
+                target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
                 target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
             # Add random false positives
@@ -381,11 +389,11 @@ class DETRTrackingBase(nn.Module):
             track_queries_fal_pos_mask[~target['target_ind_matching']] = True
 
             if 'dn_track' in target:
+                dn_track['track_queries_TP_mask'] = dn_track['target_ind_matching']
                 dn_track['track_queries_mask'] = torch.ones_like(dn_track['target_ind_matching']).to(self.device).bool()
                 dn_track['track_queries_fal_pos_mask'] = torch.zeros_like(dn_track['target_ind_matching']).to(self.device).bool()
                 dn_track['track_queries_fal_pos_mask'][~dn_track['target_ind_matching']] = True      
 
-                # dn_track['track_query_hs_embeds'] = prev_out['hs_embed'][i, dn_track['prev_ind'][0]]
                 dn_track['track_query_hs_embeds'] = self.dn_track_embedding.weight.repeat(len(dn_track['prev_ind'][0]),1)
 
                 boxes = prev_out['pred_boxes'].detach()[i, dn_track['prev_ind'][0]]
@@ -438,7 +446,6 @@ class DETRTrackingBase(nn.Module):
             target['track_query_boxes'] = boxes[:,:4]
 
             assert torch.sum(target['track_query_boxes'] < 0) == 0, 'Bboxes need to have positive values'
-
             assert target['track_query_hs_embeds'].shape[0] + self.num_queries == len(target['track_queries_TP_mask'])
             assert target['track_query_boxes'].shape[0] + self.num_queries == len(target['track_queries_TP_mask'])
 
@@ -531,7 +538,6 @@ class DETRTrackingBase(nn.Module):
                             prev_prev_target = target['prev_prev_target']
                             prev_cur_target = target['prev_cur_target']
 
-                            # if 'object_detection_div_mask' in target:
                             prev_ind_out_clone = prev_ind_out.clone()
                             prev_ind_tgt_clone = prev_ind_tgt.clone()
                             prev_boxes_clone = prev_target['boxes'].clone()

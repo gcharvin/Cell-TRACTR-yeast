@@ -49,7 +49,7 @@ enc_n_points: 4
 # DAB-DETR
 use_dab: true
 group_object: false
-dn_track: false
+dn_track: true
 dn_track_l1: 0.1
 dn_track_l2: 0.05
 dn_object: false
@@ -60,6 +60,7 @@ dn_object_l2: 0.1
 refine_track_queries: true
 refine_object_queries: true
 refine_div_track_queries: false
+use_div_ref_pts: true
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`

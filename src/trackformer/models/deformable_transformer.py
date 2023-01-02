@@ -462,6 +462,7 @@ class DeformableTransformerDecoder(nn.Module):
         # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
         self.bbox_embed = None
         self.class_embed = None
+        self.use_div_ref_pts = False
 
         #### DAB-DETR
         self.use_dab = use_dab
@@ -516,7 +517,14 @@ class DeformableTransformerDecoder(nn.Module):
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
-                tmp = self.bbox_embed[lid](output)[:,:,:4]  # I am using the first box as the basis for the reference points
+                if self.use_div_ref_pts:
+                    tmp = self.bbox_embed[lid](output)
+                    cls = self.class_embed[lid](output)
+                    box_1_ratio = torch.exp(cls[:,:,0]) / (torch.exp(cls[:,:,0]) + torch.exp(cls[:,:,1]))
+                    box_1_ratio = box_1_ratio[:,:,None].repeat(1,1,4)
+                    tmp = tmp[:,:,:4] * box_1_ratio + tmp[:,:,4:] * (1 - box_1_ratio)
+                else:
+                    tmp = self.bbox_embed[lid](output)[:,:,:4]  # I am using the first box as the basis for the reference points
                 if reference_points.shape[-1] == 4:
                     new_reference_points = tmp + inverse_sigmoid(reference_points)
                     assert torch.sum(torch.isnan(new_reference_points)) == 0, 'Reference points causing nan'

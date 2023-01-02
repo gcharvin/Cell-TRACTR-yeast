@@ -31,7 +31,9 @@ class DeformableDETR(DETR):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,device,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
-                 use_dab=True, random_refpoints_xy=False,group_object=False, dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0, refine_object_queries=False):
+                 use_dab=True, random_refpoints_xy=False,group_object=False,
+                  dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0, refine_object_queries=False,
+                  use_div_ref_pts = False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -127,18 +129,24 @@ class DeformableDETR(DETR):
         if two_stage:
             num_pred += 1
 
+        if use_div_ref_pts:
+            self.transformer.decoder.use_div_ref_pts = True
+
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
             self.transformer.decoder.bbox_embed = self.bbox_embed
+            self.transformer.decoder.class_embed = self.class_embed
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
+            self.transformer.decoder.class_embed = None
         if two_stage:
+            raise NotImplementedError
             # hack implementation for two-stage
             self.transformer.decoder.class_embed = self.class_embed
             for box_embed in self.bbox_embed:

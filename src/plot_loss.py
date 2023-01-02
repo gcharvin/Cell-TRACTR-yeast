@@ -9,9 +9,8 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '221210_dn_track_dab_no_mask'
-folder = '221210_dn_object_dab_no_mask'
-folder = '221210_no_mask'
+folder = '221224_div_ref_pts__dab_no_mask'
+folder = '230101_10ep_dn_track_dab_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -32,6 +31,15 @@ for training_method in training_methods:
     if 'loss_ce_' + training_method in losses:
         groups += [training_method]
 
+fig,ax = plt.subplots()
+lrs = metrics_train['lr']
+
+for i in range(lrs.shape[1]):
+    ax.plot(np.arange(1,epochs+1),lrs[:,i])
+ax.set_title('Learning Rate Schedule')
+ax.set_xlabel('Epochs')
+ax.set_ylabel('lr')
+fig.savefig(datapath / folder / 'learning_rate.png')
 
 # Plot Overall Loss
 fig,ax = plt.subplots()
@@ -41,7 +49,7 @@ ax.plot(np.arange(1,epochs_val+1),np.nanmean(metrics_val['loss'],axis=-1),label=
 ax.set_xlabel('Epochs')
 ax.set_ylabel('Loss')
 ax.legend()
-plt.savefig(datapath / folder / 'loss_plot_overall.png')
+fig.savefig(datapath / folder / 'loss_plot_overall.png')
 
 ax.set_yscale('log')
 plt.savefig(datapath / folder / 'loss_plot_overall_log.png')
@@ -130,7 +138,9 @@ def plot_aux_losses(losses,metrics_train,metrics_val,groups):
         plt.savefig(datapath / folder / (f'aux_loss{"_" + group if group is not None else ""}_plot.png'))
 
 plot_aux_losses(losses,metrics_train,metrics_val,groups=groups)
-
+metrics.remove('rand_FP_track_acc')
+metrics.remove('cells_leaving_track_acc')
+metrics.remove('post_division_track_acc')
 
 # Plot acc
 fig,ax = plt.subplots(1,2,figsize=(10,5))
@@ -147,11 +157,12 @@ for midx,metric in enumerate(metrics):
     replace_word = '_object_det_acc' if i ==0 else '_track_acc'
     metric = metric.replace(replace_word,'')
 
-    replace_word = '_objects_det_acc' if i ==0 else '_track_acc'
-    metric = metric.replace(replace_word,'')
 
     ax[i].plot(np.arange(1,epochs+1),train_acc, color = colors[midx] if 'overall' not in metric else 'k',label=metric)
     ax[i].plot(np.arange(1,epochs_val+1),val_acc, '--', color = colors[midx] if 'overall' not in metric else 'k',)
+
+    if metric in ['overall']:
+        print(f'{"Track" if i == 1 else "Object Detection"}\nTrain: {train_acc[-1]}\nVal: {val_acc[-1]}')
 
 for i in range(2):
     ax[i].set_xlabel('Epochs')

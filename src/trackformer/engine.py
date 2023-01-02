@@ -40,6 +40,7 @@ def calc_loss_for_training_methods(training_method:str,
                                    groups,
                                    targets,
                                    criterion,
+                                   epoch,
                                    masks=False):
     outputs_TM = {}
     outputs_TM['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
@@ -48,7 +49,12 @@ def calc_loss_for_training_methods(training_method:str,
 
     outputs_TM = split_outputs(outputs,groups[-2:],outputs_TM,update_masks=masks)
 
-    loss_dict_TM = criterion(outputs_TM, [target[training_method] for target in targets],return_bbox_track_acc=False)
+    targets_TM = [target[training_method] for target in targets]
+
+    if epoch > 10:
+        targets_TM = update_early_or_late_track_divisions(targets_TM,outputs_TM)
+
+    loss_dict_TM = criterion(outputs_TM, targets_TM,return_bbox_track_acc=False)
 
     return outputs_TM, loss_dict_TM, groups
 
@@ -102,11 +108,6 @@ def update_early_or_late_track_divisions(targets,outputs):
                     if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
                         div_box = utils.divide_box(box,fut_box)
 
-                    # not sure if this matters. It's a quick check that the combined_box is reasonble 
-                    # should update to calculate iou based on shape only not location because cells can shift quite a bit in one frame
-                        # if utils.calc_iou(box,div_box) < 0.6:
-                        #     continue
-
                         iou_div, flip = utils.calc_iou(div_box,pred_box,return_flip=True)
                         pred_box[4:] = 0
                         iou = utils.calc_iou(box,pred_box)
@@ -131,12 +132,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
     model.train()
     criterion.train()
 
-    if epoch > 10:
-        tm_threshold = 0.2
-    elif epoch > 20:
-        tm_threshold = 0.1
-    else:
+    if epoch < 10:
         tm_threshold = 0.4
+    elif epoch < 20:
+        tm_threshold = 0.3
+    elif epoch < 40:
+        tm_threshold = 0.25
+    else:
+        tm_threshold = 0.2
 
     ids = np.random.randint(0,len(data_loaders[0]),num_plots)
     ids = np.concatenate((ids,[0]))
@@ -180,23 +183,23 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
-        targets = update_early_or_late_track_divisions(targets,outputs)
-
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
         meta_data = {}
     
-        groups = [0]
-        groups.append(groups[-1] + outputs['pred_logits'].shape[1])
+        groups = [0, targets[0]['track_queries_mask'].shape[0]]
 
         for training_method in training_methods:
             meta_data[training_method] = {}
-            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, args.masks)
+            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args.masks)
 
             meta_data[training_method]['outputs'] = outputs_TM
             meta_data[training_method]['loss_dict'] = loss_dict_TM
 
         outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
+
+        if epoch > 10:
+            targets = update_early_or_late_track_divisions(targets,outputs)
 
         loss_dict, acc_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
@@ -257,10 +260,12 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
     ids = np.random.randint(0,len(data_loaders[0]),num_plots)
     ids = np.concatenate((ids,[0]))
 
-    if epoch > 10:
+    if epoch < 10:
         tm_threshold = 0.4
-    elif epoch > 20:
-        tm_threshold = 0.1
+    elif epoch < 20:
+        tm_threshold = 0.3
+    elif epoch < 40:
+        tm_threshold = 0.25
     else:
         tm_threshold = 0.2
 
@@ -303,23 +308,23 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
-        targets = update_early_or_late_track_divisions(targets,outputs)
-
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
         meta_data = {}
 
-        groups = [0]
-        groups.append(groups[-1] + outputs['pred_logits'].shape[1])
+        groups = [0, targets[0]['track_queries_mask'].shape[0]]
 
         for training_method in training_methods:
             meta_data[training_method] = {}
-            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, args.masks)
+            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args.masks)
 
             meta_data[training_method]['outputs'] = outputs_TM
             meta_data[training_method]['loss_dict'] = loss_dict_TM
 
         outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
+
+        if epoch > 10:
+            targets = update_early_or_late_track_divisions(targets,outputs)
 
         loss_dict, acc_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
@@ -361,8 +366,6 @@ class pipeline():
             Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-        self.colors = np.array([tuple((255*np.random.random(3))) for _ in range(1000)]) # Assume max 1000 cells in one chamber
-
         self.threshold = 0.5
         self.target_size = (256,32)
         self.num_queries = args.num_queries
@@ -371,6 +374,13 @@ class pipeline():
 
         self.write_video = True
         self.track = True
+
+        if self.track:
+            self.colors = np.array([tuple((255*np.random.random(3))) for _ in range(1000)]) # Assume max 1000 cells in one chamber
+        else:
+            self.colors = np.array([tuple((np.zeros(3))) for _ in range(1000)])
+
+
         self.display_masks = False
         self.oq_div = True # Can object queries detect divisions
 
@@ -483,16 +493,16 @@ class pipeline():
 
             for i, fp in enumerate(tqdm(fps_ROI)):
 
-                if not self.track: # should we remove previmg as well for object detection ?
-                    targets = [{}]
-                    colors = np.array([tuple((np.zeros(3))) for _ in range(1000)])
-                    self.max_cellnb = 0
-
                 img = PIL.Image.open(fp,mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB')
                 previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None
 
                 samples = self.normalize(img)[0][None]
                 samples = samples.to(self.device)
+
+                if not self.track: # should we remove previmg as well for object detection ?
+                    targets = [{}]
+                    self.max_cellnb = 0
+                    previmg = None
 
                 outputs, targets, prev_features, memory, hs, prev_outputs = self.model(samples,targets=targets,prev_features=prev_features)
 
@@ -563,7 +573,7 @@ class pipeline():
                 if self.track:
                     color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[self.cells-1],self.cells,self.div_track,self.new_cells,self.track)
                 else:
-                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[:len(self.cells)],self.cells,self.div_track,self.new_cells,self.track)
+                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[:len(self.cells)],self.cells,self.div_track,None,self.track)
 
                 self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = color_frame         
 
@@ -580,8 +590,9 @@ class pipeline():
 
                     colors = self.colors[self.cells-1] if self.track else self.colors[:len(self.cells)] 
 
-                    cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells) if c not in self.cells])
-                    previmg_copy = previmg.copy()
+                    cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells) if c not in self.cells]) if prevcells is not None else None
+                    if self.track:
+                        previmg_copy = previmg.copy()
                     for a,aux_output in enumerate(aux_outputs):
                         all_boxes = aux_output['pred_boxes'][0].detach()
                         img_copy = img.copy()
@@ -596,15 +607,16 @@ class pipeline():
                                 track_boxes = track_boxes[:,:4]
                                 div_track = self.div_track
                                 box_colors = colors
-                                new_cells = self.new_cells
+                                new_cells = self.new_cells if self.track else None
 
                             else:
                                 track_boxes = all_boxes[np.unique(self.track_indices)]
-                                box_colors = self.colors[prevcells-1]
+                                box_colors = self.colors[prevcells-1] if prevcells is not None else colors
                                 div_track = np.ones((track_boxes.shape[0])) * -1
                                 new_cells = None
 
-                                previmg_anchor_boxes = utils.plot_tracking_results(previmg_copy,track_boxes,None,box_colors,prevcells,div_track,new_cells,self.track)
+                                if self.track:
+                                    previmg_anchor_boxes = utils.plot_tracking_results(previmg_copy,track_boxes,None,box_colors,prevcells,div_track,new_cells,self.track)
 
                             if a == 0 and not self.use_dab: # if x,y reference points are used
                                 for ridx in range(track_boxes.shape[0]):
@@ -613,7 +625,12 @@ class pipeline():
                             else:
                                 img_copy = utils.plot_tracking_results(img_copy,track_boxes,None,box_colors,self.cells,div_track,new_cells,self.track)
                         
-                        decoder_frame = np.concatenate((decoder_frame,img_copy),axis=1) if a > 0 else np.concatenate((previmg,img,previmg_anchor_boxes,img_copy),axis=1)
+                        if a == 0 and self.track:
+                            decoder_frame = np.concatenate((previmg,img,previmg_anchor_boxes,img_copy),axis=1)
+                        elif a == 0:
+                            decoder_frame = np.concatenate((img,img_copy),axis=1)
+                        else:
+                            decoder_frame = np.concatenate((decoder_frame,img_copy),axis=1)
 
                         # Plot all predictions regardless of cls label
                         if a == len(aux_outputs) - 1:
@@ -621,7 +638,7 @@ class pipeline():
                             
                             color_queries = np.array([(np.array([0.,0.,255.])) for _ in range(self.num_queries)])
 
-                            if cells_exit_ids.shape[0] > 0: # Plot the track query that left the chamber
+                            if cells_exit_ids is not None and cells_exit_ids.shape[0] > 0: # Plot the track query that left the chamber
                                 boxes_exit = all_boxes[cells_exit_ids[:,0],:4]
                                 boxes = torch.cat((all_boxes[-self.num_queries:,:4],boxes_exit,track_boxes))
                                 colors_prev = self.colors[cells_exit_ids[:,1] - 1] 
@@ -650,7 +667,8 @@ class pipeline():
 
                     img_ref_pts_init_object = np.copy(np.array(img))
                     img_ref_pts_init_track = np.copy(np.array(img))
-                    previmg_ref_pts_init_track = np.copy(np.array(previmg))
+                    if self.track:
+                        previmg_ref_pts_init_track = np.copy(np.array(previmg))
                     img_ref_pts_init_all = np.copy(np.array(img))
                     img_ref_pts_final_all = np.copy(np.array(img))
 
@@ -663,18 +681,26 @@ class pipeline():
                             else:
                                 x,y = ref[ridx]
                             
-                            if ridx < len(prevcells) and prevcells[ridx] in self.cells: # cell tracked from previous frame
-                                color = self.colors[prevcells[ridx] - 1]
-                                radius = 2
-                            elif ridx < len(prevcells) and prevcells[ridx] not in self.cells: # track query not detected
-                                color = (255,255,255)
-                                radius = 2
-                            elif ridx >= len(prevcells) and pred_logits[ridx,0] > self.threshold: # object queries detected
-                                color = (255,0,0)
-                                radius = 1
-                            elif ridx >= len(prevcells) and pred_logits[ridx,0] < self.threshold: # object queries not used
-                                color = (0,0,255)
-                                radius = 1
+                            if self.track:
+                                if ridx < len(prevcells) and prevcells[ridx] in self.cells: # cell tracked from previous frame
+                                    color = self.colors[prevcells[ridx] - 1]
+                                    radius = 2
+                                elif ridx < len(prevcells) and prevcells[ridx] not in self.cells: # track query not detected
+                                    color = (255,255,255)
+                                    radius = 2
+                                elif ridx >= len(prevcells) and pred_logits[ridx,0] > self.threshold: # object queries detected
+                                    color = (255,0,0)
+                                    radius = 1
+                                elif ridx >= len(prevcells) and pred_logits[ridx,0] < self.threshold: # object queries not used
+                                    color = (0,0,255)
+                                    radius = 1
+                            else:
+                                if pred_logits[ridx,0] > self.threshold: # object queries detected
+                                    color = (255,0,0)
+                                    radius = 1
+                                elif pred_logits[ridx,0] < self.threshold: # object queries not used
+                                    color = (0,0,255)
+                                    radius = 1
 
                             img_ref_pts_update = cv2.circle(img_ref_pts_update, (int(x*self.target_size[1]),int(y*self.target_size[0])), radius=radius, color=color, thickness=-1)
 

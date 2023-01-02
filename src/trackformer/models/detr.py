@@ -291,14 +291,6 @@ class SetCriterion(nn.Module):
 
         target_boxes = [t['boxes'][i] for t, (_, i) in zip(targets, indices)]
 
-        # for s,swap_ind in enumerate(swap_indices):
-        #     if len(swap_ind) > 0:
-        #         for swap_output_idx in swap_ind:
-        #             assert swap_output_idx in indices[s][0]
-        #             swap_idx = torch.where(swap_output_idx == indices[s][0])
-        #             target_boxes[s][swap_idx] = torch.cat((target_boxes[s][swap_idx,4:],target_boxes[s][swap_idx,:4]),axis=-1)
-
-
         target_boxes = torch.cat(target_boxes,dim=0)
 
         # For empty chambers, there is a placeholder bbox of zeros that needs to be removed
@@ -346,13 +338,6 @@ class SetCriterion(nn.Module):
         src_masks = torch.cat((src_masks,torch.cat((src_masks[:,:,1:],src_masks[:,:,:1]),axis=2)),axis=1)
 
         target_masks = [t["masks"][i] for t, (_, i) in zip(targets, indices)]
-        
-        # for s,swap_ind in enumerate(swap_indices):
-        #     if len(swap_ind) > 0:
-        #         for swap_output_idx in swap_ind:
-        #             assert swap_output_idx in indices[s][0]
-        #             swap_idx = torch.where(swap_output_idx == indices[s][0])
-        #             target_masks[s][swap_idx] = torch.cat((target_masks[s][swap_idx,1:],target_masks[s][swap_idx,:1]),axis=1)
 
         target_masks = torch.cat(target_masks,axis=0).to(src_masks)
         target_masks,_ = nested_tensor_from_tensor_list(target_masks).decompose()

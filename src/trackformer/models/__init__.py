@@ -43,7 +43,8 @@ def build_model(args):
         'dn_object_l1': args.dn_object_l1,
         'dn_object_l2': args.dn_object_l2,
         'dn_label': args.dn_label,
-        'refine_object_queries': args.refine_object_queries,}
+        'refine_object_queries': args.refine_object_queries,
+        'use_div_ref_pts': args.use_div_ref_pts,}
 
     tracking_kwargs = {
         'track_query_false_positive_prob': args.track_query_false_positive_prob,
