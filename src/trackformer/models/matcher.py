@@ -178,13 +178,14 @@ class HungarianMatcher(nn.Module):
         indices = [linear_sum_assignment(c[i])
                    for i, c in enumerate(cost_matrix.split(sizes, -1))]
 
-        # Meant for debugging purposes only; will check when a flipped division has been matched
-        if np.sum(indices[0][0] > cost_matrix.shape[1] // 2) + np.sum(indices[1][0] > cost_matrix.shape[1] // 2) > 0:
-            a = 0
+        # # Meant for debugging purposes only; will check when a flipped division has been matched
+        # if np.sum(indices[0][0] > cost_matrix.shape[1] // 2) + np.sum(indices[1][0] > cost_matrix.shape[1] // 2) > 0:
+        #     a = 0
 
         for target in targets:
             if 'track_query_match_ids' not in target:
-                assert np.sum(indices[0][0] >= cost_matrix.shape[1] // 2) == 0 and np.sum(indices[1][0] >= cost_matrix.shape[1] // 2) == 0
+                for c in range(cost_matrix.shape[0]):
+                    assert np.sum(indices[c][0] >= cost_matrix.shape[1] // 2) == 0
 
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
                 for i, j in indices]
