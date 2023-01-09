@@ -67,7 +67,9 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
     alpha = 0.3
     pred_masks = 'pred_masks' in outputs
     box_converter = box_cxcy_to_xyxy(height,width)
-
+    batch_enc_frames = []
+    enc_colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+    
     if meta_data is not None:
         meta_data_keys = list(meta_data.keys())
 
@@ -81,7 +83,6 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                 for i in range(bs):
                     colors = [tuple((255*np.random.random(3))) for _ in range(50)]
 
-                    # img = samples.tensors[i].permute(1,2,0)                
                     img = samples[i].permute(1,2,0)                
                     
                     boxes = targets_TM[i]['track_query_boxes_gt'].detach().cpu().numpy()
@@ -142,29 +143,10 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     pred_logits = outputs_TM['pred_logits'][i].sigmoid().detach().cpu().numpy()
 
                     pred_boxes = box_converter.convert(pred_boxes)
-                    pred_boxes_thresh = pred_boxes[pred_logits[:,0] < threshold]
 
-                    for idx,bbox in enumerate(pred_boxes_thresh):
-                        bounding_box = bbox[:4]
-                        img_all_pred = cv2.rectangle(
-                            img_all_pred,
-                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
-                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                            color=colors[idx] if TP_mask[idx] else (0,0,0),
-                            thickness = 1)  
-
-                        img_all_pred = cv2.putText(
-                            img_all_pred,
-                            text = f'{pred_logits[idx,0]:.2f}', 
-                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                            fontScale = fontscale,
-                            color = colors[idx] if TP_mask[idx] else (128,128,128),
-                            thickness=1,
-                        )
-
-                        if pred_logits[idx,1] > threshold:
-                            bounding_box = bbox[4:]
+                    for idx,bbox in enumerate(pred_boxes):
+                        if pred_logits[idx,0] < threshold:
+                            bounding_box = bbox[:4]
                             img_all_pred = cv2.rectangle(
                                 img_all_pred,
                                 (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
@@ -174,7 +156,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
                             img_all_pred = cv2.putText(
                                 img_all_pred,
-                                text = f'{pred_logits[idx,1]:.2f}', 
+                                text = f'{pred_logits[idx,0]:.2f}', 
                                 org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
                                 fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
                                 fontScale = fontscale,
@@ -233,9 +215,134 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     dn_track[:,(width*6+spacer)*i + width*4:(width*6+spacer)*i + width*5] = img_pred
                     dn_track[:,(width*6+spacer)*i + width*5:(width*6+spacer)*i + width*6] = img_all_pred
 
-                cv2.imwrite(str(savepath / folder / (filename.stem + '_dn_track' + filename.suffix)),dn_track)
+                cv2.imwrite(str(savepath / folder / 'dn_track' / filename),dn_track)
 
-            if meta_data_key == 'dn_object':
+            elif meta_data_key == 'dn_enc':
+                for i in range(bs):
+                    colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+
+                    img = samples[i].permute(1,2,0)                
+                    
+                    enc_boxes_noised = targets_TM[i]['enc_boxes_noised'].detach().cpu().numpy()
+                    enc_boxes = targets_TM[i]['enc_boxes'].detach().cpu().numpy()
+                    boxes = targets_TM[i]['boxes'].detach().cpu().numpy()
+                
+                    enc_boxes_noised = box_converter.convert(enc_boxes_noised)
+                    enc_boxes = box_converter.convert(enc_boxes)
+                    boxes = box_converter.convert(boxes)
+
+                    img = img.detach().cpu().numpy().copy()
+                    img = np.repeat(np.mean(img,axis=-1)[:,:,np.newaxis],3,axis=-1)
+                    img = (255*(img - np.min(img)) / np.ptp(img)).astype(np.uint8)
+                    img_gt = img.copy()
+                    img_enc_noised = img.copy()
+                    img_enc = img.copy()
+                    img_enc_thresh = img.copy()
+                    img_pred = img.copy()
+                    img_pred_all = img.copy()
+
+
+                    for idx,bbox in enumerate(boxes):
+                        bounding_box = bbox[:4]
+                        img_gt = cv2.rectangle(
+                            img_gt,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=(0,0,0),
+                            thickness = 1)
+
+
+                    for idx,bbox in enumerate(enc_boxes_noised):
+                        bounding_box = bbox[:4]
+                        img_enc_noised = cv2.rectangle(
+                            img_enc_noised,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx],
+                            thickness = 1)
+
+                    for idx,bbox in enumerate(enc_boxes):
+                        bounding_box = bbox[:4]
+                        img_enc = cv2.rectangle(
+                            img_enc,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx],
+                            thickness = 1)
+
+                    for idx,bbox in enumerate(enc_boxes):
+                        if targets_TM[i]['enc_logits'][idx] > 0.2:
+                            bounding_box = bbox[:4]
+                            img_enc_thresh = cv2.rectangle(
+                                img_enc_thresh,
+                                (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                                (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                                color=colors[idx],
+                                thickness = 1)
+
+                            img_enc_thresh = cv2.putText(
+                                    img_enc_thresh,
+                                    text = f'{targets_TM[i]["enc_logits"][idx]:.2f}', 
+                                    org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                    fontScale = fontscale,
+                                    color = colors[idx],
+                                    thickness=1,
+                                )
+
+                    pred_boxes = outputs_TM['pred_boxes'][i].detach().cpu().numpy()
+                    pred_logits = outputs_TM['pred_logits'][i].sigmoid().detach().cpu().numpy()
+
+                    pred_boxes = box_converter.convert(pred_boxes)
+
+                    for idx,bbox in enumerate(pred_boxes):
+                        bounding_box = bbox[:4]
+                        img_pred_all = cv2.rectangle(
+                            img_pred_all,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[idx],
+                            thickness = 1)  
+                        
+                        img_pred_all = cv2.putText(
+                            img_pred_all,
+                            text = f'{pred_logits[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = fontscale,
+                            color = colors[idx],
+                            thickness=1,
+                        )
+
+                    keep = pred_logits[:,0] > threshold
+                    where = np.where(pred_logits[:,0] > threshold)[0]
+                    pred_boxes = pred_boxes[keep]
+                    pred_logits = pred_logits[keep]
+
+                    for idx,bbox in enumerate(pred_boxes): 
+                        bounding_box = bbox[:4]
+                        img_pred = cv2.rectangle(
+                            img_pred,
+                            (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                            (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                            color=colors[where[idx]],
+                            thickness = 1)            
+
+                        img_pred = cv2.putText(
+                            img_pred,
+                            text = f'{pred_logits[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = fontscale,
+                            color = colors[where[idx]],
+                            thickness=1,
+                        )
+
+                    dn_enc = np.concatenate((img,img_enc_thresh,img_enc,img_enc_noised,img_pred,img_pred_all,img_gt),axis=1)
+
+                cv2.imwrite(str(savepath / folder / 'dn_enc' / filename),dn_enc)
+
+            elif meta_data_key == 'dn_object':
                 dn_object = np.zeros((height,(width*5 + spacer)*bs,3))
                 for i in range(bs):
                     colors = [tuple((255*np.random.random(3))) for _ in range(50)]
@@ -332,7 +439,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     dn_object[:,(width*5+spacer)*i + width*3:(width*5+spacer)*i + width*4] = img_pred
                     dn_object[:,(width*5+spacer)*i + width*4:(width*5+spacer)*i + width*5] = img_pred_all
 
-                cv2.imwrite(str(savepath / folder / (filename.stem + '_dn_object' + filename.suffix)),dn_object)
+                cv2.imwrite(str(savepath / folder / 'dn_object' / filename),dn_object)
 
 
     for i in range(bs):
@@ -358,14 +465,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
             if sum(prev_keep) > 0:
         
-                prev_bbs[:,1::2] = prev_bbs[:,1::2] * height
-                prev_bbs[:,::2] = prev_bbs[:,::2] * width
-                prev_bbs[:,0] = prev_bbs[:,0] - prev_bbs[:,2] // 2
-                prev_bbs[:,1] = prev_bbs[:,1] - prev_bbs[:,3] // 2
-                prev_bbs[:,4] = prev_bbs[:,4] - prev_bbs[:,6] // 2
-                prev_bbs[:,5] = prev_bbs[:,5] - prev_bbs[:,7] // 2
-
-
+                prev_bbs = box_converter.convert(prev_bbs)
 
             for idx,bbox in enumerate(prev_bbs):
                 bounding_box = bbox[:4]
@@ -431,6 +531,39 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
             blank = np.concatenate((blank,previmg,previmg_track),axis=1)
 
+        if prev_outputs is not None and 'enc_outputs' in prev_outputs:
+            enc_outputs = prev_outputs['enc_outputs']
+            enc_pred_logits = enc_outputs['pred_logits'].cpu()
+            enc_pred_boxes = enc_outputs['pred_boxes'].cpu()
+
+            logits_topk, ind_topk = torch.topk(enc_pred_logits[i,:,0].sigmoid(),30)
+            boxes_topk = enc_pred_boxes[i,ind_topk]
+
+            boxes_topk = box_converter.convert(boxes_topk.numpy())
+
+            t0,t1,t2,t3 = 0.1,0.3,0.5,0.8
+            boxes_list = []
+            boxes_list.append(boxes_topk[logits_topk < t0])
+            boxes_list.append(boxes_topk[(logits_topk > t0) * (logits_topk < t1)])
+            boxes_list.append(boxes_topk[(logits_topk > t1) * (logits_topk < t2)])
+            boxes_list.append(boxes_topk[(logits_topk > t2) * (logits_topk < t3)])
+            boxes_list.append(boxes_topk[logits_topk > t3])
+
+            enc_frames = []
+            for boxes in boxes_list:
+                enc_frame = np.array(previmg_copy).copy()
+                for idx,bounding_box in enumerate(boxes):
+                    enc_frame = cv2.rectangle(
+                    enc_frame,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=enc_colors[idx],
+                    thickness = 1)
+                enc_frames.append(enc_frame)
+
+            enc_frames_prev = np.concatenate((enc_frames),axis=1)
+
+
         img = samples[i].permute(1,2,0)
 
         bbs = outputs['pred_boxes'][i].detach().cpu().numpy()
@@ -458,12 +591,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
         if sum(keep) > 0:
 
-            bbs[:,1::2] = bbs[:,1::2] * height
-            bbs[:,::2] = bbs[:,::2] * width
-            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
-            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+            bbs = box_converter.convert(bbs)
 
         img = img.detach().cpu().numpy().copy()
         img = np.repeat(np.mean(img,axis=-1)[:,:,np.newaxis],3,axis=-1)
@@ -521,6 +649,44 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                     img[mask>0] = img[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
                     
+        if 'enc_outputs' in outputs:
+            enc_outputs = outputs['enc_outputs']
+            enc_pred_logits = enc_outputs['pred_logits'].detach().cpu()
+            enc_pred_boxes = enc_outputs['pred_boxes'].detach().cpu()
+
+            logits_topk, ind_topk = torch.topk(enc_pred_logits[i,:,0].sigmoid(),30)
+            boxes_topk = enc_pred_boxes[i,ind_topk]
+
+            boxes_topk = box_converter.convert(boxes_topk.numpy())
+
+            t0,t1,t2,t3 = 0.1,0.3,0.5,0.8
+            boxes_list = []
+            boxes_list.append(boxes_topk[logits_topk < t0])
+            boxes_list.append(boxes_topk[(logits_topk > t0) * (logits_topk < t1)])
+            boxes_list.append(boxes_topk[(logits_topk > t1) * (logits_topk < t2)])
+            boxes_list.append(boxes_topk[(logits_topk > t2) * (logits_topk < t3)])
+            boxes_list.append(boxes_topk[logits_topk > t3])
+
+            enc_frames = []
+            for boxes in boxes_list:
+                enc_frame = np.array(img_copy).copy()
+                for idx,bounding_box in enumerate(boxes):
+                    enc_frame = cv2.rectangle(
+                    enc_frame,
+                    (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                    (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                    color=enc_colors[idx],
+                    thickness = 1)
+                enc_frames.append(enc_frame)
+
+            enc_frames_cur = np.concatenate((enc_frames),axis=1)
+
+            if prev_outputs is not None:
+                enc_frames = np.concatenate((enc_frames_prev,enc_frames_cur),axis=1)
+            else:
+                enc_frames = enc_frames_cur
+
+            batch_enc_frames.append(enc_frames)
 
         if blank is None:
             blank = img
@@ -545,12 +711,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                 prev_prev_img_gt_copy = prev_prev_img_gt.copy()
 
                 bbs = target_og['prev_prev_boxes'].detach().cpu().numpy()
-                bbs[:,1::2] = bbs[:,1::2] * height
-                bbs[:,::2] = bbs[:,::2] * width
-                bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-                bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-                bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
-                bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+
+                bbs = box_converter.convert(bbs)
 
                 for idx, bbox in enumerate(bbs):
                     bounding_box = bbox[:4]
@@ -577,11 +739,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
             prev_target = target['prev_target']
             bbs = prev_target['boxes'].detach().cpu().numpy()
-            bbs[:,1::2] = bbs[:,1::2] * height
-            bbs[:,::2] = bbs[:,::2] * width
-            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            bbs = box_converter.convert(bbs)
+
             for idx, bbox in enumerate(bbs):
                 bounding_box = bbox[:4]
                 previmg_gt = cv2.rectangle(
@@ -604,11 +763,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             previmg_gt_og = previmg_copy.copy()
 
             bbs = target_og['prev_boxes'].detach().cpu().numpy()
-            bbs[:,1::2] = bbs[:,1::2] * height
-            bbs[:,::2] = bbs[:,::2] * width
-            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
+            bbs = box_converter.convert(bbs)
+
             for idx, bbox in enumerate(bbs):
                 bounding_box = bbox[:4]
                 previmg_gt_og = cv2.rectangle(
@@ -632,12 +788,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             img_gt = img_copy.copy()
 
             bbs = target['boxes'].detach().cpu().numpy()
-            bbs[:,1::2] = bbs[:,1::2] * height
-            bbs[:,::2] = bbs[:,::2] * width
-            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
-            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+            bbs = box_converter.convert(bbs)
+
 
             for idx, bbox in enumerate(bbs):
                 bounding_box = bbox[:4]
@@ -660,12 +812,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
             img_gt_og = img_copy.copy()
             bbs = target_og['boxes'].detach().cpu().numpy()
-            bbs[:,1::2] = bbs[:,1::2] * height
-            bbs[:,::2] = bbs[:,::2] * width
-            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
-            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+            bbs = box_converter.convert(bbs)
 
             for idx, bbox in enumerate(bbs):
                 bounding_box = bbox[:4]
@@ -694,12 +841,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             fut_img_gt_copy = fut_img_gt.copy()
 
             bbs = target_og['fut_boxes'].detach().cpu().numpy()
-            bbs[:,1::2] = bbs[:,1::2] * height
-            bbs[:,::2] = bbs[:,::2] * width
-            bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-            bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
-            bbs[:,4] = bbs[:,4] - bbs[:,6] // 2
-            bbs[:,5] = bbs[:,5] - bbs[:,7] // 2
+            bbs = box_converter.convert(bbs)
 
             for idx, bbox in enumerate(bbs):
                 bounding_box = bbox[:4]
@@ -722,17 +864,20 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             blank = np.concatenate((blank,fut_img_gt,fut_img_gt_copy),axis=1)
 
 
-    cv2.imwrite(str(savepath / folder / filename),blank)
+    cv2.imwrite(str(savepath / folder / 'standard' / filename),blank)
+
+    if 'enc_outputs' in outputs:
+        cv2.imwrite(str(savepath / folder / 'enc_outputs' / filename),np.concatenate((batch_enc_frames),axis=1))
 
 
-def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=None,track=True):
+def plot_tracking_results(img,bbs,masks,colors,cells=None,div_track=None,new_cells=None,track=True):
 
     img = np.array(img)
     height = img.shape[0]
     width = img.shape[1]
-    fontscale = 0.4
     mask_threshold = 0.5
     alpha = 0.4
+    box_converter = box_cxcy_to_xyxy(height,width)
 
     bbs = bbs.detach().cpu().numpy()
 
@@ -746,13 +891,8 @@ def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=No
         masks_filt = masks_filt > mask_threshold
         masks = (masks_filt*255).astype(np.uint8)
 
-    write_cellnb = False
-
     if bbs is not None:
-        bbs[:,1::2] = bbs[:,1::2] * height
-        bbs[:,::2] = bbs[:,::2] * width
-        bbs[:,0] = bbs[:,0] - bbs[:,2] // 2
-        bbs[:,1] = bbs[:,1] - bbs[:,3] // 2
+        bbs = box_converter.convert(bbs)
 
     for idx,bounding_box in enumerate(bbs):
 
@@ -770,16 +910,6 @@ def plot_tracking_results(img,bbs,masks,colors,cells,div_track=None,new_cells=No
             mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
             img[mask>0] = img[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
-        if write_cellnb:
-            img = cv2.putText(
-                img,
-                text = str(cells[idx]), 
-                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = fontscale,
-                color = colors[idx],
-                thickness=1,
-            )
     # if track ; currently want to see how much object uses divisions
     if div_track is not None and (div_track != -1).sum() > 0:
         div_track_nbs = np.unique(div_track[div_track != -1])
@@ -1422,12 +1552,12 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
         for metrics_key in acc_dict.keys(): # add the accuracy info; these are two digits; first is # correct; second is total #
             metrics_dict[metrics_key] = acc_dict[metrics_key]
 
-        for loss_dict_key in loss_dict.keys(): # add the loss info which is a single number
-            metrics_dict[loss_dict_key] = (loss_dict[loss_dict_key].detach().cpu().numpy()[None,None] * weight_dict[loss_dict_key]) if loss_dict_key in loss_dict else np.array(np.nan)[None,None]
+        for weight_dict_key in weight_dict.keys(): # add the loss info which is a single number
+            metrics_dict[weight_dict_key] = (loss_dict[weight_dict_key].detach().cpu().numpy()[None,None] * weight_dict[weight_dict_key]) if weight_dict_key in loss_dict else np.array(np.nan)[None,None]
 
-        for weight_dict_key in weight_dict.keys(): # If there are empty chambers in both samples, we need to manually add nan to standarize it
-            if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
-                metrics_dict[weight_dict_key] = np.array(np.nan)[None,None]
+        # for weight_dict_key in weight_dict.keys(): # If there are empty chambers in both samples, we need to manually add nan to standarize it
+        #     if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
+        #         metrics_dict[weight_dict_key] = np.array(np.nan)[None,None]
         
         if lr is not None:
             metrics_dict['lr'] = lr
@@ -1436,13 +1566,13 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
         for metrics_key in acc_dict.keys():
             metrics_dict[metrics_key] = np.concatenate((metrics_dict[metrics_key],acc_dict[metrics_key]),axis=1)
 
-        for loss_dict_key in loss_dict.keys():
-            loss_dict_key_loss = (loss_dict[loss_dict_key].detach().cpu().numpy()[None,None] * weight_dict[loss_dict_key]) if loss_dict_key in loss_dict else np.array(np.nan)[None,None]
-            metrics_dict[loss_dict_key] = np.concatenate((metrics_dict[loss_dict_key],loss_dict_key_loss),axis=1)
+        for weight_dict_key in weight_dict.keys():
+            loss_dict_key_loss = (loss_dict[weight_dict_key].detach().cpu().numpy()[None,None] * weight_dict[weight_dict_key]) if weight_dict_key in loss_dict else np.array(np.nan)[None,None]
+            metrics_dict[weight_dict_key] = np.concatenate((metrics_dict[weight_dict_key],loss_dict_key_loss),axis=1)
 
-        for weight_dict_key in weight_dict.keys(): # If there are empty chambers in both samples, we need to manually add nan to standarize it
-            if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
-                metrics_dict[weight_dict_key] = np.concatenate((metrics_dict[weight_dict_key],np.array(np.nan)[None,None]),axis=1)
+        # for weight_dict_key in weight_dict.keys(): # If there are empty chambers in both samples, we need to manually add nan to standarize it
+        #     if weight_dict_key not in loss_dict and (('mask' not in weight_dict_key) or ('mask' in weight_dict_key and not bool(re.search('\d',weight_dict_key)))):
+        #         metrics_dict[weight_dict_key] = np.concatenate((metrics_dict[weight_dict_key],np.array(np.nan)[None,None]),axis=1)
 
     assert metrics_dict['loss'].shape[0] == 1, 'Only one epoch worth of loss / metric info should be added'
 
@@ -1652,36 +1782,48 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
 
     return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None], cells_leaving_acc[None,None], rand_FP_acc[None,None]
 
+def calc_object_query_FP(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
+    acc = torch.zeros((2),dtype=torch.int32)
+    if 'track_queries_mask' in targets[0]:
+        num_queries = (~targets[0]['track_queries_mask']).sum().cpu()
+        
+        for t,target in enumerate(targets):
+            bboxes = target['boxes'].detach().cpu()
+            query_ids = torch.where((outputs['pred_logits'][t,:,0] > cls_thresh))[0]
+            object_query_ids = torch.tensor([query_id for query_id in query_ids if query_id >= outputs['pred_logits'].shape[1] - num_queries]).cpu()
+            for object_query_id in object_query_ids:
+                if object_query_id not in indices[t][0]:
+                    acc[1] += 1
+                else:
+                    ind_loc = torch.where(indices[t][0] == object_query_id)[0]
+                    iou = box_ops.generalized_box_iou(
+                            box_ops.box_cxcywh_to_xyxy(outputs['pred_boxes'][t,object_query_id,:4].detach().cpu()[None]),
+                            box_ops.box_cxcywh_to_xyxy(bboxes[indices[t][1][ind_loc],:4]),
+                            return_iou_only=True
+                            )
+
+                    if iou > iou_thresh:
+                        acc += 1
+                    else:
+                        acc[1] += 1
+
+    return acc[None,None]
 
 def combine_div_boxes(box, prev_box):
 
-    new_box = prev_box.clone()
+    new_box = torch.zeros_like(box)
 
     min_y = min(box[1] - box[3] / 2, box[5] - box[7] / 2)
     max_y = max(box[1] + box[3] / 2, box[5] + box[7] / 2)
     avg_y = (min_y + max_y) / 2
     new_box[1] = avg_y
+    new_box[3] = max_y - min_y
 
     min_x = min(box[0] - box[2] / 2, box[4] - box[6] / 2)
     max_x = max(box[0] + box[2] / 2, box[4] + box[6] / 2)
     avg_x = (min_x + max_x) / 2
     new_box[0] = avg_x
-
-    h = torch.tensor([new_box[1] - new_box[3] / 2, new_box[1] + new_box[3] / 2])
-    if h[0] < 0:
-        new_box[1] = new_box[1] - h[0] / 2 
-        new_box[3] = new_box[3] + h[0] 
-    elif h[1] > 1: 
-        new_box[1] = new_box[1] - (h[1]-1) / 2 
-        new_box[3] = new_box[3] - (h[1]-1)
-
-    w = torch.tensor([new_box[0] - new_box[2] / 2, new_box[0] + new_box[2] / 2])
-    if w[0] < 0:
-        new_box[0] = new_box[0] - w[0] / 2 
-        new_box[2] = new_box[2] + w[0] 
-    elif w[1] > 1: 
-        new_box[0] = new_box[0] - (w[1]-1) / 2 
-        new_box[2] = new_box[2] - (w[1]-1)
+    new_box[2] = max_x - min_x
 
     return new_box
 
@@ -1704,6 +1846,16 @@ def divide_box(box,fut_box):
 
     new_box[0::4] = fut_box[0::4] + dif_x
     new_box[1::4] = fut_box[1::4] + dif_y
+
+    new_box_y_0 = torch.clip((new_box[1::4] - new_box[3::4] / 2), box[1] - box[3] / 2, box[1] + box[3] / 2)
+    new_box_x_0 = torch.clip((new_box[0::4] - new_box[2::4] / 2), box[0] - box[2] / 2, box[0] + box[2] / 2)
+    new_box_y_1 = torch.clip((new_box[1::4] + new_box[3::4] / 2), box[1] - box[3] / 2, box[1] + box[3] / 2)
+    new_box_x_1 = torch.clip((new_box[0::4] + new_box[2::4] / 2), box[0] - box[2] / 2, box[0] + box[2] / 2)
+
+    new_box[1::4] = (new_box_y_0 + new_box_y_1) / 2
+    new_box[3::4] = new_box_y_1 - new_box_y_0
+    new_box[0::4] = (new_box_x_0 + new_box_x_1) / 2
+    new_box[2::4] = new_box_x_1 - new_box_x_0
 
     return new_box
 
@@ -1785,3 +1937,12 @@ def calc_iou(box_1,box_2,return_flip=False):
             return iou, flip
 
     return iou
+
+
+def add_noise_to_boxes(boxes,l_1,l_2,clamp=True):
+    noise = torch.rand_like(boxes) * 2 - 1
+    boxes[..., :2] += boxes[..., 2:] * noise[..., :2] * l_1
+    boxes[..., 2:] *= 1 + l_2 * noise[..., 2:]
+    if clamp:
+        boxes = torch.clamp(boxes,0,1)
+    return boxes
