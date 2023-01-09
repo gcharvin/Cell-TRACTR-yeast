@@ -9,8 +9,8 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '221224_div_ref_pts__dab_no_mask'
-folder = '230101_10ep_dn_track_dab_no_mask'
+folder = '230109_delete_dn_enc_two_stage_dn_track_dab_no_mask'
+# folder = '230105_all_tokens_no_prev_memory_init_enc_embed_two_stage_dn_track_dab_no_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -25,7 +25,7 @@ epochs_val = metrics_val['loss'].shape[0]
 
 groups = [None]
 
-training_methods = ['dn_track','dn_object','group_object']
+training_methods = ['dn_track','dn_object','dn_enc','group_object']
 
 for training_method in training_methods:
     if 'loss_ce_' + training_method in losses:
@@ -95,7 +95,7 @@ for g in range(len(groups)):
 plt.savefig(datapath / folder / 'loss_plot_log.png')
 
 
-losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice']] # Auxillary losses does not have mask / dice loss
+losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice','loss_ce_enc','loss_bbox_enc','loss_giou_enc']] # Auxillary losses does not have mask / dice loss
 
 
 def plot_aux_losses(losses,metrics_train,metrics_val,groups):

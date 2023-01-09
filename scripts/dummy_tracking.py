@@ -10,6 +10,7 @@ import cv2
 import numpy as np 
 from skimage.measure import label
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 def get_avg_cell_area_norm(fps,num_samples = 30):
     area = []
@@ -33,7 +34,7 @@ def get_avg_cell_area_norm(fps,num_samples = 30):
         
     return sum(area) / len(area)
         
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells/raw_data_ordered')
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset/raw_data')
 
 fps = sorted(list((datapath / 'img').glob("*.png")))[:]
 # fps = [fp for fp in fps if 'TrainingSet' not in fp.stem]
@@ -41,7 +42,10 @@ fps = sorted(list((datapath / 'img').glob("*.png")))[:]
 np.random.seed(1)
 colors = tuple([(255*np.random.random(3)).astype(np.uint8) for _ in range(12)])
 
-save_dummy = False
+save_dummy = True
+if save_dummy:
+    (datapath / 'dummy').mkdir(exist_ok=True)
+remove = True
 resize = 4
 avg_area_norm = get_avg_cell_area_norm(fps,num_samples=30)
 correct = []
@@ -51,7 +55,6 @@ for fp in tqdm(fps):
         print(fp.stem)
     inputs = cv2.imread(str(datapath / 'inputs' / fp.name),cv2.IMREAD_ANYDEPTH)    
     outputs = cv2.imread(str(datapath / 'outputs' / fp.name),cv2.IMREAD_ANYDEPTH)
-    
     previmg = cv2.imread(str(datapath / 'previmg' / fp.name))
     img = cv2.imread(str(datapath / 'img' / fp.name))
     
@@ -156,9 +159,7 @@ for fp in tqdm(fps):
                             color = (0,0,0),
                             thickness = 1)
             
-    if save_dummy:
-        cv2.imwrite(str(datapath / 'dummy' / fp.name),np.concatenate((previmg,img,np.repeat(prevseg[:,:,None]*255,3,axis=-1),np.repeat(seg[:,:,None]*255,3,axis=-1)),axis=1))
-    
+
     outputs_cells = np.unique(outputs)
     seg_cells = np.unique(seg_label)[1:]
     
@@ -179,5 +180,30 @@ for fp in tqdm(fps):
             correct.append(0)
             print(f'{fp.stem}:wrong')
             
+            if save_dummy:
+                cv2.imwrite(str(datapath / 'dummy' / fp.name),np.concatenate((previmg,img,np.repeat(prevseg[:,:,None]*255,3,axis=-1),np.repeat(seg[:,:,None]*255,3,axis=-1)),axis=1))
+    
+            plot = np.concatenate((previmg,img,np.repeat(prevseg[:,:,None]*255,3,axis=-1),np.repeat(seg[:,:,None]*255,3,axis=-1)),axis=1)
+
+            # plt.show(plot)
+
+            while True:
+                answer = input('Do you want to remove this sample? (y/n)')
+
+                if answer == 'y':
+                    if (datapath / 'inputs' / fp.name).exists():
+                        for folder in ['inputs','outputs','img','previmg']:
+                            (datapath / folder / fp.name).unlink()
+                        print('file exists and is deleted')
+                    else:
+                        print('File does not exist or file was already deleted')
+                    break
+                elif answer == 'n':
+                    break
+                else:
+                    print('Please select y or n')
+
+            # plt.close('all')
+
 print(f'{sum(correct)} correct predictions out of {len(correct)}')
     

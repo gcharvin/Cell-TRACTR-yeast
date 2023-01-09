@@ -32,7 +32,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 def train(args: Namespace) -> None:
 
     
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_refactored_dataloader_{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_group" if args.group_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
+    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_delete_dn_enc{"_two_stage" if args.two_stage else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_group" if args.group_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
     # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/221208_dn_track_dab_no_mask/checkpoint.pth')
     args.save_model_interval = False
     # args.resume_optim = False
@@ -47,6 +47,25 @@ def train(args: Namespace) -> None:
     args.output_dir.mkdir(exist_ok=True)
     (args.output_dir / 'eval_outputs').mkdir(exist_ok=True)
     (args.output_dir / 'train_outputs').mkdir(exist_ok=True)
+
+    (args.output_dir / 'eval_outputs' / 'standard').mkdir(exist_ok=True)
+    (args.output_dir / 'train_outputs' / 'standard').mkdir(exist_ok=True)
+
+    if args.two_stage:
+        (args.output_dir / 'eval_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+        (args.output_dir / 'train_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+
+    if args.dn_track:
+        (args.output_dir / 'eval_outputs' / 'dn_track').mkdir(exist_ok=True)
+        (args.output_dir / 'train_outputs' / 'dn_track').mkdir(exist_ok=True)     
+
+    if args.dn_object:
+        (args.output_dir / 'eval_outputs' / 'dn_object').mkdir(exist_ok=True)
+        (args.output_dir / 'train_outputs' / 'dn_object').mkdir(exist_ok=True)   
+
+    if args.dn_enc:
+        (args.output_dir / 'eval_outputs' / 'dn_enc').mkdir(exist_ok=True)
+        (args.output_dir / 'train_outputs' / 'dn_enc').mkdir(exist_ok=True) 
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))

@@ -147,7 +147,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
     metrics_dict = {}
 
     for i,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
-    
         samples = cur_samples
         targets = cur_targets
 
@@ -208,8 +207,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
+                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
+                    continue
+                assert (loss_dict_key + '_' + training_method) in weight_dict.keys()
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
-                weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
+                # weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key]
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
@@ -333,12 +335,14 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
+                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
+                    continue
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
-                weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
+                # weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
-        weight_dict['loss'] = 1
+        # weight_dict['loss'] = 1
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
@@ -354,7 +358,7 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
 @torch.no_grad()
 class pipeline():
-    def __init__(self,model, fps, device, output_dir, args):
+    def __init__(self,model, fps, device, output_dir, args, track=True):
         self.model = model
         self.model.tracking()
 
@@ -373,13 +377,15 @@ class pipeline():
         self.use_dab = args.use_dab
 
         self.write_video = True
-        self.track = True
+        self.track = track
 
         if self.track:
             self.colors = np.array([tuple((255*np.random.random(3))) for _ in range(1000)]) # Assume max 1000 cells in one chamber
         else:
             self.colors = np.array([tuple((np.zeros(3))) for _ in range(1000)])
 
+        if args.two_stage:
+            (self.output_dir / 'predictions' / 'enc_outputs').mkdir(exist_ok=True)
 
         self.display_masks = False
         self.oq_div = True # Can object queries detect divisions
@@ -418,7 +424,7 @@ class pipeline():
         self.color_stack = np.zeros((max_len,self.target_size[0],self.target_size[1]*len(self.videoname_list),3))
 
     def update_query_box_locations(self,pred_boxes,keep,keep_div):
-        
+        # This is only used to display to reference points for object queries that are detected
         # Get x,y location of all detected object queries 
         all_oq_boxes = pred_boxes[-self.num_queries:].cpu().numpy()
         oq_boxes = all_oq_boxes[keep[-self.num_queries:],:4]
@@ -466,7 +472,7 @@ class pipeline():
                 self.div_indices = self.div_indices[self.div_indices != div_ind ]
 
     def update_div_boxes(self,boxes,masks=None):
-        # boxes were div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
+        # boxes where div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
         self.unique_divs = np.unique(self.div_track[self.div_track != -1])
         for unique_div in self.unique_divs:
             div_ids = (self.div_track == unique_div).nonzero()[0]
@@ -494,15 +500,15 @@ class pipeline():
             for i, fp in enumerate(tqdm(fps_ROI)):
 
                 img = PIL.Image.open(fp,mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB')
-                previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None
+                previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for easy analysis
 
                 samples = self.normalize(img)[0][None]
                 samples = samples.to(self.device)
 
-                if not self.track: # should we remove previmg as well for object detection ?
+                if not self.track: # should we set prev_features as None for object detection? --> this means it can't see the previous image features
                     targets = [{}]
                     self.max_cellnb = 0
-                    previmg = None
+                    prev_features = None
 
                 outputs, targets, prev_features, memory, hs, prev_outputs = self.model(samples,targets=targets,prev_features=prev_features)
 
@@ -578,8 +584,35 @@ class pipeline():
                 self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = color_frame         
 
 
-
                 if self.display_decoder_aux and i in random_nbs:
+
+                    if 'enc_outputs' in outputs:
+                        enc_frame = np.array(img).copy()
+                        enc_outputs = outputs['enc_outputs']
+                        enc_pred_logits = enc_outputs['pred_logits']
+                        enc_pred_boxes = enc_outputs['pred_boxes']
+
+                        logits_topk, ind_topk = torch.topk(enc_pred_logits[0,:,0].sigmoid(),self.num_queries)
+                        boxes_topk = enc_pred_boxes[0,ind_topk]
+
+                        t0,t1,t2,t3 = 0.1,0.3,0.5,0.8
+                        boxes_list = []
+                        boxes_list.append(boxes_topk[logits_topk < t0])
+                        boxes_list.append(boxes_topk[(logits_topk > t0) * (logits_topk < t1)])
+                        boxes_list.append(boxes_topk[(logits_topk > t1) * (logits_topk < t2)])
+                        boxes_list.append(boxes_topk[(logits_topk > t2) * (logits_topk < t3)])
+                        boxes_list.append(boxes_topk[logits_topk > t3])
+
+                        enc_frames = []
+                        for boxes in boxes_list:
+                            enc_frame = np.array(img).copy()
+                            enc_frames.append(utils.plot_tracking_results(enc_frame,boxes,None,self.colors,None,None,None,self.track))
+                        
+                        enc_frames = np.concatenate((enc_frames),axis=1)
+
+                        cv2.imwrite(str(self.output_dir / 'predictions' / 'enc_outputs' / (f'encoder_frame_{fp.name}')),enc_frames)
+
+
                     references = outputs['references'].detach()
 
                     aux_outputs = outputs['aux_outputs'] # output from first 5 layers of decoder
@@ -591,6 +624,7 @@ class pipeline():
                     colors = self.colors[self.cells-1] if self.track else self.colors[:len(self.cells)] 
 
                     cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells) if c not in self.cells]) if prevcells is not None else None
+
                     if self.track:
                         previmg_copy = previmg.copy()
                     for a,aux_output in enumerate(aux_outputs):
@@ -610,12 +644,13 @@ class pipeline():
                                 new_cells = self.new_cells if self.track else None
 
                             else:
-                                track_boxes = all_boxes[np.unique(self.track_indices)]
+                                track_boxes = all_boxes[np.unique(self.track_indices[self.track_indices < len(keep) - self.num_queries])]
                                 box_colors = self.colors[prevcells-1] if prevcells is not None else colors
                                 div_track = np.ones((track_boxes.shape[0])) * -1
                                 new_cells = None
 
                                 if self.track:
+                                    assert track_boxes.shape[0] <= box_colors.shape[0]
                                     previmg_anchor_boxes = utils.plot_tracking_results(previmg_copy,track_boxes,None,box_colors,prevcells,div_track,new_cells,self.track)
 
                             if a == 0 and not self.use_dab: # if x,y reference points are used
@@ -645,13 +680,19 @@ class pipeline():
                                 colors_prev = colors_prev[None] if colors_prev.ndim == 1 else colors_prev
                                 
                                 all_colors = np.concatenate((color_queries,colors_prev,colors),axis=0)
-                                div_track_all = np.ones((all_boxes.shape[0] + len(self.div_indices))) * -1 # all boxes does not contain div boxes separated
+                                # div_track_all = np.ones((all_boxes.shape[0] + len(self.div_indices))) * -1 # all boxes does not contain div boxes separated
+                                div_track_all = np.ones((boxes.shape[0])) * -1 # all boxes does not contain div boxes separated
                                 div_track_all[-len(track_boxes):] = self.div_track
+
+                                # print(f'boxes: {len(boxes)}\nall_boxes: {len(all_boxes)}\ntrack_boxes: {len(track_boxes)}\nboxes_exit: {len(boxes_exit)}\ndiv_indices: {len(self.div_indices)}\n{self.div_indices}')
+                                assert len(div_track_all) == len(boxes)
 
                             else: # all cells / track queries stayed in the chamber
                                 boxes = torch.cat((all_boxes[-self.num_queries:,:4],track_boxes))
                                 all_colors = np.concatenate((color_queries,colors),axis=0)
                                 div_track_all = np.concatenate((np.ones((self.num_queries))*-1,self.div_track))
+
+                                assert len(div_track_all) == len(boxes)
 
                             new_cell_thickness = np.zeros_like(div_track_all).astype(bool)
                             new_cell_thickness[self.num_queries:] = True # set all track queries with a thickened boudning box so it's easier to see
@@ -797,22 +838,32 @@ class pipeline():
 
 
 @torch.no_grad()
-def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, output_dir, args):
+def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, output_dir, args, track=True):
     model.eval()
     model._tracking = True
     criterion.eval()
 
-    save_folder = 'save_worst_predictions'
+    if track:
+        save_folder = 'save_worst_predictions_track'
+        tm_threshold = 0
+    else:
+        save_folder = 'save_worst_predcitions_object_det'
+        tm_threshold = 1
+
     (output_dir / save_folder).mkdir(exist_ok=True)
     (output_dir / save_folder / 'train_outputs').mkdir(exist_ok=True)
     (output_dir / save_folder / 'eval_outputs').mkdir(exist_ok=True)
 
+    (output_dir / save_folder / 'train_outputs' / 'standard').mkdir(exist_ok=True)
+    (output_dir / save_folder / 'eval_outputs' / 'standard').mkdir(exist_ok=True)
+
+    (output_dir / save_folder / 'train_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+    (output_dir / save_folder / 'eval_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+
+
     for didx, data_loaders in enumerate([data_loaders_train,data_loaders_val]):
         store_loss = torch.zeros((len(data_loaders[0])))
         for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in tqdm(enumerate(zip(*data_loaders))):
-            
-            # if idx not in [844]:
-            #     continue
 
             samples = cur_samples
             targets = cur_targets
@@ -849,7 +900,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0)
+            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
             targets = update_early_or_late_track_divisions(targets,outputs)
 
@@ -900,7 +951,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=0)
+            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
             targets = update_early_or_late_track_divisions(targets,outputs)
 

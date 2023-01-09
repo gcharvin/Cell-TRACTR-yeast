@@ -13,12 +13,12 @@ from ..util import box_ops
 from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
                          interpolate, is_dist_avail_and_initialized,
                          nested_tensor_from_tensor_list, sigmoid_focal_loss,threshold_indices,
-                         calc_bbox_acc, calc_track_acc,combine_div_boxes,calc_iou,divide_box)
+                         calc_bbox_acc, calc_track_acc,combine_div_boxes,calc_iou,divide_box,calc_object_query_FP)
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection. """
 
-    def __init__(self, backbone, transformer, num_classes, num_queries, device,
+    def __init__(self, backbone, transformer, num_classes, num_queries, device, two_stage=False,
                  aux_loss=False, overflow_boxes=False):
         """ Initializes the model.
         Parameters:
@@ -37,6 +37,9 @@ class DETR(nn.Module):
         self.overflow_boxes = overflow_boxes
         self.class_embed = nn.Linear(self.hidden_dim, num_classes + 2)
         self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 8, 3)
+        if two_stage:
+            self.enc_class_embed = nn.Linear(self.hidden_dim, num_classes + 1)
+            self.enc_bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
 
         # match interface with deformable DETR
@@ -250,7 +253,8 @@ class SetCriterion(nn.Module):
 
                 if len(track_ind) > 0: 
                     weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
-        
+        else:
+            weights[:,:,1] = 0
 
         loss_ce = sigmoid_focal_loss(
             src_logits, target_classes_onehot, num_boxes, weights,
@@ -471,7 +475,7 @@ class SetCriterion(nn.Module):
 
                         combined_box = combine_div_boxes(sep_box,prev_box)
 
-                        unused_object_query_indices = torch.tensor([ind_out_box_1,ind_out_box_2] + [oq_id for oq_id in torch.arange(N-self.args.num_queries,N) if (oq_id not in ind_out_clone and outputs['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
+                        unused_object_query_indices = torch.tensor([ind_out_box_1,ind_out_box_2] + [oq_id for oq_id in torch.arange(N-len(target['track_queries_mask']),N) if (oq_id not in ind_out_clone and outputs['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
             
                         unused_pred_boxes = outputs['pred_boxes'][i,unused_object_query_indices].detach() 
 
@@ -532,13 +536,12 @@ class SetCriterion(nn.Module):
             
             if test_early_div: # quick check to see if any cells divided in the future frame
                 
-
                 pred_boxes = outputs['pred_boxes'].detach()
                 ind_tgt_clone = ind_tgt.clone()
                 ind_out_clone = ind_out.clone()
                 boxes = target['boxes'].clone()
                 for idx in range(len(ind_tgt)):
-                    if (~target['track_queries_mask'])[ind_out_clone[idx]] and target['object_detection_div_mask'][ind_tgt_clone[idx]] == 0.: # check that we are looking at non tracked cells
+                    if (~target['track_queries_mask'])[ind_out_clone[idx]] and target['object_detection_div_mask'][ind_tgt_clone[idx]] == 0.: # check that we are looking at non-tracked cells
 
                         box = boxes[ind_tgt_clone[idx]]
 
@@ -557,7 +560,7 @@ class SetCriterion(nn.Module):
 
                             div_box = divide_box(box,fut_box)
 
-                            unused_object_query_indices = torch.tensor([ind_out[idx]] + [oq_id for oq_id in torch.arange(N-self.args.num_queries,N) if (oq_id not in ind_out and outputs['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
+                            unused_object_query_indices = torch.tensor([ind_out[idx]] + [oq_id for oq_id in torch.arange(N-len(target['track_queries_mask']),N) if (oq_id not in ind_out and outputs['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
                 
                             if len(unused_object_query_indices) > 1:
 
@@ -622,11 +625,14 @@ class SetCriterion(nn.Module):
             metrics['no_tracking_object_det_acc'] = bbox_det_only_acc
             metrics['untracked_object_det_acc'] = bbox_FN_acc
             track_acc, div_acc, track_post_div_acc, cells_leaving_acc, rand_FP_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['overall_track_acc'] = track_acc
+            metrics['track_queries_only_track_acc'] = track_acc
             metrics['divisions_track_acc'] = div_acc
             metrics['post_division_track_acc'] = track_post_div_acc
             metrics['cells_leaving_track_acc'] = cells_leaving_acc
             metrics['rand_FP_track_acc'] = rand_FP_acc
+            object_query_FP_track_acc = calc_object_query_FP(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+            metrics['object_query_FP_track_acc'] = object_query_FP_track_acc
+            metrics['overall_track_acc'] = track_acc + object_query_FP_track_acc
 
         # Compute all the requested losses
         losses = {}

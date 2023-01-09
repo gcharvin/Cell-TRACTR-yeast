@@ -27,8 +27,8 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '221224_div_ref_pts__dab_no_mask'
-
+    modelname = '230105_all_tokens_no_prev_memory_2_two_stage_dn_track_dab_no_mask'
+    
     args.dn_track = False
     args.dn_object = False
     args.group_object = False
@@ -40,9 +40,13 @@ def train(args: Namespace) -> None:
     
     datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/predictions/2022-04-24_TrainingSet8/img')
     fps = sorted(list((datapath).glob('*.png')))
+    
+    args.batch_size = 1
+    args.init_enc_queries_embeddings = False
 
-    display_worst = False
-    run_movie = True
+    display_worst = True
+    run_movie = False
+    track= True
 
     print(args)
 
@@ -166,12 +170,13 @@ def train(args: Namespace) -> None:
 
     if run_movie:
         model.evaluate_dataset_with_no_data_aug = False
-        Pipeline = pipeline(model, fps, device, output_dir, args)
+        Pipeline = pipeline(model, fps, device, output_dir, args, track)
         Pipeline.forward()
     
     if display_worst:
 
         model.evaluate_dataset_with_no_data_aug = True
+        args.evaluate_dataset_with_no_data_aug = True
 
         datasets_train = build_dataset(split='train', args=args)
         datasets_val = build_dataset(split='val', args=args)
@@ -204,7 +209,7 @@ def train(args: Namespace) -> None:
             data_loaders_train.append(data_loader_train)
             data_loaders_val.append(data_loader_val)
 
-        print_worst(model,criterion,data_loaders_train,data_loaders_val,device,output_dir,args)
+        print_worst(model,criterion,data_loaders_train,data_loaders_val,device,output_dir,args,track)
 
 
 

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..util import box_ops
-from ..util.misc import NestedTensor, inverse_sigmoid, nested_tensor_from_tensor_list
+from ..util.misc import NestedTensor, inverse_sigmoid, nested_tensor_from_tensor_list,add_noise_to_boxes
 from .detr import DETR, PostProcess, SetCriterion
 
 
@@ -47,7 +47,7 @@ class DeformableDETR(DETR):
             two_stage: two-stage Deformable DETR
         """
         
-        super().__init__(backbone, transformer, num_classes, num_queries, device, aux_loss)
+        super().__init__(backbone, transformer, num_classes, num_queries, device, two_stage, aux_loss)
         self.merge_frame_features = merge_frame_features
         self.multi_frame_attention = multi_frame_attention
         self.multi_frame_encoding = multi_frame_encoding
@@ -126,8 +126,6 @@ class DeformableDETR(DETR):
 
         # if two-stage, the last class_embed and bbox_embed is for region proposal generation
         num_pred = transformer.decoder.num_layers
-        if two_stage:
-            num_pred += 1
 
         if use_div_ref_pts:
             self.transformer.decoder.use_div_ref_pts = True
@@ -145,31 +143,26 @@ class DeformableDETR(DETR):
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
             self.transformer.decoder.class_embed = None
+
         if two_stage:
-            raise NotImplementedError
-            # hack implementation for two-stage
-            self.transformer.decoder.class_embed = self.class_embed
-            for box_embed in self.bbox_embed:
-                nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+            self.enc_class_embed.bias.data = torch.ones_like(self.enc_class_embed.bias) * bias_value
+            nn.init.constant_(self.enc_bbox_embed.layers[-1].weight.data, 0)
+            nn.init.constant_(self.enc_bbox_embed.layers[-1].bias.data, 0)
+
+            self.transformer.enc_out_class_embed = self.enc_class_embed
+            self.transformer.enc_out_bbox_embed = self.enc_bbox_embed
+
 
         if self.merge_frame_features:
             self.merge_features = nn.Conv2d(self.hidden_dim * 2, self.hidden_dim, kernel_size=1)
             self.merge_features = _get_clones(self.merge_features, num_feature_levels)
-
-    def add_noise_to_boxes(self,boxes,l_1,l_2,clamp=True):
-        noise = torch.rand_like(boxes) * 2 - 1
-        boxes[..., :2] += boxes[..., 2:] * noise[..., :2] * l_1
-        boxes[..., 2:] *= 1 + l_2 * noise[..., 2:]
-        if clamp:
-            boxes = torch.clamp(boxes,0,1)
-        return boxes
     
     # def fpn_channels(self):
     #     """ Returns FPN channels. """
     #     num_backbone_outs = len(self.backbone.strides)
     #     return [self.hidden_dim, ] * num_backbone_outs
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False):
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False, dn_enc=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -253,34 +246,38 @@ class DeformableDETR(DETR):
         training_methods = []
         #### DAB-DETR
         query_attn_mask = None 
-        if self.two_stage:
-            assert NotImplementedError
-            query_embeds = None
-        elif self.use_dab:
-            tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)      # nq, 256
-            if self.refine_object_queries:
-                tgt_embed += self.object_embedding.weight
-            refanchor = self.refpoint_embed.weight.repeat(bs,1,1)      # nq, 4
-            query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
 
+        if self.use_dab:
+            if self.two_stage:
+                query_embeds = None
+            else:
+                tgt_embed = self.tgt_embed.weight.repeat(bs,1,1)      # nq, 256
+                if self.refine_object_queries:
+                    tgt_embed += self.object_embedding.weight
+                refanchor = self.refpoint_embed.weight.repeat(bs,1,1)      # nq, 4
+                query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
+
+            num_queries = self.num_queries
             #### Group-DETR
             if group_object:
+                raise NotImplementedError
+                num_queries += self.num_queries
                 query_embeds = query_embeds.repeat(1,2,1)
                 training_methods.append('group_object')
 
+            # Initialize the attn_mask
             if targets is not None and 'track_query_hs_embeds' in targets[0]:
                 num_track_queries = targets[0]['track_query_hs_embeds'].shape[0]
             else: 
                 num_track_queries = 0
 
-            num_total_queries = query_embeds.shape[1] + num_track_queries 
-
-            query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)
+            num_total_queries = num_queries + num_track_queries 
+            query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(self.device)
 
             #### Group-DETR
             if group_object:
-                # query_attn_mask[num_track_queries:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True
-                query_attn_mask[:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True # HAve not accessed the impact of this error
+                raise NotImplementedError
+                query_attn_mask[:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True # Have not accessed the impact of this error
                 query_attn_mask[num_total_queries - self.num_queries:,:num_total_queries - self.num_queries] = True
 
             #### DN-DETR for noised object detection
@@ -308,8 +305,7 @@ class DeformableDETR(DETR):
                 num_boxes = torch.tensor([target['dn_object']['boxes'].shape[0] for target in targets]).long()
                 num_FPs = max(num_boxes) - num_boxes
 
-                query_embed_dn_track = torch.zeros((bs,max(num_boxes),query_embeds.shape[-1])).to(self.device)
-                batch_boxes = torch.zeros((bs,max(num_boxes),4)).to(self.device)
+                query_embed_dn_object = torch.zeros((bs,max(num_boxes),query_embeds.shape[-1])).to(self.device)
 
                 for t,target in enumerate(targets):
 
@@ -326,20 +322,21 @@ class DeformableDETR(DETR):
                     l_1 = self.dn_object_l1
                     l_2 = self.dn_object_l2
 
-                    boxes = self.add_noise_to_boxes(boxes,l_1,l_2)
+                    boxes = add_noise_to_boxes(boxes,l_1,l_2)
                     target['dn_object']['track_queries_fal_pos_mask'] = torch.zeros((boxes.shape[0] + num_FPs[t])).bool().to(self.device)
 
                     if num_FPs[t] > 0:
                         random_FP_mask = torch.randperm(num_FPs[t])
                         FP_boxes = target['dn_object']['boxes'][random_FP_mask,:4].clone()
-                        FP_boxes = self.add_noise_to_boxes(FP_boxes,l_1*3,l_2*3)
+                        FP_boxes = add_noise_to_boxes(FP_boxes,l_1*3,l_2*3)
                         boxes = torch.cat((boxes, FP_boxes),axis=0)
                         # No tracking is done here; just a formality so it works in the matcher.py code; but there are FPs as in empty tracking boxes
                         target['dn_object']['track_queries_fal_pos_mask'][-num_FPs[t]:] = True
 
                         labels = torch.cat((labels,torch.ones((num_FPs[t])).long().to(self.device)))
 
-                    if self.dn_label > 0:
+                    # denoised label not implemented because we only have one class so this doesn't make much sense
+                    if False and self.dn_label > 0:
                         random_labels_mask = torch.randperm(labels.shape[0])[:torch.ceil(torch.tensor(labels.shape[0] * self.dn_label)).long()]
                         labels[random_labels_mask] = 1 - labels[random_labels_mask]
 
@@ -349,14 +346,15 @@ class DeformableDETR(DETR):
                     target['dn_object']['noised_boxes'] = boxes
 
                     label_embedding = self.label_enc(labels)
-                    query_embed_dn_track[t,:,:self.hidden_dim] = label_embedding
-                    query_embed_dn_track[t,:,self.hidden_dim:] = boxes      
+                    query_embed_dn_object[t,:,:self.hidden_dim] = label_embedding
+                    query_embed_dn_object[t,:,self.hidden_dim:] = boxes      
 
-                    batch_boxes[t] = boxes
+                if self.two_stage:
+                    query_embeds = query_embed_dn_object
+                else:
+                    query_embeds = torch.cat((query_embeds,query_embed_dn_object),axis=1)
 
-                query_embeds = torch.cat((query_embeds,query_embed_dn_track),axis=1)
-
-                num_dn_object_queries = query_embed_dn_track.shape[1]
+                num_dn_object_queries = query_embed_dn_object.shape[1]
                 num_total_queries += num_dn_object_queries
                 new_query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)    
                 new_query_attn_mask[:-num_dn_object_queries,:-num_dn_object_queries] = query_attn_mask
@@ -364,22 +362,20 @@ class DeformableDETR(DETR):
                 new_query_attn_mask[:-num_dn_object_queries,-num_dn_object_queries:] = True
                 query_attn_mask = new_query_attn_mask
 
-            if targets is not None and  'dn_track' in targets[0]:
-                training_methods.append('dn_track')
-
 
         else:
-            query_embeds = self.query_embed.weight
+            if self.two_stage:
+                raise NotImplementedError
+            else:
+                query_embeds = self.query_embed.weight
             
             #### Group-DETR
             if group_object:
                 query_embeds.repeat(2,1)
 
-        #### DAB-DETR
 
-
-        hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
-            self.transformer(src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask)
+        hs, memory, init_reference, inter_references, class_enc, ref_enc, training_methods = \
+            self.transformer(src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask, dn_enc, training_methods)
 
         save_references = torch.cat((init_reference[None],inter_references[...,:init_reference.shape[-1]]),axis=0)
 
@@ -419,9 +415,8 @@ class DeformableDETR(DETR):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
-        if self.two_stage:
-            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
-            out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+        if class_enc is not None:
+            out['enc_outputs'] = {'pred_logits': class_enc, 'pred_boxes': ref_enc}
 
         offset = 0
         memory_slices = []

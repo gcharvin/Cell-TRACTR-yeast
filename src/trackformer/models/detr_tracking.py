@@ -22,6 +22,7 @@ class DETRTrackingBase(nn.Module):
                  dn_track_l1 = 0,
                  dn_track_l2 = 0,
                  dn_object = False,
+                 dn_enc=False,
                  refine_div_track_queries = False,
                  evaluate_dataset_with_no_data_aug=False,):
 
@@ -33,6 +34,7 @@ class DETRTrackingBase(nn.Module):
         self.dn_track_l1 = dn_track_l1
         self.dn_track_l2 = dn_track_l2
         self.dn_object = dn_object
+        self.dn_enc = dn_enc
         self.refine_div_track_queries = refine_div_track_queries
         self.evaluate_dataset_with_no_data_aug = evaluate_dataset_with_no_data_aug
 
@@ -231,7 +233,9 @@ class DETRTrackingBase(nn.Module):
         for i, (target, prev_ind) in enumerate(zip(targets, prev_indices)):
             prev_out_ind, prev_target_ind = prev_ind
 
-            if prev_prev_track or keep_all_track or self.evaluate_dataset_with_no_data_aug:
+            if self.evaluate_dataset_with_no_data_aug:
+                random_subset_mask = torch.arange(len(prev_target_ind))
+            elif prev_prev_track or keep_all_track:
                 random_subset_mask = torch.randperm(len(prev_target_ind))
             elif rand_num > 0.3:  #max number to be tracked since 
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)]
@@ -546,7 +550,7 @@ class DETRTrackingBase(nn.Module):
                             prev_pred_boxes = prev_out['pred_boxes'][i].detach()
 
                             # we are cehcking to see if the model predicts a single cell instead of two cells (pre-req - must have just divided)
-                            for idx in range(len(prev_ind_tgt_clone)):
+                            for idx in range(len(prev_ind_tgt_clone)): # go through all gt boxes
 
                                 prev_ind_tgt_box_1 = prev_ind_tgt_clone[idx]
 
@@ -709,7 +713,7 @@ class DETRTrackingBase(nn.Module):
                                     div_box = utils.divide_box(prev_box,cur_tgt_box)
 
                                     assert N == self.num_queries
-                                    unused_object_query_indices = torch.tensor([prev_ind_out_box] + [oq_id for oq_id in torch.arange(self.num_queries) if (oq_id not in prev_ind_out and prev_out['pred_logits'][i,oq_id,0].detach() > 0.5)])
+                                    unused_object_query_indices = torch.tensor([prev_ind_out_box] + [oq_id for oq_id in torch.arange(self.num_queries) if (oq_id not in prev_ind_out and prev_out['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
                         
                                     if len(unused_object_query_indices) > 1:
 
@@ -786,10 +790,26 @@ class DETRTrackingBase(nn.Module):
                     target['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
 
                     
-
                     assert (target['boxes'][:,-1] == 0).all()
 
-        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object, dn_object=self.dn_object)
+        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object, dn_object=self.dn_object, dn_enc=self.dn_enc)
+
+        if self.dn_enc and 'dn_enc' in targets[0]:
+
+            for target in targets:     
+                count = 0
+                store_div_ind = []
+                for b in range(len(target['dn_enc']['boxes'])):
+                    if target['dn_enc']['boxes'][b + count,-1] > 0:
+                        self.update_target(target['dn_enc'],b+count)
+                        store_div_ind.append(torch.tensor([b+count,b+count+1]))
+                        count += 1
+
+                target['dn_enc']['object_detection_div_mask'] = torch.zeros(target['dn_enc']['boxes'].shape[0]).to(self.device)
+
+                if len(store_div_ind) > 0:
+                    for s,ind in enumerate(store_div_ind):
+                        target['dn_enc']['object_detection_div_mask'][ind] = s + 1
 
         return out, targets, features, memory, hs, prev_out
 

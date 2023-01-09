@@ -14,7 +14,7 @@ from torch import nn
 from torch.nn.init import constant_, normal_, xavier_uniform_
 import torch.nn.functional as F
 
-from ..util.misc import inverse_sigmoid
+from ..util.misc import inverse_sigmoid,add_noise_to_boxes
 from .ops.modules import MSDeformAttn
 from .transformer import _get_clones, _get_activation_fn
 
@@ -24,13 +24,16 @@ class DeformableTransformer(nn.Module):
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024,
                  dropout=0.1, activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
-                 two_stage=False, num_queries=30,
+                 two_stage=False, num_queries=30, batch_size = 2,
                  use_dab=False, high_dim_query_update=False, no_sine_embed=False,
                  multi_frame_attention_separate_encoder=False, 
-                 refine_track_queries=False, refine_div_track_queries=False):
+                 refine_track_queries=False, refine_div_track_queries=False,
+                 init_enc_queries_embeddings=False,
+                 dn_enc_l1=0, dn_enc_l2=0):
         super().__init__()
 
         self.d_model = d_model
+        self.batch_size = batch_size
         self.nhead = nhead
         self.two_stage = two_stage
         self.num_queries = num_queries
@@ -40,16 +43,24 @@ class DeformableTransformer(nn.Module):
 
         self.refine_track_queries = refine_track_queries
         self.refine_div_track_queries = refine_div_track_queries
+        self.init_enc_queries_embeddings = init_enc_queries_embeddings
 
         if self.refine_track_queries:
-            self.track_embedding = nn.Embedding(1,self.hidden_dim)
+            self.track_embedding = nn.Embedding(1,self.d_model)
 
         if self.refine_div_track_queries:
-            self.div_track_embedding = nn.Embedding(2,self.hidden_dim)
+            self.div_track_embedding = nn.Embedding(2,self.d_model)
+
+        if self.init_enc_queries_embeddings:
+            self.enc_query_embeddings = nn.Embedding(1,self.d_model)
+
+        self.dn_enc_l1 = dn_enc_l1
+        self.dn_enc_l2 = dn_enc_l2
 
         enc_num_feature_levels = num_feature_levels
         if multi_frame_attention_separate_encoder:
             enc_num_feature_levels = enc_num_feature_levels // 2
+
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           enc_num_feature_levels, nhead, enc_n_points)
@@ -112,7 +123,7 @@ class DeformableTransformer(nn.Module):
 
     def gen_encoder_output_proposals(self, memory, memory_padding_mask, spatial_shapes):
         N_, S_, C_ = memory.shape
-        base_scale = 4.0
+        # base_scale = 4.0
         proposals = []
         _cur = 0
         for lvl, (H_, W_) in enumerate(spatial_shapes):
@@ -151,7 +162,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None, dn_enc=False,training_methods=[]):
         assert self.two_stage or query_embed is not None
         if not self.two_stage:
             assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
@@ -207,27 +218,97 @@ class DeformableTransformer(nn.Module):
         bs, _, c = memory.shape
 
         if self.two_stage:
-            output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
+            output_memory, output_proposals = self.gen_encoder_output_proposals(memory[:,:memory.shape[1]//2], mask_flatten[:,:mask_flatten.shape[1]//2], spatial_shapes[:spatial_shapes.shape[0]//2])
 
             # hack implementation for two-stage Deformable DETR
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
-            enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory)[...,:output_proposals.shape[-1]] + output_proposals
+            enc_outputs_class = self.enc_out_class_embed(output_memory)
+            enc_outputs_coord_unact = self.enc_out_bbox_embed(output_memory)[...,:output_proposals.shape[-1]] + output_proposals
 
             assert self.num_queries <= enc_outputs_class.shape[1]
             topk = self.num_queries
             # topk = min(self.two_stage_num_proposals,enc_outputs_class.shape[1])
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
-            topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
-            topk_coords_unact = topk_coords_unact.detach()
-            reference_points = topk_coords_unact.sigmoid()
+            topk_coords_undetach = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+            topk_coords_detach = topk_coords_undetach.detach()
+            reference_points = topk_coords_detach.sigmoid()
             init_reference_out = reference_points
 
-            if self.use_dab:
-                tgt = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-                query_embed = None
-            else:
-                pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-                query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+            if True:
+                if self.init_enc_queries_embeddings:
+                    tgt = self.enc_query_embeddings.weight.repeat(self.batch_size,self.num_queries,1)
+                else:
+                    # gather tgt
+                    tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
+                    tgt = tgt_undetach.detach()
+
+                if query_embed is not None: # used for dn_object or if you want to add extra object queries on top of two_stage
+                    reference_points = torch.cat((reference_points,query_embed[..., self.d_model:].sigmoid()),axis=1)
+                    tgt = torch.cat((tgt,query_embed[..., :self.d_model]),axis=1)
+                    query_embed = None
+
+                if dn_enc:
+                    enc_thresh = 0.2
+                    topk_cls_undetach = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
+                    keep_enc_boxes = topk_cls_undetach[:,:,0].sigmoid() > enc_thresh
+                    max_boxes = max([target['boxes'].shape[0] for target in targets])
+                    total_boxes = sum([target['boxes'].shape[0] for target in targets])
+                    if keep_enc_boxes.sum() > total_boxes - 2: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 
+                        max_enc_boxes = max_boxes * 2
+                        topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], max_enc_boxes, dim=1)[1]
+
+                        tgt_enc = torch.gather(tgt,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,self.d_model))
+                        tgt = torch.cat((tgt,tgt_enc),axis=1)
+
+                        assert max_enc_boxes == tgt_enc.shape[1]
+                        assert tgt_enc.shape[1] >= max_boxes
+
+                        reference_points_enc = torch.gather(reference_points,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4))
+
+                        # denoise enc boxes
+                        l_1 = self.dn_enc_l1
+                        l_2 = self.dn_enc_l2
+                        reference_points_enc_noised = add_noise_to_boxes(reference_points_enc.clone(),l_1,l_2)
+
+                        reference_points = torch.cat((reference_points,reference_points_enc_noised),axis=1)
+
+                        if query_attn_mask is not None:
+                            new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1])).bool().to(tgt.device)
+                            new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
+                            query_attn_mask = new_query_attn_mask                          
+                        else:
+                            query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1])).bool().to(self.device)
+
+                        query_attn_mask[-max_enc_boxes:,:-max_enc_boxes] = True
+                        query_attn_mask[:-max_enc_boxes,-max_enc_boxes:] = True
+
+                        for t,target in enumerate(targets):
+                            target['dn_enc'] = {}
+                            target['dn_enc']['boxes'] = target['boxes'].clone()
+                            target['dn_enc']['enc_boxes_noised'] = reference_points_enc_noised[t]
+                            target['dn_enc']['enc_boxes'] = reference_points_enc[t]
+                            target['dn_enc']['enc_logits'] = topk_cls_undetach[:,:,0].sigmoid()[t]
+                            target['dn_enc']['labels'] = target['labels'].clone()
+                            target['dn_enc']['track_ids'] = target['track_ids'].clone()
+                            target['dn_enc']['prev_target'] = target['prev_target'].copy()
+                            target['dn_enc']['fut_target'] = target['fut_target'].copy()
+                            target['dn_enc']['fut_prev_target'] = target['fut_prev_target'].copy()
+                            target['dn_enc']['empty'] = target['empty']
+                            target['dn_enc']['track_queries_mask'] = torch.zeros((reference_points_enc.shape[1])).bool().to(tgt.device)
+                            target['dn_enc']['num_queries'] = reference_points_enc.shape[1]
+
+                        training_methods.append('dn_enc')
+
+
+            else: # This was the old way of getting the tgt embedding; I've updated to what DINO has done 
+                if self.use_dab:
+                    tgt = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_detach)))
+                if query_embed is not None:
+                    reference_points = torch.cat((reference_points,query_embed[..., self.d_model:].sigmoid()),axis=1)
+                    tgt = torch.cat((tgt,query_embed[..., :self.d_model]),axis=1)
+                    query_embed = None                
+                else:
+                    pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_detach)))
+                    query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
 
         elif self.use_dab:
             reference_points = query_embed[..., self.d_model:].sigmoid() 
@@ -266,6 +347,7 @@ class DeformableTransformer(nn.Module):
                 targets_dn_track = [target['dn_track'] for target in targets]
 
                 num_dn_track = targets_dn_track[0]['boxes'].shape[0]
+                assert num_dn_track > 0
 
                 prev_hs_embed_dn_track = [t['track_query_hs_embeds'] for t in targets_dn_track]
                 prev_boxes_dn_track = torch.stack([t['track_query_boxes'] for t in targets_dn_track])
@@ -307,6 +389,8 @@ class DeformableTransformer(nn.Module):
 
                 query_attn_mask = new_query_attn_mask
 
+                training_methods.append('dn_track')
+
         init_reference_out = reference_points
 
 
@@ -320,9 +404,16 @@ class DeformableTransformer(nn.Module):
         inter_references_out = inter_references
 
         if self.two_stage:
-            return (hs, memory, init_reference_out, inter_references_out,
-                    enc_outputs_class, enc_outputs_coord_unact)
-        return hs, memory, init_reference_out, inter_references_out, None, None
+            if False: # This uses just the topK proposals for the matcher; useful to reduce computational resources
+                class_enc = self.enc_out_class_embed(tgt_undetach)
+                ref_enc = topk_coords_undetach.sigmoid()
+            else:
+                class_enc = torch.cat((enc_outputs_class,torch.zeros_like(enc_outputs_class)),axis=-1)  # I use weight map to discard the second prediction
+                ref_enc = enc_outputs_coord_unact.sigmoid()
+        else:
+            class_enc = ref_enc = None
+
+        return hs, memory, init_reference_out, inter_references_out, class_enc, ref_enc, training_methods
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -566,8 +657,12 @@ def build_deforamble_transformer(args):
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
         num_queries=args.num_queries,
+        batch_size=args.batch_size,
         use_dab=args.use_dab,
         multi_frame_attention_separate_encoder=args.multi_frame_attention and args.multi_frame_attention_separate_encoder,
+        init_enc_queries_embeddings=args.init_enc_queries_embeddings,
+        dn_enc_l1=args.dn_enc_l1,
+        dn_enc_l2=args.dn_enc_l2
         )
 
 class MLP(nn.Module):
