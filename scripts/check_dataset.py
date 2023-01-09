@@ -3,48 +3,43 @@ import re
 import math
 import cv2
 from tqdm import tqdm
+import numpy as np
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells/raw_data_ordered')
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells')
-
-folders = ['train','val']
-remove = False
+trainingsets = ['train','val']
+remove = True
 target_size = (256,32)
 
-fps = sorted(list((datapath / 'combined').glob('*.png')))
+subfolders = [['prev_cur','prev'],['cur','fut_prev']]
 
-for f,fp in enumerate(tqdm(fps)):
+for trainingset in trainingsets:
+    for subfolder in subfolders:
 
-    if '_cur' in fp.name:
-        assert (fp.parent / (fp.stem.replace('_cur','_prev') + '.png')).exists()
-        continue
-    elif '_prev' in fp.name:
-        assert (fp.parent / (fp.stem.replace('_prev','_cur') + '.png')).exists()
+        fps = sorted(list((datapath / trainingset / (subfolder[0] + '_gt')).glob('*.png')))
 
-    fn = fp.name
-    inputs = cv2.imread(str(fp),cv2.IMREAD_UNCHANGED)      
+        for fp in fps:
+            remove_file = False
+            inputs = cv2.imread(str(fp),cv2.IMREAD_UNCHANGED)      
+            assert inputs.shape == target_size
 
-    assert inputs.shape == target_size
+            inputs_cellnbs = np.unique(inputs)[1:]
+            for inputs_cellnb in inputs_cellnbs:
+                if np.sum(inputs == inputs_cellnb) < 40:
+                    if np.max(np.where(inputs==inputs_cellnb)[0]) < 40:
+                        remove_file = True
 
-    framenb = list(map(int,re.findall('\d+',fn)))[-1]
-    pad = re.findall('\d+',fp.name)[-1].count('0') + int(math.log10(framenb))+1
-    fn = fn.replace(re.findall('\d+', fn)[-1],f'{framenb-1:0{str(pad)}d}')
-    fn = fn.replace('_prev','_cur')
+            outputs = cv2.imread(str(datapath / trainingset / (subfolder[1] + '_gt') / fp.name),cv2.IMREAD_UNCHANGED)
+            assert outputs.shape == target_size
 
-    if (fp.parent / fn).exists():
-        outputs = cv2.imread(str(fp.parent / fn),cv2.IMREAD_UNCHANGED)
-        assert outputs.shape == target_size
+            if not ((inputs > 0) == (outputs > 0)).all() or remove_file:
+                print(fp.name)
+                if remove:
+                    for folder in ['prev_prev','prev_cur','prev','cur','fut_prev','fut']:
+                        for f in ['_gt','_img']:
+                            if (datapath / trainingset / (folder + f) / fp.name).exists():
+                                (datapath / trainingset / (folder + f) / fp.name).unlink()
 
-        if not ((inputs > 0) == (outputs > 0)).all():
-            print(fn,fp.name)
-            if remove:
-                #### TODO double check that this works as expected
-                for folder in folders:
-                    if (fp.parents[1] / folder / fn).exists():
-                        (fp.parents[1] / folder / fn).unlink()
-                    if (fp.parents[1] / folder / fp.name).exists():
-                        (fp.parents[1] / folder / fp.name).unlink()
-                if (fp.parent / fp.name).exists():
-                    (fp.parent / fp.name).unlink()
-                if (fp.parent / fn).exists():
-                    (fp.parent / fn).unlink()
+                    for folder in ['img','previmg','inputs','outputs']:
+                        if (datapath / 'raw_data' / folder / fp.name).exists():
+                            (datapath / 'raw_data' / folder / fp.name).unlink()
+

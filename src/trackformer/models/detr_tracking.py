@@ -1,13 +1,11 @@
-import math
 import random
 from contextlib import nullcontext
-import numpy as np
 
 import torch
 import torch.nn as nn
 
 from ..util import box_ops
-from ..util.misc import NestedTensor, get_rank, threshold_indices
+from ..util import misc as utils
 from .deformable_detr import DeformableDETR
 from .detr import DETR
 from .matcher import HungarianMatcher
@@ -24,6 +22,7 @@ class DETRTrackingBase(nn.Module):
                  dn_track_l1 = 0,
                  dn_track_l2 = 0,
                  dn_object = False,
+                 dn_enc=False,
                  refine_div_track_queries = False,
                  evaluate_dataset_with_no_data_aug=False,):
 
@@ -35,6 +34,7 @@ class DETRTrackingBase(nn.Module):
         self.dn_track_l1 = dn_track_l1
         self.dn_track_l2 = dn_track_l2
         self.dn_object = dn_object
+        self.dn_enc = dn_enc
         self.refine_div_track_queries = refine_div_track_queries
         self.evaluate_dataset_with_no_data_aug = evaluate_dataset_with_no_data_aug
 
@@ -139,26 +139,28 @@ class DETRTrackingBase(nn.Module):
 
     def calc_num_FPs(self,targets,return_FPs=False,add_extra_FPs=True):
 
+        # Number of cells being tracked per batch
         num_cells = torch.tensor([len(target['prev_ind'][0]) for target in targets])
 
+        # Calculate the FPs necessary for batching to work. There needs to be an equal amount of track queries per batch so FPs are added to offset a sample with less cells
         max_track = max(num_cells)
         num_FPs = max_track - num_cells
 
-        # num_FPs = torch.tensor([FP for FP in add_FPs])
-
-        if sum(num_cells) != 0 and add_extra_FPs: # Only add FPs if it is tracking; it is not realistic to add extra FPs when no cells are being tracked
-            max_FPs = max(num_FPs)
-            num_fps_rand = torch.randint(0,max(3-max_FPs,1),(1,)).item()
+        # Only add FPs if it is tracking; it is not realistic to add extra FPs when no cells are being tracked
+        if sum(num_cells) != 0 and add_extra_FPs: 
+            # If 3 or more FPs are being added then we do not add more as we don't want to litter the sample with FPs causing an unrealistic sample and waste computational resources
+            num_fps_rand = torch.randint(0,max(3-max(num_FPs),1),(1,)).item()
             num_FPs += num_fps_rand 
 
-        if return_FPs:
-            return num_FPs
-        else:
-            for t,target in enumerate(targets):
-                target['num_FPs'] = num_FPs[t]
+        # if return_FPs:
+        #     return num_FPs
+        # else:
+        for t,target in enumerate(targets):
+            target['num_FPs'] = num_FPs[t]
 
     def add_FPs(self,target,i,prev_out):
         # Due to divisions, we do not want a repeat false positive which would occur with the current code below
+        # With divisions, target['prev_ind][0] can point to the 
         prev_out_ind_uni = torch.unique(target['prev_ind'][0])
         
         prev_boxes_matched = prev_out['pred_boxes'][i,prev_out_ind_uni]
@@ -218,7 +220,7 @@ class DETRTrackingBase(nn.Module):
             N,_,H,W = target['masks'].shape
             target['masks'] = torch.cat((target['masks'][:index],torch.cat((target['masks'][index,:1],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],torch.cat((target['masks'][index,1:],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],target['masks'][index+1:]))
 
-    def add_track_queries_to_targets(self, targets, prev_indices, swap_prev_indices, prev_out, prev_prev_track=False, keep_all_track=False, group_object=False, dn_track=False):
+    def add_track_queries_to_targets(self, targets, prev_indices, prev_out, prev_prev_track=False, keep_all_track=False, group_object=False, dn_track=False):
     
         # min_prev_target_ind = min([len(prev_ind[1]) for prev_ind in prev_indices])
 
@@ -231,7 +233,9 @@ class DETRTrackingBase(nn.Module):
         for i, (target, prev_ind) in enumerate(zip(targets, prev_indices)):
             prev_out_ind, prev_target_ind = prev_ind
 
-            if prev_prev_track or keep_all_track or self.evaluate_dataset_with_no_data_aug:
+            if self.evaluate_dataset_with_no_data_aug:
+                random_subset_mask = torch.arange(len(prev_target_ind))
+            elif prev_prev_track or keep_all_track:
                 random_subset_mask = torch.randperm(len(prev_target_ind))
             elif rand_num > 0.3:  #max number to be tracked since 
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)]
@@ -239,16 +243,6 @@ class DETRTrackingBase(nn.Module):
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)-1]
             else:
                 random_subset_mask = torch.randperm(len(prev_target_ind))[:len(prev_target_ind)-2]
-
-            # #### Need to rewrite this; get rid of min_prev_target_ind; FPs are added later so it doesn't matter what min num of cells per chamber is
-            # if prev_prev_track or keep_all_track:
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))
-            # elif rand_num > 0.8:  #max number to be tracked since 
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind]
-            # elif rand_num < 0.5 and not group_object:
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:0]
-            # else:
-            #     random_subset_mask = torch.randperm(len(prev_target_ind))[:min_prev_target_ind - 1]
 
             target['prev_ind'] = [prev_out_ind[random_subset_mask],prev_target_ind[random_subset_mask]]
 
@@ -259,6 +253,8 @@ class DETRTrackingBase(nn.Module):
                 dn_track['boxes'] = target['boxes'].clone()
                 dn_track['empty'] = target['empty'].clone()
                 dn_track['prev_target'] = target['prev_target']
+                dn_track['fut_target'] = target['fut_target']
+                dn_track['fut_prev_target'] = target['fut_prev_target']
                 
                 random_subset_mask = torch.randperm(len(prev_target_ind))
                 dn_track['prev_ind'] = [prev_out_ind[random_subset_mask],prev_target_ind[random_subset_mask]]
@@ -287,12 +283,13 @@ class DETRTrackingBase(nn.Module):
         # Only matters if we are using the prev prev frame when a division is tracked from prev prev frame to prev frame. This is because a single decoder output embedding can predict a cell division
         
         self.calc_num_FPs(targets,add_extra_FPs=not self.evaluate_dataset_with_no_data_aug)
+        assert sum(['num_FPs' in target for target in targets]) == len(targets), 'False Positives were not properly added to target'
 
         if dn_track:
-            num_FPs = self.calc_num_FPs([target['dn_track'] for target in targets],return_FPs=True)
-
-            for i,target in enumerate(targets):
-                target['dn_track']['num_FPs'] = num_FPs[i]
+            self.calc_num_FPs([target['dn_track'] for target in targets])
+            assert sum(['num_FPs' in target['dn_track'] for target in targets]) == len(targets), 'False Positives were not properly added to dn_target '
+            # for i,target in enumerate(targets):
+            #     target['dn_track']['num_FPs'] = num_FPs[i]
 
             
         for i, target in enumerate(targets):
@@ -307,7 +304,7 @@ class DETRTrackingBase(nn.Module):
                 # match track ids between frames
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 dn_track['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
-                #dn_track['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['dn_track']['num_FPs'])).bool().to(self.device)))
+                dn_track['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * dn_track['num_FPs'])).bool().to(self.device)))
                 dn_track['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
             prev_track_ids = track_ids[target['prev_ind'][1]]
@@ -329,6 +326,7 @@ class DETRTrackingBase(nn.Module):
 
                 if 'masks' in target:
                     group_object['masks'] = target['masks'].clone()
+
                 count = 0
                 for b in range(len(target['boxes'])):
                     if target['boxes'][b,-1] > 0:
@@ -338,15 +336,26 @@ class DETRTrackingBase(nn.Module):
             # If there is a FN for a cell in the previous frame that divides, then the labels/boxes/masks need to be adjusted for object detection to detect the divided cells separately
             if len(target_ind_not_matched_idx) > 0:
                 count = 0
+                store_div_ind = []
                 for nidx in range(len(target_ind_not_matched_idx)):
                     target_ind_not_matched_i = target_ind_not_matched_idx[nidx] + count
                     if target['boxes'][target_ind_not_matched_i][-1] > 0:
                         
                         self.update_target(target,target_ind_not_matched_i)
+                        store_div_ind.append(int(target_ind_not_matched_i))
+                        store_div_ind.append(int(target_ind_not_matched_i+1))
                         count += 1
 
+                target['object_detection_div_mask'] = torch.zeros(target['boxes'].shape[0]).to(self.device)
+
+                if len(store_div_ind) > 0:
+                    for s in range(len(store_div_ind) // 2):
+                        target['object_detection_div_mask'][torch.tensor(store_div_ind[s*2:(s+1)*2])] = s + 1
+
+                # target['track_ids'] has change since FP divided cells have been separated into two boxes
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
+                target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
                 target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
             # Add random false positives
@@ -384,19 +393,14 @@ class DETRTrackingBase(nn.Module):
             track_queries_fal_pos_mask[~target['target_ind_matching']] = True
 
             if 'dn_track' in target:
+                dn_track['track_queries_TP_mask'] = dn_track['target_ind_matching']
                 dn_track['track_queries_mask'] = torch.ones_like(dn_track['target_ind_matching']).to(self.device).bool()
                 dn_track['track_queries_fal_pos_mask'] = torch.zeros_like(dn_track['target_ind_matching']).to(self.device).bool()
                 dn_track['track_queries_fal_pos_mask'][~dn_track['target_ind_matching']] = True      
 
-                # dn_track['track_query_hs_embeds'] = prev_out['hs_embed'][i, dn_track['prev_ind'][0]]
                 dn_track['track_query_hs_embeds'] = self.dn_track_embedding.weight.repeat(len(dn_track['prev_ind'][0]),1)
 
                 boxes = prev_out['pred_boxes'].detach()[i, dn_track['prev_ind'][0]]
-
-                if len(swap_prev_indices[i]) > 0:
-                    for b in range(len(boxes)):
-                        if dn_track['prev_ind'][0][b] in swap_prev_indices[i]:
-                            boxes[b] = torch.cat((boxes[b,4:],boxes[b,:4]),dim=-1)
 
                 assert torch.sum(boxes < 0) == 0, 'Bboxes need to have positive values'
 
@@ -431,10 +435,10 @@ class DETRTrackingBase(nn.Module):
 
             boxes = prev_out['pred_boxes'].detach()[i, target['prev_ind'][0]]
 
-            if len(swap_prev_indices[i]) > 0:
-                for b in range(len(boxes)):
-                    if target['prev_ind'][0][b] in swap_prev_indices[i]:
-                        boxes[b] = torch.cat((boxes[b,4:],boxes[b,:4]),dim=-1)
+            # if len(swap_prev_indices[i]) > 0:
+            #     for b in range(len(boxes)):
+            #         if target['prev_ind'][0][b] in swap_prev_indices[i]:
+            #             boxes[b] = torch.cat((boxes[b,4:],boxes[b,:4]),dim=-1)
 
             assert torch.sum(boxes < 0) == 0, 'Bboxes need to have positive values'
 
@@ -446,7 +450,6 @@ class DETRTrackingBase(nn.Module):
             target['track_query_boxes'] = boxes[:,:4]
 
             assert torch.sum(target['track_query_boxes'] < 0) == 0, 'Bboxes need to have positive values'
-
             assert target['track_query_hs_embeds'].shape[0] + self.num_queries == len(target['track_queries_TP_mask'])
             assert target['track_query_boxes'].shape[0] + self.num_queries == len(target['track_queries_TP_mask'])
 
@@ -460,7 +463,7 @@ class DETRTrackingBase(nn.Module):
                 torch.tensor([False, ] * self.num_queries).to(self.device)
             ]).bool()
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, prev_out=None, tm_threshold=None, evaluate_track=False):     
+    def forward(self, samples: utils.NestedTensor, targets: list = None, prev_features=None, prev_out=None, tm_threshold=None, evaluate_track=False):     
         if targets is not None and (not self._tracking or self.evaluate_dataset_with_no_data_aug):
             prev_targets = [target['prev_target'] for target in targets]
 
@@ -477,13 +480,13 @@ class DETRTrackingBase(nn.Module):
                 track_cells = True
 
             if track_cells:
-                # print('track')
+
                 backprop_context = torch.no_grad
                 if self._backprop_prev_frame:
                     backprop_context = nullcontext
 
                 with backprop_context():
-                    if all(['prev_prev_image' in t for t in targets]):
+                    if False:
                         for target, prev_target in zip(targets, prev_targets):
                             prev_target['prev_target'] = target['prev_prev_target']
 
@@ -523,32 +526,290 @@ class DETRTrackingBase(nn.Module):
                     else:
                         prev_out, _, prev_features, _, _ = super().forward([t['prev_image'] for t in targets])
                         prev_prev_track = False
-                        # print(prev_out['pred_logits'])
+
                         prev_outputs_without_aux = {
                             k: v for k, v in prev_out.items() if 'aux_outputs' not in k}
 
                         prev_indices = self._matcher(prev_outputs_without_aux, prev_targets)
 
-                        prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
+                        prev_indices, prev_targets = utils.threshold_indices(prev_indices,prev_targets,max_ind=prev_out['pred_logits'].shape[1])
+
+                        N = prev_out['pred_logits'].shape[1]
+
+                        for i, (target,(prev_ind_out,prev_ind_tgt)) in enumerate(zip(targets,prev_indices)):
+                    
+                            prev_target = target['prev_target']
+                            prev_prev_target = target['prev_prev_target']
+                            prev_cur_target = target['prev_cur_target']
+
+                            prev_ind_out_clone = prev_ind_out.clone()
+                            prev_ind_tgt_clone = prev_ind_tgt.clone()
+                            prev_boxes_clone = prev_target['boxes'].clone()
+                            skip = []
+                            prev_ind_tgt_blah = prev_ind_tgt.clone()
+                            prev_pred_boxes = prev_out['pred_boxes'][i].detach()
+
+                            # we are cehcking to see if the model predicts a single cell instead of two cells (pre-req - must have just divided)
+                            for idx in range(len(prev_ind_tgt_clone)): # go through all gt boxes
+
+                                prev_ind_tgt_box_1 = prev_ind_tgt_clone[idx]
+
+                                prev_tgt_box_1 = prev_boxes_clone[prev_ind_tgt_box_1][:4] # these are inputs so all pred_boxes will contain one box
+
+                                if prev_ind_tgt_box_1 in skip:
+                                    continue
+
+                                prev_cur_boxes = prev_cur_target['boxes']
+                                # cell could have just divided so need to check first and second box
+                                box_eq = torch.add(prev_tgt_box_1[:4].eq(prev_cur_boxes[:,:4]).all(axis=-1),prev_tgt_box_1[:4].eq(prev_cur_boxes[:,4:]).all(axis=-1))
+
+                                if box_eq.sum() == 0:
+                                    continue
+
+                                prev_box_ind_match_id = box_eq.nonzero()[0][0]
+
+                                if prev_cur_boxes[prev_box_ind_match_id][-1] > 0:
+                                    prev_prev_track_id = prev_cur_target['track_ids'][prev_box_ind_match_id]
+                                    prev_prev_box_ind = (prev_prev_target['track_ids'] == prev_prev_track_id).nonzero()[0][0]
+                                    prev_prev_box = prev_prev_target['boxes'][prev_prev_box_ind]
+
+                                    div_boxes = prev_cur_boxes[prev_box_ind_match_id]
+
+                                    combined_box = utils.combine_div_boxes(div_boxes,prev_prev_box)
+
+                                    if prev_tgt_box_1[:4].eq(prev_cur_boxes[:,:4]).all(axis=-1).sum() == 1:
+                                        prev_tgt_box_2 = div_boxes[4:]
+                                    else:
+                                        prev_tgt_box_2 = div_boxes[:4]
+
+                                    prev_ind_tgt_box_2 = prev_tgt_box_2[:4].eq(prev_boxes_clone[:,:4]).all(axis=-1).nonzero()[0][0].to('cpu')
+                                    prev_ind_box_2 = (prev_ind_tgt_clone == prev_ind_tgt_box_2).nonzero()[0][0]
+
+                                    skip.append(prev_ind_tgt_box_2)
+
+                                    prev_ind_out_box_1 = prev_ind_out_clone[idx]
+                                    prev_ind_out_box_2 = prev_ind_out_clone[prev_ind_box_2]
+
+                                    prev_pred_box_1 = prev_pred_boxes[prev_ind_out_box_1,:4]
+                                    prev_pred_box_2 = prev_pred_boxes[prev_ind_out_box_2,:4]
+                                    
+                                    iou = utils.calc_iou(torch.cat((prev_pred_box_1,prev_pred_box_2)),div_boxes)
+
+                                    unused_object_query_indices = torch.tensor([prev_ind_out_box_1,prev_ind_out_box_2] + [oq_id for oq_id in torch.arange(N-self.num_queries,N) if (oq_id not in prev_ind_out and prev_out['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
+
+                                    unused_pred_boxes = prev_pred_boxes[unused_object_query_indices].detach() 
+
+                                    iou_combined = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(unused_pred_boxes[:,:4]),box_ops.box_cxcywh_to_xyxy(combined_box[None,:4]),return_iou_only=True)
+
+                                    max_ind = torch.argmax(iou_combined)
+
+                                    assert iou_combined[max_ind] <= 1 and iou_combined[max_ind] >= 0 and iou <= 1 and iou >= 0
+
+                                    if iou_combined[max_ind] - iou > 0:
+
+                                        query_id = unused_object_query_indices[max_ind]
+                                        
+                                        if max_ind == 1:
+                                            prev_ind_out_box_1,prev_ind_out_box_2 = prev_ind_out_box_2,prev_ind_out_box_1
+                                            prev_ind_tgt_box_1,prev_ind_tgt_box_2 = prev_ind_tgt_box_2,prev_ind_tgt_box_1
+                                        
+                                        prev_ind_out[prev_ind_out == prev_ind_out_box_1] = query_id
+
+                                        assert (prev_ind_out == prev_ind_out_box_2).sum() == 1
+
+                                        prev_ind_out = prev_ind_out[prev_ind_out != prev_ind_out_box_2]                                
+
+                                        prev_ind_tgt_box_1_new = prev_ind_tgt[(prev_ind_tgt_blah == prev_ind_tgt_box_1).nonzero()[0][0]]
+                                        prev_ind_tgt_box_2_new = prev_ind_tgt[(prev_ind_tgt_blah == prev_ind_tgt_box_2).nonzero()[0][0]]
+
+                                        prev_ind_tgt = prev_ind_tgt[prev_ind_tgt != prev_ind_tgt_box_2_new]
+                                        prev_ind_tgt[prev_ind_tgt > prev_ind_tgt_box_2_new] = prev_ind_tgt[prev_ind_tgt > prev_ind_tgt_box_2_new] - 1
+
+                                        assert len(prev_ind_tgt) + 1 == len(prev_ind_tgt_blah)
+
+                                        prev_ind_tgt_blah = prev_ind_tgt_blah[prev_ind_tgt_blah != prev_ind_tgt_box_2]
 
 
-                    self.add_track_queries_to_targets(targets, prev_indices, swap_prev_indices, prev_outputs_without_aux,
+                                        track_ids_div = prev_target['track_ids'][torch.tensor([prev_ind_tgt_box_1_new,prev_ind_tgt_box_2_new])]
+
+                                        if track_ids_div[0] in target['track_ids'] and track_ids_div[1] in target['track_ids']: # if cell 1 and 2 are still present, we need to treat this as a division
+
+                                            cur_ind_tgt_box_1 = (target['track_ids'] == track_ids_div[0]).nonzero()[0][0]
+                                            cur_ind_tgt_box_2 = (target['track_ids'] == track_ids_div[1]).nonzero()[0][0]
+
+                                            assert target['boxes'][cur_ind_tgt_box_1][-1] == 0 and target['boxes'][cur_ind_tgt_box_2][-1] == 0
+
+                                            target['boxes'][cur_ind_tgt_box_1] = torch.cat((target['boxes'][cur_ind_tgt_box_1,:4],target['boxes'][cur_ind_tgt_box_2,:4]))
+                                            target['labels'][cur_ind_tgt_box_1] = torch.tensor([0,0]).to(self.device)
+                                            target['track_ids'][cur_ind_tgt_box_1] = prev_target['track_ids'][prev_ind_tgt_box_1_new]
+
+                                            cur_ind_keep = torch.tensor([cur_ind_tgt_box for cur_ind_tgt_box in range(len(target['boxes'])) if cur_ind_tgt_box != cur_ind_tgt_box_2])
+                                            target['boxes'] = target['boxes'][cur_ind_keep]
+                                            target['labels'] = target['labels'][cur_ind_keep]
+                                            target['track_ids'] = target['track_ids'][cur_ind_keep]
+
+                                        elif track_ids_div[0] in target['track_ids']: # if cell 2 left the chamber but cell 1 is still present
+
+                                            cur_ind_tgt_box_1 = (target['track_ids'] == track_ids_div[0]).nonzero()[0][0]
+
+                                            assert target['boxes'][cur_ind_tgt_box_1][-1] == 0 
+                                            # Don't need to update target boxes or labels here
+                                            target['track_ids'][cur_ind_tgt_box_1] = prev_target['track_ids'][prev_ind_tgt_box_1_new]
+
+                                        elif track_ids_div[1] in target['track_ids']: # if cell 1 left the chamber but cell 2 is still present
+    
+                                            cur_ind_tgt_box_2 = (target['track_ids'] == track_ids_div[1]).nonzero()[0][0]
+
+                                            assert target['boxes'][cur_ind_tgt_box_2][-1] == 0 
+                                            # Don't need to update target boxes or labels here
+                                            target['track_ids'][cur_ind_tgt_box_2] = prev_target['track_ids'][prev_ind_tgt_box_1_new]
+
+                                        else: # This means both cells left chamber in next frame; nothing to be done since the modified cell(s) in the previous frame tracks to nothing 
+                                            pass
+
+                                        prev_target['boxes'][prev_ind_tgt_box_1_new] = combined_box
+                                        prev_ind_tgt_boxes = torch.tensor([prev_ind_tgt_box for prev_ind_tgt_box in range(len(prev_target['boxes'])) if prev_ind_tgt_box != prev_ind_tgt_box_2_new])
+                                        prev_target['boxes'] = prev_target['boxes'][prev_ind_tgt_boxes]
+                                        prev_target['labels'] = prev_target['labels'][prev_ind_tgt_boxes]
+                                        prev_target['track_ids'] = prev_target['track_ids'][prev_ind_tgt_boxes]
+                                        assert len(prev_ind_out) == len(prev_ind_tgt)
+
+                                        prev_indices[i] = (prev_ind_out,prev_ind_tgt)
+
+                                        if 'masks' in target:
+                                            raise NotImplementedError
+
+                            test_early_div = (target['boxes'][:,-1] > 0).any()
+                            # we are checking to see if the model predicted two separate cells (object detection instead of one cell) - pre-req: cell must divide in next frame (current frame)
+                            if test_early_div: # quick check to see if any cells divided in the current frame (we are accessing object detection in the prev frame)
+                                prev_ind_out_clone = prev_ind_out.clone()
+                                prev_ind_tgt_clone = prev_ind_tgt.clone()
+                                prev_boxes_clone = prev_target['boxes'].clone()
+                                prev_track_ids_clone = prev_target['track_ids'].clone()
+                                skip = [] 
+                                for idx in range(len(prev_ind_tgt_clone)):
+
+                                    prev_ind_out_box = prev_ind_out_clone[idx]
+                                    prev_ind_tgt_box = prev_ind_tgt_clone[idx]
+
+                                    if prev_ind_tgt_box in skip:
+                                        continue
+
+                                    prev_track_id = prev_track_ids_clone[prev_ind_tgt_box]
+
+                                    # Cell needs to track to next frame (current frame) to check if it divided or not
+                                    if prev_track_id not in target['track_ids']:
+                                        continue
+
+                                    cur_ind_tgt_box = (target['track_ids'] == prev_track_id).nonzero()[0][0]
+                                    cur_tgt_box = target['boxes'][cur_ind_tgt_box].clone()
+
+                                    # Cell in next frame (current frame) needs to divide otherwise we won't consider an early division
+                                    if cur_tgt_box[-1] == 0:
+                                        continue
+
+                                    prev_box = prev_boxes_clone[prev_ind_tgt_box]
+
+                                    div_box = utils.divide_box(prev_box,cur_tgt_box)
+
+                                    assert N == self.num_queries
+                                    unused_object_query_indices = torch.tensor([prev_ind_out_box] + [oq_id for oq_id in torch.arange(self.num_queries) if (oq_id not in prev_ind_out and prev_out['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
+                        
+                                    if len(unused_object_query_indices) > 1:
+
+                                        unused_prev_pred_boxes = prev_pred_boxes[unused_object_query_indices]
+
+                                        iou_div_all = box_ops.generalized_box_iou(
+                                                                                  box_ops.box_cxcywh_to_xyxy(unused_prev_pred_boxes[:,:4]),
+                                                                                  box_ops.box_cxcywh_to_xyxy(torch.cat((div_box[None,:4],div_box[None,4:]),axis=0)),
+                                                                                  return_iou_only=True
+                                                                                  )
+
+                                        match_ind = torch.argmax(iou_div_all,axis=0).to('cpu')
+
+                                        if len(torch.unique(match_ind)) == 2: # If same cell matches best to the target box; then discard
+                                            selected_pred_boxes = unused_prev_pred_boxes[match_ind,:4]
+                                            iou_div = utils.calc_iou(div_box, torch.cat((selected_pred_boxes[0],selected_pred_boxes[1])))
+
+                                            prev_pred_box = prev_pred_boxes[prev_ind_out_box]
+                                            prev_pred_box[4:] = 0
+
+                                            iou = utils.calc_iou(prev_box,prev_pred_box)
+
+                                            if iou_div - iou > 0:
+                                                prev_target['boxes'][prev_ind_tgt_box] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
+                                                prev_target['boxes'] = torch.cat((prev_target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
+
+                                                # prev_target['labels'][prev_ind_tgt_box] = torch.tensor([0,1]).to(self.device) # inputs --> so no divisions here
+                                                prev_target['labels'] = torch.cat((prev_target['labels'],torch.tensor([0,1])[None,].to(self.device)))
+
+                                                new_track_id = torch.max((torch.cat((prev_target['track_ids'],target['track_ids'])))) + 1
+                                                prev_target['track_ids'] = torch.cat((prev_target['track_ids'],torch.tensor([new_track_id]).to(self.device)))
+
+                                                target['track_ids'] = torch.cat((target['track_ids'],torch.tensor([new_track_id]).to(self.device)))
+                                                target['labels'][cur_ind_tgt_box] = torch.tensor([0,1]).to(self.device) # division so we need to change this since division is now happening a frame early
+                                                target['labels'] = torch.cat((target['labels'],torch.tensor([0,1])[None].to(self.device)))
+                                                target['boxes'] = torch.cat((target['boxes'],torch.cat((cur_tgt_box[4:],torch.zeros_like(cur_tgt_box[4:])))[None]))
+                                                target['boxes'][cur_ind_tgt_box] = torch.cat((cur_tgt_box[:4],torch.zeros_like(cur_tgt_box[:4])))
+
+
+                                                if 'masks' in target:
+                                                    raise NotImplementedError
+
+                                                prev_ind_out[prev_ind_out == prev_ind_out_box] = unused_object_query_indices[match_ind[0]]
+                                                prev_ind_out = torch.cat((prev_ind_out,unused_object_query_indices[match_ind[1]][None]))
+                                                prev_ind_tgt = torch.cat((prev_ind_tgt,torch.tensor([prev_target['boxes'].shape[0]-1])))                    
+
+                                                assert len(prev_ind_out) == len(prev_ind_tgt)
+                                                assert len(prev_target['boxes']) == len(prev_target['labels'])
+
+                                                prev_indices[i] = (prev_ind_out,prev_ind_tgt)
+
+                    self.add_track_queries_to_targets(targets, prev_indices, prev_outputs_without_aux,
                                                     prev_prev_track=prev_prev_track,group_object=self.group_object,dn_track=self.dn_track)
 
             else: # if we are perforoming object detection, we need to make sure the ground truths are all single cells as divided cells will be grouped as one
                 # print('object detection')
                 for target in targets:
+                    
                     count = 0
+                    store_div_ind = []
                     for b in range(len(target['boxes'])):
                         if target['boxes'][b + count,-1] > 0:
-                            self.update_target(target,b+count,update_track_ids=False)
+                            self.update_target(target,b+count)
+                            store_div_ind.append(b+count)
+                            store_div_ind.append(b+count+1)
                             count += 1
+
+                    target['object_detection_div_mask'] = torch.zeros(target['boxes'].shape[0]).to(self.device)
+
+                    if len(store_div_ind) > 0:
+                        for s in range(len(store_div_ind) // 2):
+                            target['object_detection_div_mask'][torch.tensor(store_div_ind[s*2:(s+1)*2])] = s + 1
 
                     target['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
 
+                    
                     assert (target['boxes'][:,-1] == 0).all()
 
-        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object, dn_object=self.dn_object)
+        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object, dn_object=self.dn_object, dn_enc=self.dn_enc)
+
+        if self.dn_enc and 'dn_enc' in targets[0]:
+
+            for target in targets:     
+                count = 0
+                store_div_ind = []
+                for b in range(len(target['dn_enc']['boxes'])):
+                    if target['dn_enc']['boxes'][b + count,-1] > 0:
+                        self.update_target(target['dn_enc'],b+count)
+                        store_div_ind.append(torch.tensor([b+count,b+count+1]))
+                        count += 1
+
+                target['dn_enc']['object_detection_div_mask'] = torch.zeros(target['dn_enc']['boxes'].shape[0]).to(self.device)
+
+                if len(store_div_ind) > 0:
+                    for s,ind in enumerate(store_div_ind):
+                        target['dn_enc']['object_detection_div_mask'][ind] = s + 1
 
         return out, targets, features, memory, hs, prev_out
 

@@ -43,7 +43,8 @@ def build_model(args):
         'dn_object_l1': args.dn_object_l1,
         'dn_object_l2': args.dn_object_l2,
         'dn_label': args.dn_label,
-        'refine_object_queries': args.refine_object_queries,}
+        'refine_object_queries': args.refine_object_queries,
+        'use_div_ref_pts': args.use_div_ref_pts,}
 
     tracking_kwargs = {
         'track_query_false_positive_prob': args.track_query_false_positive_prob,
@@ -54,6 +55,7 @@ def build_model(args):
         'dn_track_l1': args.dn_track_l1,
         'dn_track_l2': args.dn_track_l2,
         'dn_object': args.dn_object,
+        'dn_enc':args.dn_enc,
         'refine_div_track_queries': args.refine_div_track_queries,
         'evaluate_dataset_with_no_data_aug': args.evaluate_dataset_with_no_data_aug}
 
@@ -99,8 +101,7 @@ def build_model(args):
             else:
                 model = DETR(**detr_kwargs)
 
-    weight_dict = {'loss': args.loss_coef,
-                   'loss_ce': args.bbox_loss_coef,
+    weight_dict = {'loss_ce': args.bbox_loss_coef,
                    'loss_bbox': args.bbox_loss_coef,
                    'loss_giou': args.giou_loss_coef,}
 
@@ -108,21 +109,41 @@ def build_model(args):
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
 
+    training_methods = []
+    if args.dn_track:
+        training_methods.append('dn_track')
+    if args.dn_object:
+        training_methods.append('dn_object')
+    if args.dn_enc:
+        training_methods.append('dn_enc')
+
+
+    weight_dict_TM = {}
+    for weight_dict_key in list(weight_dict.keys()):
+        for training_method in training_methods:
+            weight_dict_TM.update({f'{weight_dict_key}_{training_method}': weight_dict[weight_dict_key]})
+
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
+        for i in range(args.dec_layers-1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+
+            for training_method in training_methods:
+                aux_weight_dict.update({k + f'_{i}_{training_method}': v for k, v in weight_dict.items()})
 
         if args.two_stage:
             aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
-            aux_weight_dict.pop('loss_enc')
         weight_dict.update(aux_weight_dict)
 
+    weight_dict.update(weight_dict_TM)
+
+    weight_dict.update({'loss': args.loss_coef})
 
     losses = ['labels', 'boxes']
     if args.masks:
         losses.append('masks')
+
 
     criterion = SetCriterion(
         num_classes,

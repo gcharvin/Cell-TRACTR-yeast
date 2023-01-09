@@ -8,14 +8,14 @@ overwrite_lrs: false
 overwrite_lr_scheduler: false
 batch_size: 2
 weight_decay: 0.0001
-epochs: 50
-lr_drop: 10
+epochs: 80
+lr_drop: 40
 # gradient clipping max norm
 clip_max_norm: 0.1
 # Deformable DETR
 deformable: true
 with_box_refine: true
-two_stage: false
+two_stage: true
 # Model parameters
 freeze_detr: false
 load_mask_head_from_model: null
@@ -49,17 +49,22 @@ enc_n_points: 4
 # DAB-DETR
 use_dab: true
 group_object: false
-dn_track: false
+dn_track: true
 dn_track_l1: 0.1
 dn_track_l2: 0.05
 dn_object: false
 dn_label: 0.3
 dn_object_l1: 0.2
 dn_object_l2: 0.1
+dn_enc: true
+dn_enc_l1: 0.2
+dn_enc_l2: 0.1
 # Embeddings to differentiate object vs track queries
 refine_track_queries: true
 refine_object_queries: true
 refine_div_track_queries: false
+use_div_ref_pts: true
+init_enc_queries_embeddings: False
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`

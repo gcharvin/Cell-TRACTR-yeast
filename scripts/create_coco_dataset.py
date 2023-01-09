@@ -8,6 +8,7 @@ import numpy as np
 from itertools import groupby
 import random
 from skimage.measure import label
+import re 
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -41,6 +42,40 @@ def polygonFromMask(seg):
     if valid_poly == 0:
         raise ValueError
     return segmentation
+
+
+def read_image(filepath,width=32,height=256):
+
+    img = cv2.imread(str(filepath),cv2.IMREAD_ANYDEPTH)
+    img = (img - np.min(img)) / np.ptp(img)
+    img = cv2.resize(img,(width,height))
+    img = (255 * img).astype(np.uint8)
+
+    return img
+
+def read_gts(fp,reset = False, width=32, height=256):
+
+    # Read and resize inputs
+    prev_gt = (cv2.imread(str(fp.parents[1] / 'inputs' / fp.name),cv2.IMREAD_ANYDEPTH))
+    orginal_size_prev_gt = np.unique(label(prev_gt))[1:]
+    prev_gt = cv2.resize(prev_gt,(width,height),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
+
+    # Read and resize outputs
+    cur_gt = (cv2.imread(str(fp.parents[1] / 'outputs' / fp.name),cv2.IMREAD_ANYDEPTH))
+    original_size_cur_gt = np.unique(label(cur_gt))[1:]
+    cur_gt = cv2.resize(cur_gt,(width,height),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
+
+    prev_gt_label = np.unique(label(prev_gt > 0))[1:]
+    cur_gt_label = np.unique(label(cur_gt > 0))[1:]
+    # Check for resizing artifacts and remove them
+    if len(prev_gt_label) != len(orginal_size_prev_gt) or len(cur_gt_label) != len(original_size_cur_gt):
+        print(f'Resizing error\nRemoving: {fp.stem}')
+        for data_folder in ['img','previmg','inputs','outputs']:
+            (fp.parents[1] / data_folder / fp.name).unlink()
+        
+        reset = True
+
+    return prev_gt, cur_gt, reset
 
 def create_anno(mask,cell,image_id,track_id,annotation_id,category_id,min_area=20):
    
@@ -117,62 +152,188 @@ def create_anno(mask,cell,image_id,track_id,annotation_id,category_id,min_area=2
         'empty': empty,
     }
 
-    if not empty:
+    if not empty and track_id > 0:
         annotation['track_id'] = track_id
 
     return annotation
 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells/raw_data_ordered')
+
+def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id):
+
+    prev_gt,cur_gt = gts
+    prev_annotations,cur_annotations = annotations_old
+    prev_annotation_id, cur_annotation_id = annotation_ids_old
+
+    cells_prev = np.unique(prev_gt)[1:]
+    cells_cur = np.unique(cur_gt)[1:]
+
+    # Remove any cells smaller than min_area as these objects are probably not cells
+    cells_prev = [i for i in cells_prev if np.sum(prev_gt == i) > min_area]
+    cells_cur = [i for i in cells_cur if np.sum(cur_gt == i) > min_area]
+
+    # Divided cells into three categories
+    # 1.) Cells that track from the previous to current frame
+    cells_track = [i for i in cells_prev if i in cells_cur]
+    # 2.) Cells that appear in the new frame (this should not happen for mothermachine)
+    cells_new = [i for i in cells_cur if i not in cells_prev]
+    assert len(cells_new) == 0
+    # 3.) Cells that exit the chamber; The cell exists in the previous frame but is gone in the current frame
+    cells_leave = [i for i in cells_prev if i not in cells_cur]
+
+    cells_all = cells_track + cells_new + cells_leave
+    assert len(cells_all) == len(set(cells_all))
+    
+    # First check for empty chambers and make an annotation per empty chamber
+    # Images with no objects are trickier to deal; this is a hack implementation
+
+    cell = -1 # This will be used to label an empty chamber with cellnb -1
+
+    if len(cells_prev) == 0 and len(cells_cur) != 0:
+        print('Empty chamber in previous frame only')
+        if mothermachine:
+            raise Exception('Cells cannot spontaneously spawn in the current frame if they don"t exist in the previous frame')
+        annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
+        prev_annotations.append(annotation)
+        prev_annotation_id += 1
+
+    elif len(cells_prev) != 0 and len(cells_cur) == 0:
+        print('Empty chamber in current frame only')
+        annotation = create_anno(cur_gt,cell,image_id,-1,cur_annotation_id,category_id)
+        cur_annotations.append(annotation)
+        cur_annotation_id += 1        
+
+    elif len(cells_prev) == 0 and len(cells_cur) == 0:
+        print('Empty chambers in previous and current frame')
+        annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
+        prev_annotations.append(annotation)
+        prev_annotation_id += 1
+
+        annotation = create_anno(cur_gt,cell,image_id,-1,cur_annotation_id,category_id)
+        cur_annotations.append(annotation)
+        cur_annotation_id += 1
+
+    # Then iterate through all cells to create the standard annotations
+    for cell in cells_all:
+        if cell in cells_track:
+
+            annotation = create_anno(prev_gt,cell,image_id,track_id,prev_annotation_id,category_id)
+            prev_annotations.append(annotation)
+            prev_annotation_id += 1
+
+            annotation = create_anno(cur_gt,cell,image_id,track_id,cur_annotation_id,category_id)
+            cur_annotations.append(annotation)                    
+            cur_annotation_id += 1
+
+            track_id += 1
+
+        elif cell in cells_leave:
+            annotation = create_anno(prev_gt,cell,image_id,track_id,prev_annotation_id,category_id)
+            prev_annotations.append(annotation)
+            prev_annotation_id += 1
+            track_id += 1
+
+        elif cell in cells_new:
+            assert False
+            cur_annotation = create_anno(cur_gt,cell,image_id,track_id,cur_annotation_id,category_id)
+            cur_annotations.append(cur_annotation)                    
+            cur_annotation_id += 1
+            track_id += 1
+        else:
+            print('error')
+
+    updated_annotation_ids = [prev_annotation_id,cur_annotation_id]
+    updated_annotations = [prev_annotations,cur_annotations]
+
+    return updated_annotations, track_id, updated_annotation_ids
+
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
 
 anno_folder = 'annotations'
-(datapath.parent / anno_folder).mkdir(exist_ok=True)
+folders = ['train','val']
 
-if (datapath.parent / anno_folder / 'train.json').exists():
-    (datapath.parent / anno_folder / 'train.json').unlink()
-
-if (datapath.parent / anno_folder / 'val.json').exists():
-    (datapath.parent / anno_folder / 'val.json').unlink()
+(datapath / anno_folder).mkdir(exist_ok=True)
 
 category_id = 1
 no_cell = 0
 min_area = 20
 mothermachine = True
 
-img_fps = list((datapath / 'img').glob("*.png"))[:]
-random.seed(1)
-random.shuffle(img_fps)
-train_val_split = 0.8
-split = int(train_val_split*len(img_fps))
-train_fps = sorted(img_fps[:split])
-val_fps = sorted(img_fps[split:])
+img_fps = list((datapath / 'raw_data' / 'img').glob("*.png"))[:]
 
-folders = ['train','val']
+# Configure metadata
+meta_data = np.zeros((len(img_fps),5),dtype=int)
+for idx,fp in enumerate(img_fps):
+
+    fn = fp.stem
+
+    numbers = list(map(int,re.findall('\d+',fn)))
+
+    meta_data[idx] = numbers
+
+fns = []
+
+exps = np.unique(meta_data[:,0])
+
+for exp in exps:
+    exp_data = meta_data[meta_data[:,0] == exp][:,1:]
+
+    training_sets = np.unique(exp_data[:,0])
+
+    for training_set in training_sets:
+        ts_data = exp_data[exp_data[:,0] == training_set][:,1:]
+
+        positions = np.unique(ts_data[:,0])
+
+        for position in positions:
+            pos_data = ts_data[ts_data[:,0] == position][:,1:]
+
+            chambers = np.unique(pos_data[:,0])
+
+            for chamber in chambers:
+
+                cha_data = pos_data[pos_data[:,0] == chamber][:,1:]
+
+                frames = np.unique(cha_data[:,0])
+
+                for frame in frames:
+
+                    if frame - 1 in frames and frame + 1 in frames:
+
+                        ind = np.where((meta_data[:,0] == exp) * (meta_data[:,1] == training_set) * (meta_data[:,2] == position) * (meta_data[:,3] == chamber) * (meta_data[:,4] == frame) == True)[0][0]
+
+                        fns.append(img_fps[ind].name)
+
+random.seed(1)
+random.shuffle(fns)
+train_val_split = 0.8
+split = int(train_val_split*len(fns))
+train_fns = sorted(fns[:split])
+val_fns = sorted(fns[split:])
+
 
 # Remove old data
 for folder in folders:
-    (datapath.parent / folder).mkdir(exist_ok=True)
-    (datapath.parent / folder / 'img').mkdir(exist_ok=True)
-    (datapath.parent / folder / 'gt').mkdir(exist_ok=True)
 
-    json_path = datapath.parent / anno_folder / (f'{folder}.json')
-    if json_path.exists():
+    for time_ref in ['fut_','fut_prev_','cur_','prev_','prev_prev_','prev_cur_']:
+        for img_type in ['img','gt']:
+            (datapath/ folder / (time_ref + img_type)).mkdir(exist_ok=True)
+
+            delete_fps = (datapath / folder / (time_ref + img_type)).glob('*.png')
+            for delete_fp in delete_fps:
+                delete_fp.unlink()
+
+    (datapath / anno_folder / folder).mkdir(exist_ok=True)
+
+    json_paths = (datapath / anno_folder / folder).glob('*.json')
+    for json_path in json_paths:
         json_path.unlink()
 
-    for fol in ['img','gt']:
-        fps = (datapath.parent / folder / fol).glob('*.png')
-        for fp in fps:
-            fp.unlink()
 
-(datapath.parent / 'combined').mkdir(exist_ok=True)
-
-for idx,fps in enumerate([train_fps,val_fps]):
+for idx,dataset_fns in enumerate([train_fns,val_fns]):
     # These ids will be automatically increased as we go
-    annotation_id = 0
     image_id = 0
     track_id = 1
     
-    metadata = {}
-
     licenses = []
     licenses.append({'id': 1,'name': 'MIT license', 'url':'add later'})
 
@@ -187,167 +348,100 @@ for idx,fps in enumerate([train_fps,val_fps]):
         'year': '2022'
         }
 
-    annotations = []
+    annotations = [[[],[]] for _ in range(3)]
+    annotation_ids = [[0,0] for _ in range(3)]
+    # 0 - prev_prev
+    # 1 - prev_cur
+    # 2 - prev
+    # 3 - cur
+    # 4 - fut_prev
+    # 5 - fut
+
     images = []
+
     categories = []
     
     width = 32
     height = 256
 
-    for counter,fp in enumerate(tqdm(fps)):
+    for counter,fn in enumerate(tqdm(dataset_fns)):
 
-        previmg = cv2.imread(str(fp.parents[1] / 'previmg' / fp.name),cv2.IMREAD_ANYDEPTH)
-        previmg = (previmg - np.min(previmg)) / np.ptp(previmg)
-        previmg = cv2.resize(previmg,(width,height))
-        previmg = (255 * previmg).astype(np.uint8)
+        prev_img = read_image(datapath / 'raw_data' / 'previmg' / fn)
+        cur_img = read_image(datapath / 'raw_data' / 'img' / fn)
 
-        img = cv2.imread(str(fp.parents[1] / 'img' / fp.name),cv2.IMREAD_ANYDEPTH)
-        img = (img - np.min(img)) / np.ptp(img)
-        img = cv2.resize(img,(width,height))
-        img = (255 * img).astype(np.uint8)
+        prev_gt, cur_gt, reset = read_gts(datapath / 'raw_data' / 'inputs' / fn)
 
-        # Read and resize inputs
-        inputs = (cv2.imread(str(fp.parents[1] / 'inputs' / fp.name),cv2.IMREAD_ANYDEPTH))
-        og_inputs = np.unique(label(inputs))[1:]
-        inputs = cv2.resize(inputs,(width,height),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
-        inputs_label = np.unique(label(inputs > 0))[1:]
 
-        # Read and resize outputs
-        outputs = (cv2.imread(str(fp.parents[1] / 'outputs' / fp.name),cv2.IMREAD_ANYDEPTH))
-        og_outputs = np.unique(label(outputs))[1:]
-        outputs = cv2.resize(outputs,(width,height),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
-        outputs_label = np.unique(label(outputs > 0))[1:]
+        framenb = (re.findall('\d+',fn)[-1])
+        framenb_plus1 = f'{int(framenb)+1:06d}'
+        framenb_minus1 = f'{int(framenb)-1:06d}'
 
-        # Check for resizing artifacts and remove them
-        if len(inputs_label) != len(og_inputs) or len(outputs_label) != len(og_outputs):
-            print(f'Resizing error\nRemoving: {fp.stem}')
-            for data_folder in ['img','previmg','inputs','outputs']:
-                (fp.parents[1] / data_folder / fp.name).unlink()
-            continue
+        fn_plus1 = fn.replace(framenb,framenb_plus1)
+        fn_minus1 = fn.replace(framenb,framenb_minus1)
 
-        cells_input = np.unique(inputs)[1:]
-        cells_output = np.unique(outputs)[1:]
+        prev_prev_img = read_image(datapath / 'raw_data' / 'previmg' / fn_minus1)
+        fut_img = read_image(datapath / 'raw_data' / 'img' / fn_plus1)
 
-        # Remove any cells smaller than min_area as these objects are probably not cells
-        cells_input = [i for i in cells_input if np.sum(inputs == i) > min_area]
-        cells_output = [i for i in cells_output if np.sum(outputs == i) > min_area]
+        prev_prev_gt, prev_cur_gt, reset = read_gts(datapath / 'raw_data' / 'inputs' / fn_minus1)
+        fut_prev_gt, fut_gt, reset = read_gts(datapath / 'raw_data' / 'inputs' / fn_plus1)
 
-        # Divided cells into three categories
-        # 1.) Cells that track from the previous to current frame
-        cells_track = [i for i in cells_input if i in cells_output]
-        # 2.) Cells that appear in the new frame (this should not happen for mothermachine)
-        cells_new = [i for i in cells_output if i not in cells_input]
-        # 3.) Cells that exit the chamber; The cell exists in the previous frame but is gone in the current frame
-        cells_leave = [i for i in cells_input if i not in cells_output]
+        if reset:
+            raise Exception
 
-        cells_all = cells_track + cells_new + cells_leave
-        
-        # First check for empty chambers and make an annotation per empty chamber
-        # Images with no objects are trickier to deal; this is a hack implementation
+        gts = [[prev_prev_gt,prev_cur_gt],[prev_gt,cur_gt],[fut_prev_gt,fut_gt]]
 
-        cell = -1 # This will be used to label an empty chamber with cellnb -1
+        for k in range(len(gts)):
+            updated_annotations,track_id, updated_annotation_ids = compile_annotations(gts[k],annotations[k],annotation_ids[k],track_id,image_id)
+            annotations[k] = updated_annotations
+            annotation_ids[k] = updated_annotation_ids
 
-        if len(cells_input) == 0 and len(cells_output) != 0:
-            print('Empty chamber in previous frame only')
-            if mothermachine:
-                raise Exception('Cells cannot spontaneously spawn in the current frame if they don"t exist in the previous frame')
-            prev_annotation = create_anno(inputs,cell,image_id,-1,annotation_id,category_id)
-            annotations.append(prev_annotation)
-            annotation_id += 1
 
-        elif len(cells_input) != 0 and len(cells_output) == 0:
-            print('Empty chamber in current frame only')
-            cur_annotation = create_anno(inputs,cell,image_id+1,-1,annotation_id,category_id)
-            annotations.append(cur_annotation)
-            annotation_id += 1        
-
-        elif len(cells_input) == 0 and len(cells_output) == 0:
-            print('Empty chambers in previous and current frame')
-            prev_annotation = create_anno(inputs,cell,image_id,-1,annotation_id,category_id)
-            annotations.append(prev_annotation)
-            annotation_id += 1
-
-            cur_annotation = create_anno(inputs,cell,image_id+1,-1,annotation_id,category_id)
-            annotations.append(cur_annotation)
-            annotation_id += 1
-
-        # Then iterate through all cells to create the standard annotations
-        for cell in cells_all:
-            if cell in cells_track:
-
-                prev_annotation = create_anno(inputs,cell,image_id,track_id,annotation_id,category_id)
-                annotations.append(prev_annotation)
-                annotation_id += 1
-
-                cur_annotation = create_anno(outputs,cell,image_id+1,track_id,annotation_id,category_id)
-                annotations.append(cur_annotation)                    
-                annotation_id += 1
-
-                track_id += 1
-
-            elif cell in cells_leave:
-                prev_annotation = create_anno(inputs,cell,image_id,track_id,annotation_id,category_id)
-                annotations.append(prev_annotation)
-                annotation_id += 1
-                track_id += 1
-
-            elif cell in cells_new:
-                cur_annotation = create_anno(outputs,cell,image_id+1,track_id,annotation_id,category_id)
-                annotations.append(cur_annotation)                    
-                annotation_id += 1
-                track_id += 1
-            else:
-                print('error')
-
-        prev_image = {
+        image = {
             'license': 1,
-            'file_name': fp.stem + '_prev.png',
-            'height': inputs.shape[0],
-            'width': inputs.shape[1],
+            'file_name': fn,
+            'height': prev_gt.shape[0],
+            'width': prev_gt.shape[1],
             'id': image_id,
             'frame_id': 0,
             'seq_length': 1,
-            'first_frame_image_id': image_id
-           }    
-
-        images.append(prev_image)
-        image_id += 1
-
-        cur_image = {
-            'license': 1,
-            'file_name': fp.stem + '_cur.png',
-            'height': outputs.shape[0],
-            'width': outputs.shape[1],
-            'id': image_id,
-            'frame_id': 1,
-            'seq_length': 1,
-            'first_frame_image_id': image_id-1,
             }    
 
-        images.append(cur_image)
+        images.append(image)
 
         image_id += 1
 
-        cv2.imwrite(str(datapath.parent / folders[idx] / 'img' / (fp.stem + '_prev.png')),previmg)
-        cv2.imwrite(str(datapath.parent / folders[idx] / 'img' /(fp.stem + '_cur.png')),img)
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_img' / fn),prev_prev_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_gt' / fn),prev_prev_gt)
 
-        cv2.imwrite(str(datapath.parent / folders[idx] / 'gt' / (fp.stem + '_prev.png')),inputs)
-        cv2.imwrite(str(datapath.parent / folders[idx] / 'gt' / (fp.stem + '_cur.png')),outputs)
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_img' / fn),prev_img)        
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_gt' / fn),prev_cur_gt)
 
-        cv2.imwrite(str(datapath.parent / 'combined' / (fp.stem + '_prev.png')),inputs)
-        cv2.imwrite(str(datapath.parent / 'combined' / (fp.stem + '_cur.png')),outputs)
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_img' / fn),prev_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'prev_gt' / fn),prev_gt)
 
-    metadata = {
-        'annotations': annotations,
-        'images': images,
-        'categories': categories,
-        'licenses': licenses,
-        'info': info,
-        'sequences': 'cells',
-    }
+        cv2.imwrite(str(datapath / folders[idx] / 'cur_img' / fn),cur_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'cur_gt' / fn),cur_gt)
         
-    with open(datapath.parent / anno_folder / (f'{folders[idx]}.json'), 'w') as f:
-        json.dump(metadata,f, cls=NpEncoder)
+        cv2.imwrite(str(datapath / folders[idx] / 'fut_img' / fn),fut_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'fut_gt' / fn),fut_gt)
+
+        cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_img' / fn),cur_img)
+        cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_gt' / fn),fut_prev_gt)
+    
+    json_folders = ['prev_prev','prev_cur','prev','cur','fut_prev','fut']
+
+    for m in range(len(json_folders)):
+        metadata = {
+            'annotations': annotations[m//2][m%2],
+            'images': images,
+            'categories': categories,
+            'licenses': licenses,
+            'info': info,
+            'sequences': 'cells',
+        }
+        
+        with open(datapath / anno_folder / (f'{folders[idx]}') / (f'{json_folders[m]}.json'), 'w') as f:
+            json.dump(metadata,f, cls=NpEncoder)
         
 
 

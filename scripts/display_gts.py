@@ -5,30 +5,43 @@ from pathlib import Path
 from pycocotools import mask as coco_mask
 import matplotlib.pyplot as plt
 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/trackformer_2d/data/cells/annotations')
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
+
+json_folders = ['prev','cur']
+json_folders = ['prev_prev','prev_cur']
+json_folders = ['fut_prev','fut']
 
 # Opening JSON file
-f = open(datapath / 'train.json')
-data = json.load(f)
+f = open(datapath  / 'annotations' / 'train' / (f'{json_folders[0]}.json'))
+data_prev = json.load(f)
 
+f = open(datapath / 'annotations' / 'train' / (f'{json_folders[1]}.json'))
+data_cur = json.load(f)
 # returns JSON object as 
 # a dictionary
 
 
-num_display = 20
+num_display = 5
 alpha=0.4
-anno = data['annotations']
-images = data['images']
-images_frame0 = [img['id'] for img in images if img['frame_id'] == 0]
-np.random.seed(1)
-img_ids = np.random.choice(images_frame0,num_display)
+anno_prev = data_prev['annotations']
+images_prev = data_prev['images']
 
-(datapath.parent / 'generator').mkdir(exist_ok=True)
+anno_cur = data_cur['annotations']
+images_cur = data_cur['images']
+np.random.seed(1)
+img_ids = np.random.choice(range(len(images_cur)),num_display)
+
+(datapath / 'generator').mkdir(exist_ok=True)
+
+fps = (datapath / 'generator').glob('*.png')
+for fp in fps:
+    fp.unlink()
 
 
 class Tool():
-    def __init__(self,anno):
-        self.anno = anno
+    def __init__(self,anno_prev,anno_cur):
+        self.anno_prev = anno_prev
+        self.anno_cur = anno_cur
         self.crop = [np.inf,np.inf,0,0]
 
     def update(self,height,width,colors,img_id):
@@ -46,9 +59,18 @@ class Tool():
         self.crop[2] = int(np.max((self.crop[2],x0+w+10)))
         self.crop[3] = int(np.max((self.crop[3],y0+h+10)))
 
-    def forward(self,img_bbox,img_mask,img_bbox_mask,track_id,frame_id,color=None):
+    def forward(self,images,track_id,prev_or_cur:str,color=None):
 
-        bounding_box = [ann['bbox_1'] for ann in anno if ann['image_id'] == self.img_id + frame_id and ann['track_id'] == track_id][0]
+        if prev_or_cur == 'prev':
+            anno = self.anno_prev
+        elif prev_or_cur == 'cur':
+            anno = self.anno_cur
+        else:
+            raise Exception('You need to enter "prev" or "cur" for prev_or_cur variable')
+
+        img_bbox,img_mask,img_bbox_mask, bw_mask = images
+
+        bounding_box = [ann['bbox_1'] for ann in anno if ann['image_id'] == self.img_id and ann['track_id'] == track_id][0]
         color = (0,0,0) if not color else color
         img_bbox = cv2.rectangle(
             img_bbox,
@@ -66,7 +88,7 @@ class Tool():
 
         cell_1 = bounding_box
 
-        bounding_box = [ann['bbox_2'] for ann in anno if ann['image_id'] == self.img_id + frame_id and ann['track_id'] == track_id][0]
+        bounding_box = [ann['bbox_2'] for ann in anno if ann['image_id'] == self.img_id and ann['track_id'] == track_id][0]
 
         if bounding_box[-1] > 0:
             img_bbox = cv2.rectangle(
@@ -102,7 +124,7 @@ class Tool():
             )
         self.update_crop(bounding_box)
 
-        seg = [ann['segmentation_1'] +  ann['segmentation_2'] for ann in anno if ann['image_id'] == self.img_id + frame_id and ann['track_id'] == track_id][0]
+        seg = [ann['segmentation_1'] +  ann['segmentation_2'] for ann in anno if ann['image_id'] == self.img_id and ann['track_id'] == track_id][0]
 
         rles = coco_mask.frPyObjects(seg, self.height, self.width)
         mask = coco_mask.decode(rles)
@@ -112,7 +134,9 @@ class Tool():
             img_mask[mask_color > 1] = img_mask[mask_color>1] * (1-alpha) + mask_color[mask_color>1]  * alpha
             img_bbox_mask[mask_color > 1] = img_bbox_mask[mask_color>1] * (1-alpha) + mask_color[mask_color>1]  * alpha
 
-        return img_bbox,img_mask,img_bbox_mask, np.sum(mask,axis=-1).astype(np.uint8)*255
+        bw_mask += np.sum(mask,axis=-1).astype(np.uint8)*255
+
+        return [img_bbox,img_mask,img_bbox_mask,bw_mask]
 
 
 save_mask = True
@@ -120,30 +144,32 @@ save_bbox = True
 save_bbox_mask = True
 save_mask_bw = True
 crop = False
-tool = Tool(anno)
+tool = Tool(anno_prev,anno_cur)
 np.random.seed(1)
 
 for img_id in img_ids:
     
-    height = images[img_id]['height']
-    width = images[img_id]['width']
+    height = images_cur[img_id]['height']
+    width = images_cur[img_id]['width']
 
-    assert images[img_id]['frame_id'] == 0
-    assert images[img_id+1]['frame_id'] == 1
+    fn = images_prev[img_id]['file_name']
 
-    prevfn = images[img_id]['file_name']
-    curfn = images[img_id+1]['file_name']
+    assert fn == images_cur[img_id]['file_name']
 
-    assert prevfn[:-9] == curfn[:-8]
+    fn = Path(fn)
+
+    previmg = cv2.imread(str(datapath / 'train' / (f'{json_folders[0]}_img') / fn))
+    img = cv2.imread(str(datapath / 'train' / (f'{json_folders[1]}_img') / fn))
+
+    prev_gt = cv2.imread(str(datapath / 'train' / (f'{json_folders[0]}_gt') / fn),cv2.IMREAD_UNCHANGED)
+    gt = cv2.imread(str(datapath / 'train' / (f'{json_folders[1]}_gt') / fn),cv2.IMREAD_UNCHANGED)
+
+    previmg_bbox, previmg_mask, previmg_bbox_mask = [previmg.copy() for _ in range(3)]
+    img_bbox, img_mask, img_bbox_mask = [img.copy() for _ in range(3)]
     
-    previmg = cv2.imread(str(datapath.parent / 'train' / 'img' / prevfn))
-    img = cv2.imread(str(datapath.parent / 'train' / 'img' / curfn))
+    track_ids_prev = [ann['track_id'] for ann in anno_prev if ann['image_id'] == img_id]
+    track_ids_cur = [ann['track_id'] for ann in anno_cur if ann['image_id'] == img_id]
 
-    previmg_bbox, previmg_mask, previmg_bbox_seg = [previmg.copy() for _ in range(3)]
-    img_bbox, img_mask, img_bbox_seg = [img.copy() for _ in range(3)]
-    
-    track_ids_prev = [ann['track_id'] for ann in anno if ann['image_id'] == img_id]
-    track_ids_cur = [ann['track_id'] for ann in anno if ann['image_id'] == img_id+1]
     track_ids_both = [track_id_prev for track_id_prev in track_ids_prev if track_id_prev in track_ids_cur]
     
     # np.random.seed(4)
@@ -151,27 +177,28 @@ for img_id in img_ids:
     
     tool.update(height,width,colors,img_id)
 
-    prevseg_bw = np.zeros((img.shape[:2]),dtype=np.uint8)
-    seg_bw = np.zeros((img.shape[:2]),dtype=np.uint8)
+    prev_bw_mask = np.zeros((img.shape[:2]),dtype=np.uint8)
+    bw_mask = np.zeros((img.shape[:2]),dtype=np.uint8)
+
+    cur_images = [img_bbox,img_mask,img_bbox_mask,bw_mask]
+    prev_images = [previmg_bbox,previmg_mask,previmg_bbox_mask,prev_bw_mask]
 
     for idx,track_id in enumerate(track_ids_both):
-        previmg_bbox,previmg_mask,previmg_bbox_mask,prevseg = tool.forward(previmg_bbox, previmg_mask, previmg_bbox_seg,track_id,frame_id=0,color=colors[idx])
-        img_bbox,img_mask,img_bbox_mask,seg = tool.forward(img_bbox, img_mask, img_bbox_seg,track_id,frame_id=1,color=colors[idx])
-
-        prevseg_bw += prevseg
-        seg_bw += seg
+        prev_images = tool.forward(prev_images,track_id,prev_or_cur='prev',color=colors[idx])
+        cur_images = tool.forward(cur_images,track_id,prev_or_cur='cur',color=colors[idx])
 
     track_leave = [id for id in track_ids_prev if id not in track_ids_cur]
 
     for track_id in track_leave:
-        previmg_bbox,previmg_mask,previmg_bbox_mask,prevseg = tool.forward(previmg_bbox, previmg_mask, previmg_bbox_seg,track_id,frame_id=0,color=colors[len(track_ids_both)])
-        prevseg_bw += prevseg
+        prev_images = tool.forward(prev_images,track_id,prev_or_cur='prev',color=colors[len(track_ids_both)])
 
     track_new = [id for id in track_ids_cur if id not in track_ids_prev]
 
     for track_id in track_new:
-        img_bbox,img_mask,img_bbox_mask,seg = tool.forward(img_bbox, img_mask, img_bbox_seg,track_id,frame_id=1,color=None)
-        seg_bw += seg
+        cur_images = tool.forward(cur_images,track_id,prev_or_cur='cur',color=None)
+
+    previmg_bbox,previmg_mask,previmg_bbox_mask,prev_bw_mask = prev_images
+    img_bbox,img_mask,img_bbox_mask,bw_mask = cur_images
 
     if crop:
         previmg_bbox = previmg_bbox[tool.crop[1]:tool.crop[3],tool.crop[0]:tool.crop[2]]
@@ -184,20 +211,35 @@ for img_id in img_ids:
         img_bbox_mask = img_bbox_mask[tool.crop[1]:tool.crop[3],tool.crop[0]:tool.crop[2]]
         seg_bw = seg_bw[tool.crop[1]:tool.crop[3],tool.crop[0]:tool.crop[2]]
         img = img[tool.crop[1]:tool.crop[3],tool.crop[0]:tool.crop[2]]
+        gt = gt[tool.crop[1]:tool.crop[3],tool.crop[0]:tool.crop[2]]
+        prev_gt = prev_gt[tool.crop[1]:tool.crop[3],tool.crop[0]:tool.crop[2]]
         
-
-
         
     if save_bbox:
-        cv2.imwrite(str(datapath.parent / 'generator' / (curfn[:-8] + '_bbox.png')),np.concatenate((previmg_bbox,img_bbox),axis=1))
+        cv2.imwrite(str(datapath / 'generator' / (fn.stem + '_bbox.png')),np.concatenate((previmg_bbox,img_bbox),axis=1))
 
     if save_mask:
-        cv2.imwrite(str(datapath.parent / 'generator' / (curfn[:-8] + '_mask.png')),np.concatenate((previmg_mask,img_mask),axis=1))
+        cv2.imwrite(str(datapath / 'generator' / (fn.stem + '_mask.png')),np.concatenate((previmg_mask,img_mask),axis=1))
 
     if save_bbox:
-        cv2.imwrite(str(datapath.parent / 'generator' / (curfn[:-8] + '_bbox_mask.png')),np.concatenate((previmg_bbox_mask,img_bbox_mask),axis=1))
+        cv2.imwrite(str(datapath / 'generator' / (fn.stem + '_bbox_mask.png')),np.concatenate((previmg_bbox_mask,img_bbox_mask),axis=1))
 
     if save_mask_bw:
-        cv2.imwrite(str(datapath.parent / 'generator' / (curfn[:-8] + '_mask_bw.png')),np.concatenate((prevseg_bw,seg_bw),axis=1))
+        cv2.imwrite(str(datapath / 'generator' / (fn.stem + '_mask_bw.png')),np.concatenate((prev_bw_mask,bw_mask),axis=1))
+    save_gt = True
+    if save_gt:
+        gt_cells = set(np.concatenate((np.unique(gt)[1:],np.unique(prev_gt)[1:])))
+        blank_gt = np.repeat(np.zeros_like(gt)[...,None],3,axis=-1).astype(np.uint8)
+        blank_prev_gt = np.repeat(np.zeros_like(prev_gt)[...,None],3,axis=-1).astype(np.uint8)
+        for c,gt_cell in enumerate(gt_cells):
+            blank_gt[gt == gt_cell] = colors[c]
+            blank_prev_gt[prev_gt == gt_cell] = colors[c]
 
-    cv2.imwrite(str(datapath.parent / 'generator' / (curfn[:-8] + '_og_img.png')),np.concatenate((previmg,img),axis=1)[:,:,0])
+        alpha = 0.4
+
+        blank_prev_gt = alpha * blank_prev_gt + (1-alpha) * previmg
+        blank_gt = alpha * blank_gt + (1-alpha) * img
+
+        cv2.imwrite(str(datapath / 'generator' / (fn.stem + '_gt.png')),np.concatenate((blank_prev_gt,blank_gt),axis=1))
+
+    cv2.imwrite(str(datapath / 'generator' / (fn.stem + '_og_img.png')),np.concatenate((previmg,img),axis=1)[:,:,0])

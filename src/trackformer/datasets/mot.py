@@ -52,41 +52,43 @@ class MOT(CocoDetection):
             'torch': torch.random.get_rng_state()}
 
         fn = self.coco.imgs[idx]['file_name']
-        idx = idx if re.findall('\D+',fn)[-1] == '_cur.png' else idx + 1
+        # idx = idx if re.findall('\D+',fn)[-1] == '_cur.png' else idx + 1
 
         img, target = self._getitem_from_id(idx, random_state=random_state)
         target['image'] = img
+        target['image_id'] = torch.tensor(idx)
+        # target['fn'] = fn
         
-        if self._prev_frame:
-            prev_img, prev_target = self._getitem_from_id(idx-1, random_state=random_state)
+        # if self._prev_frame:
+        #     prev_img, prev_target = self._getitem_from_id(idx-1, random_state=random_state)
 
-            prev_target['filenb'] = torch.tensor(idx-1)
-            prev_target['image'] = prev_img
+        #     prev_target['filenb'] = torch.tensor(idx-1)
+        #     prev_target['image'] = prev_img
 
-            framenb = list(map(int,re.findall('\d+',fn)))[-1]
-            prev_target['framenb'] = torch.tensor(framenb)
+        #     framenb = list(map(int,re.findall('\d+',fn)))[-1]
+        #     prev_target['framenb'] = torch.tensor(framenb)
 
-            target[f'prev_image'] = prev_img
-            target[f'prev_target'] = prev_target
+        #     target[f'prev_image'] = prev_img
+        #     target[f'prev_target'] = prev_target
     
 
-            if self._prev_prev_frame:
-                framenb = list(map(int,re.findall('\d+',fn)))[-1]
-                pad = re.findall('\d+',fn)[-1].count('0') + int(math.log10(framenb))+1
-                fn = fn.replace(re.findall('\d+',fn)[-1],f'{framenb-1:0{str(pad)}d}')
+        #     if self._prev_prev_frame:
+        #         framenb = list(map(int,re.findall('\d+',fn)))[-1]
+        #         pad = re.findall('\d+',fn)[-1].count('0') + int(math.log10(framenb))+1
+        #         fn = fn.replace(re.findall('\d+',fn)[-1],f'{framenb-1:0{str(pad)}d}')
 
-                if os.path.exists(self.img_folder / fn):
-                    prev_prev_img , prev_prev_target = self._getitem_from_id(idx-3, random_state=random_state)
-                    target[f'prev_prev_image'] = prev_prev_img
-                    target[f'prev_prev_target'] = prev_prev_target
+        #         if os.path.exists(self.img_folder / fn):
+        #             prev_prev_img , prev_prev_target = self._getitem_from_id(idx-3, random_state=random_state)
+        #             target[f'prev_prev_image'] = prev_prev_img
+        #             target[f'prev_prev_target'] = prev_prev_target
 
-                    prev_cur_img , prev_cur_target = self._getitem_from_id(idx-2, random_state)
+        #             prev_cur_img , prev_cur_target = self._getitem_from_id(idx-2, random_state)
 
-                    prev_cur_target['filenb'] = torch.tensor(idx-2)
-                    prev_cur_target['framenb'] = torch.tensor(framenb)
+        #             prev_cur_target['filenb'] = torch.tensor(idx-2)
+        #             prev_cur_target['framenb'] = torch.tensor(framenb)
 
-                    # target[f'prev_cur_image'] = prev_cur_img
-                    target[f'prev_cur_target'] = prev_cur_target
+        #             # target[f'prev_cur_image'] = prev_cur_img
+        #             target[f'prev_cur_target'] = prev_cur_target
 
         return img, target
 
@@ -144,41 +146,33 @@ class WeightedConcatDataset(torch.utils.data.ConcatDataset):
 
 def build_cells(image_set,args):
 
-    if image_set == 'train':
-        root = Path(args.output_dir.parents[1] / 'data' / 'cells')
-        prev_frame_rnd_augs = args.track_prev_frame_rnd_augs
-        prev_frame_range=args.track_prev_frame_range
-        prev_prev_frame = True
-    elif image_set == 'val':
-        root = Path(args.output_dir.parents[1] / 'data' / 'cells')
-        prev_frame_rnd_augs = 0.0
-        prev_frame_range = 1
-        prev_prev_frame = True
-    else:
-        ValueError(f'unknown {image_set}')
+    root = Path(args.output_dir.parents[1] / 'data' / 'cells' / 'new_dataset')
 
-    assert root.exists(), f'provided MOT17Det path {root} does not exist'
+    assert root.exists()
 
     split = image_set
 
-    img_folder = root / split / 'img'
-    ann_file = root / f"annotations/{split}.json"
-
-    transforms, norm_transforms = make_coco_transforms_cells(
-        image_set, args.img_transform, args.overflow_boxes)
+    transforms, norm_transforms = make_coco_transforms_cells(image_set)
 
     if args.evaluate_dataset_with_no_data_aug:
         transforms = None
 
-    dataset = MOT(
-        img_folder, ann_file, transforms, norm_transforms,
-        prev_frame_range=prev_frame_range,
-        return_masks=args.masks,
-        overflow_boxes=args.overflow_boxes,
-        remove_no_obj_imgs=False,
-        prev_frame=args.tracking,
-        prev_frame_rnd_augs=prev_frame_rnd_augs,
-        prev_prev_frame=prev_prev_frame,
-        )
+    datasets = []
+    img_folders = ['prev_prev_img', 'prev_cur_img', 'prev_img', 'cur_img', 'fut_prev_img', 'fut_img']
+    json_files = ['prev_prev', 'prev_cur', 'prev', 'cur', 'fut_prev', 'fut']
 
-    return dataset
+    for img_folder,json_file in zip(img_folders,json_files):
+         datasets.append(MOT
+                (
+                root / split / img_folder,
+                root / 'annotations'/ split / (json_file+'.json'),
+                transforms,
+                norm_transforms,
+                return_masks=args.masks,
+                overflow_boxes=args.overflow_boxes,
+                remove_no_obj_imgs=False,
+                )
+            )
+    
+    
+    return datasets

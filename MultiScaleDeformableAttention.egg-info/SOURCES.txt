@@ -1,9 +1,9 @@
 LICENSE
 README.md
 setup.py
-/projectnb/dunlop/ooconnor/object_detection/trackformer/src/trackformer/models/ops/src/vision.cpp
-/projectnb/dunlop/ooconnor/object_detection/trackformer/src/trackformer/models/ops/src/cpu/ms_deform_attn_cpu.cpp
-/projectnb/dunlop/ooconnor/object_detection/trackformer/src/trackformer/models/ops/src/cuda/ms_deform_attn_cuda.cu
+/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/src/trackformer/models/ops/src/vision.cpp
+/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/src/trackformer/models/ops/src/cpu/ms_deform_attn_cpu.cpp
+/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/src/trackformer/models/ops/src/cuda/ms_deform_attn_cuda.cu
 MultiScaleDeformableAttention.egg-info/PKG-INFO
 MultiScaleDeformableAttention.egg-info/SOURCES.txt
 MultiScaleDeformableAttention.egg-info/dependency_links.txt
