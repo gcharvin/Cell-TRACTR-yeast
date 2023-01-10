@@ -27,11 +27,12 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '230105_all_tokens_no_prev_memory_2_two_stage_dn_track_dab_no_mask'
+    modelname = '230109_two_stage_dn_enc_dn_track_dab_no_mask'
     
     args.dn_track = False
     args.dn_object = False
     args.group_object = False
+    args.dn_enc = False
     args.output_dir = Path(args.output_dir) / modelname
     print(args.output_dir)
     args.save_model_interval = False
@@ -44,9 +45,10 @@ def train(args: Namespace) -> None:
     args.batch_size = 1
     args.init_enc_queries_embeddings = False
 
-    display_worst = True
-    run_movie = False
+    display_worst = False
+    run_movie = True
     track= True
+    use_NMS = True
 
     print(args)
 
@@ -170,7 +172,7 @@ def train(args: Namespace) -> None:
 
     if run_movie:
         model.evaluate_dataset_with_no_data_aug = False
-        Pipeline = pipeline(model, fps, device, output_dir, args, track)
+        Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS)
         Pipeline.forward()
     
     if display_worst:

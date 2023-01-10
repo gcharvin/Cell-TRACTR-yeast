@@ -358,12 +358,15 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
 @torch.no_grad()
 class pipeline():
-    def __init__(self,model, fps, device, output_dir, args, track=True):
+    def __init__(self,model, fps, device, output_dir, args, track=True, use_NMS=False):
         self.model = model
         self.model.tracking()
 
+        self.use_NMS = use_NMS
+        self.predictions_folder = 'predictions' if not self.use_NMS else 'predictions_NMS'
+
         self.output_dir = output_dir
-        (self.output_dir / 'predictions').mkdir(exist_ok=True)
+        (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
 
         self.normalize = Compose([
             ToTensor(),
@@ -385,7 +388,7 @@ class pipeline():
             self.colors = np.array([tuple((np.zeros(3))) for _ in range(1000)])
 
         if args.two_stage:
-            (self.output_dir / 'predictions' / 'enc_outputs').mkdir(exist_ok=True)
+            (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
 
         self.display_masks = False
         self.oq_div = True # Can object queries detect divisions
@@ -393,8 +396,8 @@ class pipeline():
         self.display_decoder_aux = True
 
         if self.display_decoder_aux:
-            (self.output_dir / 'predictions' / 'decoder_bbox_outputs').mkdir(exist_ok=True)
-            (self.output_dir / 'predictions' / 'ref_pts_outputs').mkdir(exist_ok=True)
+            (self.output_dir / self.predictions_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
+            (self.output_dir / self.predictions_folder / 'ref_pts_outputs').mkdir(exist_ok=True)
             self.num_decoder_frames = 1
 
         self.display_object_query_boxes = True
@@ -485,6 +488,29 @@ class pipeline():
 
         return boxes
 
+    def NMS(self, pred_boxes, keep, keep_div):
+
+        keep, keep_div = torch.tensor(keep), torch.tensor(keep_div)
+        ind_keep = torch.where(keep == True)[0]
+        track_keep = [i_keep for i_keep in ind_keep if i_keep < len(keep) - self.num_queries]
+        new_keep = [i_keep for i_keep in ind_keep if i_keep >= len(keep) - self.num_queries]
+        ind_div_keep = torch.where(keep_div == True)[0]
+        track_div_keep = [i_keep for i_keep in ind_div_keep if i_keep < len(keep) - self.num_queries]
+
+        track_boxes = torch.cat((pred_boxes[track_keep,:4],pred_boxes[track_div_keep,4:]),axis=0)
+
+        for ind in new_keep:
+            box = pred_boxes[ind,:4]
+
+            for track_box in track_boxes:
+                iou = utils.calc_iou(box,track_box)
+
+                if iou > 0.75:
+                    keep[ind] = False
+                    break
+
+        return keep.numpy(), keep_div.numpy()
+
     def forward(self):
         for r,fps_ROI in enumerate(self.fps_split):
             print(self.videoname_list[r])
@@ -522,6 +548,9 @@ class pipeline():
                 if not self.oq_div:
                     self.keep_div[-self.num_queries:] = False
                 ####
+
+                if self.use_NMS and len(keep) > self.num_queries and keep[-self.num_queries:].sum() > 0:
+                    keep, keep_div = self.NMS(pred_boxes, keep, keep_div)
 
                 if i > 0:
                     prevcells = np.copy(self.cells)
@@ -583,7 +612,6 @@ class pipeline():
 
                 self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = color_frame         
 
-
                 if self.display_decoder_aux and i in random_nbs:
 
                     if 'enc_outputs' in outputs:
@@ -610,7 +638,7 @@ class pipeline():
                         
                         enc_frames = np.concatenate((enc_frames),axis=1)
 
-                        cv2.imwrite(str(self.output_dir / 'predictions' / 'enc_outputs' / (f'encoder_frame_{fp.name}')),enc_frames)
+                        cv2.imwrite(str(self.output_dir / self.predictions_folder / 'enc_outputs' / (f'encoder_frame_{fp.name}')),enc_frames)
 
 
                     references = outputs['references'].detach()
@@ -704,7 +732,7 @@ class pipeline():
                             decoder_frame = np.concatenate((decoder_frame,img_final_box,img_final_all_box),axis=1)
 
                     method = 'object_detection' if not self.track else 'track'
-                    cv2.imwrite(str(self.output_dir / 'predictions' / 'decoder_bbox_outputs' / (f'{method}_decoder_frame_{fp.name}')),decoder_frame)
+                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'decoder_bbox_outputs' / (f'{method}_decoder_frame_{fp.name}')),decoder_frame)
 
                     img_ref_pts_init_object = np.copy(np.array(img))
                     img_ref_pts_init_track = np.copy(np.array(img))
@@ -764,7 +792,7 @@ class pipeline():
                     else:
                         ref_frames = np.concatenate((img,img_ref_pts_init_all,ref_frames,img_ref_pts_final_all),axis=1)
 
-                    cv2.imwrite(str(self.output_dir / 'predictions' / 'ref_pts_outputs' / (f'{method}_ref_pts_{fp.name}')),ref_frames)
+                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'ref_pts_outputs' / (f'{method}_ref_pts_{fp.name}')),ref_frames)
                     
 
         if self.write_video:
@@ -772,7 +800,7 @@ class pipeline():
             verbose = 1
             method = 'track' if self.track else 'object_detection'
             name_mask = 'mask_' if self.display_masks else ''
-            filename = self.output_dir / 'predictions' / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
+            filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
             print(filename)
             height, width, _ = self.color_stack[0].shape
             if height % 2 == 1:
@@ -833,7 +861,7 @@ class pipeline():
                 img_empty = cv2.putText(img_empty,f'{ind+1}',org=(shift*scale,15*scale),fontFace=cv2.FONT_HERSHEY_COMPLEX,fontScale=4,color=(0,0,0),thickness=4)
                 query_frames[:,j*(self.target_size[1]*scale+wspacer): j*(self.target_size[1]*scale+wspacer) + self.target_size[1]*scale] = img_empty
 
-            cv2.imwrite(str(self.output_dir / 'predictions' / (f'{method}_object_query_box_locations.png')),query_frames)
+            cv2.imwrite(str(self.output_dir / self.predictions_folder / (f'{method}_object_query_box_locations.png')),query_frames)
         
 
 
@@ -863,7 +891,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
 
     for didx, data_loaders in enumerate([data_loaders_train,data_loaders_val]):
         store_loss = torch.zeros((len(data_loaders[0])))
-        for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in tqdm(enumerate(zip(*data_loaders))):
+        for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(tqdm(zip(*data_loaders))):
 
             samples = cur_samples
             targets = cur_targets

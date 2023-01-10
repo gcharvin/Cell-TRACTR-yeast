@@ -1784,7 +1784,7 @@ def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
 
 def calc_object_query_FP(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
     acc = torch.zeros((2),dtype=torch.int32)
-    if 'track_queries_mask' in targets[0]:
+    if 'track_query_match_ids' in targets[0]:
         num_queries = (~targets[0]['track_queries_mask']).sum().cpu()
         
         for t,target in enumerate(targets):
@@ -1894,7 +1894,7 @@ def calc_iou(box_1,box_2,return_flip=False):
 
         iou = iou_1 + iou_2
 
-    elif box_1[-1] == 0 and box_2[-1] == 0:
+    elif (box_1[-1] == 0 and box_2[-1] == 0) or (box_1.shape[0] == 4 and box_2.shape[0] == 4):
         iou = box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(box_1[:4]),
             box_ops.box_cxcywh_to_xyxy(box_2[:4]),
