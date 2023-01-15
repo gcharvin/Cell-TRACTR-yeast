@@ -220,7 +220,7 @@ class DETRTrackingBase(nn.Module):
             N,_,H,W = target['masks'].shape
             target['masks'] = torch.cat((target['masks'][:index],torch.cat((target['masks'][index,:1],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],torch.cat((target['masks'][index,1:],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],target['masks'][index+1:]))
 
-    def add_track_queries_to_targets(self, targets, prev_indices, prev_out, prev_prev_track=False, keep_all_track=False, group_object=False, dn_track=False):
+    def add_track_queries_to_targets(self, targets, prev_indices, prev_out, prev_prev_track=False, keep_all_track=False, dn_track=False):
     
         # min_prev_target_ind = min([len(prev_ind[1]) for prev_ind in prev_indices])
 
@@ -258,6 +258,9 @@ class DETRTrackingBase(nn.Module):
                 
                 random_subset_mask = torch.randperm(len(prev_target_ind))
                 dn_track['prev_ind'] = [prev_out_ind[random_subset_mask],prev_target_ind[random_subset_mask]]
+
+                if 'masks' in targets[0]:
+                    dn_track['masks'] = target['masks'].clone()
 
                 if prev_prev_track:
                     dn_track['prev_cur_target'] = target['prev_cur_target']
@@ -315,23 +318,6 @@ class DETRTrackingBase(nn.Module):
             target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
             target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
             target_ind_not_matched_idx = (1 - target_ind_match_matrix.sum(dim=0)).nonzero()[:,0]
-
-            if group_object:
-                target['group_object'] = {}
-                group_object = target['group_object']
-                group_object['labels'] = target['labels'].clone()
-                group_object['boxes'] = target['boxes'].clone()
-                group_object['empty'] = target['empty'].clone()
-                group_object['num_queries'] = self.num_queries
-
-                if 'masks' in target:
-                    group_object['masks'] = target['masks'].clone()
-
-                count = 0
-                for b in range(len(target['boxes'])):
-                    if target['boxes'][b,-1] > 0:
-                        self.update_target(target['group_object'],b+count,update_track_ids=False)
-                        count += 1
 
             # If there is a FN for a cell in the previous frame that divides, then the labels/boxes/masks need to be adjusted for object detection to detect the divided cells separately
             if len(target_ind_not_matched_idx) > 0:
@@ -435,11 +421,6 @@ class DETRTrackingBase(nn.Module):
 
             boxes = prev_out['pred_boxes'].detach()[i, target['prev_ind'][0]]
 
-            # if len(swap_prev_indices[i]) > 0:
-            #     for b in range(len(boxes)):
-            #         if target['prev_ind'][0][b] in swap_prev_indices[i]:
-            #             boxes[b] = torch.cat((boxes[b,4:],boxes[b,:4]),dim=-1)
-
             assert torch.sum(boxes < 0) == 0, 'Bboxes need to have positive values'
 
             if prev_prev_track:
@@ -524,7 +505,7 @@ class DETRTrackingBase(nn.Module):
                         prev_indices, swap_prev_indices = threshold_indices(prev_indices,max_ind=prev_out['pred_logits'].shape[1])
 
                     else:
-                        prev_out, _, prev_features, _, _ = super().forward([t['prev_image'] for t in targets])
+                        prev_out, _, prev_features, _, _, _ = super().forward([t['prev_image'] for t in targets])
                         prev_prev_track = False
 
                         prev_outputs_without_aux = {
@@ -648,6 +629,10 @@ class DETRTrackingBase(nn.Module):
                                             target['labels'] = target['labels'][cur_ind_keep]
                                             target['track_ids'] = target['track_ids'][cur_ind_keep]
 
+                                            if 'masks' in target:
+                                                target['masks'][cur_ind_tgt_box_1] = torch.cat((target['masks'][cur_ind_tgt_box_1,:1],target['masks'][cur_ind_tgt_box_2,:1]))
+                                                target['masks'] = target['masks'][cur_ind_keep]
+
                                         elif track_ids_div[0] in target['track_ids']: # if cell 2 left the chamber but cell 1 is still present
 
                                             cur_ind_tgt_box_1 = (target['track_ids'] == track_ids_div[0]).nonzero()[0][0]
@@ -677,7 +662,12 @@ class DETRTrackingBase(nn.Module):
                                         prev_indices[i] = (prev_ind_out,prev_ind_tgt)
 
                                         if 'masks' in target:
-                                            raise NotImplementedError
+                                            div_masks = prev_cur_target['masks'][prev_box_ind_match_id]
+                                            prev_prev_mask = prev_prev_target['masks'][prev_prev_box_ind]
+                                            combined_mask = utils.combine_div_masks(div_masks,prev_prev_mask)
+
+                                            prev_target['masks'][prev_ind_tgt_box_1_new] = combined_mask
+                                            prev_target['masks'] = prev_target['masks'][prev_ind_tgt_boxes]
 
                             test_early_div = (target['boxes'][:,-1] > 0).any()
                             # we are checking to see if the model predicted two separate cells (object detection instead of one cell) - pre-req: cell must divide in next frame (current frame)
@@ -685,6 +675,7 @@ class DETRTrackingBase(nn.Module):
                                 prev_ind_out_clone = prev_ind_out.clone()
                                 prev_ind_tgt_clone = prev_ind_tgt.clone()
                                 prev_boxes_clone = prev_target['boxes'].clone()
+                                prev_masks_clone = prev_target['masks'].clone()
                                 prev_track_ids_clone = prev_target['track_ids'].clone()
                                 skip = [] 
                                 for idx in range(len(prev_ind_tgt_clone)):
@@ -754,7 +745,16 @@ class DETRTrackingBase(nn.Module):
 
 
                                                 if 'masks' in target:
-                                                    raise NotImplementedError
+                                                    cur_tgt_mask = target['masks'][cur_ind_tgt_box]
+                                                    prev_mask = prev_masks_clone[prev_ind_tgt_box]
+                                                    assert prev_mask[1].max() == 0
+                                                    div_mask = utils.divide_mask(prev_mask,cur_tgt_mask)
+
+                                                    prev_target['masks'][prev_ind_tgt_box] = torch.cat((div_mask[:1],torch.zeros_like(div_mask[:1])))
+                                                    prev_target['masks'] = torch.cat((prev_target['masks'],torch.cat((div_mask[1:],torch.zeros_like(div_mask[:1])))[None]))
+
+                                                    target['masks'] = torch.cat((target['masks'],torch.cat((cur_tgt_mask[1:],torch.zeros_like(cur_tgt_mask[1:])))[None]))
+                                                    target['masks'][cur_ind_tgt_box] = torch.cat((cur_tgt_mask[:1],torch.zeros_like(cur_tgt_mask[:1])))
 
                                                 prev_ind_out[prev_ind_out == prev_ind_out_box] = unused_object_query_indices[match_ind[0]]
                                                 prev_ind_out = torch.cat((prev_ind_out,unused_object_query_indices[match_ind[1]][None]))
@@ -766,7 +766,7 @@ class DETRTrackingBase(nn.Module):
                                                 prev_indices[i] = (prev_ind_out,prev_ind_tgt)
 
                     self.add_track_queries_to_targets(targets, prev_indices, prev_outputs_without_aux,
-                                                    prev_prev_track=prev_prev_track,group_object=self.group_object,dn_track=self.dn_track)
+                                                    prev_prev_track=prev_prev_track,dn_track=self.dn_track)
 
             else: # if we are perforoming object detection, we need to make sure the ground truths are all single cells as divided cells will be grouped as one
                 # print('object detection')
@@ -792,7 +792,7 @@ class DETRTrackingBase(nn.Module):
                     
                     assert (target['boxes'][:,-1] == 0).all()
 
-        out, targets, features, memory, hs  = super().forward(samples, targets, prev_features, group_object=self.group_object, dn_object=self.dn_object, dn_enc=self.dn_enc)
+        out, targets, features, memory, hs, mask_features  = super().forward(samples, targets, prev_features, dn_object=self.dn_object, dn_enc=self.dn_enc)
 
         if self.dn_enc and 'dn_enc' in targets[0]:
 
@@ -811,7 +811,7 @@ class DETRTrackingBase(nn.Module):
                     for s,ind in enumerate(store_div_ind):
                         target['dn_enc']['object_detection_div_mask'][ind] = s + 1
 
-        return out, targets, features, memory, hs, prev_out
+        return out, targets, features, memory, hs, mask_features, prev_out
 
 
 # TODO: with meta classes

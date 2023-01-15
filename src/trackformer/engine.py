@@ -22,16 +22,16 @@ def split_outputs(outputs,indices,new_outputs=None,update_masks=False):
     new_outputs['pred_logits'] = outputs['pred_logits'][:,indices[0]:indices[1]]
     new_outputs['pred_boxes'] = outputs['pred_boxes'][:,indices[0]:indices[1]]
 
-    if update_masks:
-        new_outputs['pred_mask'] = outputs['pred_mask'][:,indices[0]:indices[1]]
+    if 'pred_masks' in outputs:
+        new_outputs['pred_masks'] = outputs['pred_masks'][:,indices[0]:indices[1]]
 
     if 'aux_outputs' in outputs:
         for lid in range(len(outputs['aux_outputs'])):
             new_outputs['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,indices[0]:indices[1]]
             new_outputs['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,indices[0]:indices[1]]
 
-            if update_masks:
-                new_outputs['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,indices[0]:indices[1]]
+            if 'pred_masks' in outputs['aux_outputs'][lid]:
+                new_outputs['aux_outputs'][lid]['pred_masks'] = outputs['aux_outputs'][lid]['pred_masks'][:,indices[0]:indices[1]]
 
     return new_outputs
 
@@ -91,7 +91,10 @@ def update_early_or_late_track_divisions(targets,outputs):
                         target['labels'][target['track_query_match_ids'][p]] = torch.tensor([0,1]).to(outputs['pred_logits'].device)
 
                         if 'masks' in target:
-                            raise NotImplementedError
+                            mask = target['masks'][target['track_query_match_ids'][p]]
+                            prev_mask = target['prev_target']['masks'][target['prev_ind'][1]][p]
+                            combined_mask = utils.combine_div_masks(mask,prev_mask)
+                            target['masks'][target['track_query_match_ids'][p]] = combined_mask
                             
                 elif box[-1] == 0 and test_early_div and pred_logits_track[p,-1] > 0.5:
                     # if model predcitions division, check future frame and see if there is a division
@@ -121,11 +124,14 @@ def update_early_or_late_track_divisions(targets,outputs):
                             target['labels'][target['track_query_match_ids'][p]] = torch.tensor([0,0]).to(outputs['pred_logits'].device)
 
                             if 'masks' in target:
-                                raise NotImplementedError
+                                mask = target['masks'][target['track_query_match_ids'][p]]
+                                fut_mask = target['fut_target']['masks'][fut_box_ind]
+                                div_mask = utils.divide_mask(mask,fut_mask)
+                                target['masks'][target['track_query_match_ids'][p]] = div_mask
 
     return targets
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postprocessors,
+def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loaders: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, args, num_plots=10, interval = 50):
     dataset = 'train'
@@ -149,7 +155,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
     for i,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
         samples = cur_samples
         targets = cur_targets
-
         targets_og = [{},{}]
 
         for t,target in enumerate(targets):
@@ -158,6 +163,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
             targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
             targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
             targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
+            if 'masks' in target:
+                targets_og[t]['masks'] = target['masks'].to(args.device).clone()
+                targets_og[t]['prev_masks'] = prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['prev_prev_masks'] = prev_prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['fut_masks'] = fut_targets[t]['masks'].to(args.device).clone()
 
             target['prev_prev_target'] = prev_prev_targets[t]
             target['prev_prev_image'] = prev_prev_samples.tensors[t]
@@ -180,7 +191,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+        outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -207,7 +218,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
-                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
+                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc','loss_mask_enc','loss_dice_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
                     continue
                 assert (loss_dict_key + '_' + training_method) in weight_dict.keys()
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
@@ -281,34 +292,40 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         for t,target in enumerate(targets):
 
-                targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
-                targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
-                targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
-                targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
+            targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
 
-                target['prev_prev_target'] = prev_prev_targets[t]
-                target['prev_prev_image'] = prev_prev_samples.tensors[t]
+            if 'masks' in target:
+                targets_og[t]['masks'] = target['masks'].to(args.device).clone()
+                targets_og[t]['prev_masks'] = prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['prev_prev_masks'] = prev_prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['fut_masks'] = fut_targets[t]['masks'].to(args.device).clone()
 
-                target['prev_cur_target'] = prev_cur_targets[t]
-                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+            target['prev_prev_target'] = prev_prev_targets[t]
+            target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
-                target['prev_target'] = prev_targets[t]
-                target['prev_image'] = prev_samples.tensors[t]
+            target['prev_cur_target'] = prev_cur_targets[t]
+            target['prev_cur_image'] = prev_cur_samples.tensors[t]
 
-                target['fut_prev_target'] = fut_prev_targets[t]
-                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+            target['prev_target'] = prev_targets[t]
+            target['prev_image'] = prev_samples.tensors[t]
 
-                target['fut_target'] = fut_targets[t]
-                target['fut_image'] = fut_samples.tensors[t]
+            target['fut_prev_target'] = fut_prev_targets[t]
+            target['fut_prev_image'] = fut_prev_samples.tensors[t]
 
-                assert target['image_id'] == prev_prev_targets[t]['image_id']
-                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+            target['fut_target'] = fut_targets[t]
+            target['fut_image'] = fut_samples.tensors[t]
+
+            assert target['image_id'] == prev_prev_targets[t]['image_id']
+            assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
         
 
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+        outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -335,7 +352,7 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
-                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
+                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc','loss_mask_enc','loss_dice_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
                     continue
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
                 # weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
@@ -536,7 +553,7 @@ class pipeline():
                     self.max_cellnb = 0
                     prev_features = None
 
-                outputs, targets, prev_features, memory, hs, prev_outputs = self.model(samples,targets=targets,prev_features=prev_features)
+                outputs, targets, prev_features, memory, hs, mask_features, prev_outputs = self.model(samples,targets=targets,prev_features=prev_features)
 
                 pred_logits = outputs['pred_logits'][0].sigmoid().detach().cpu().numpy()
                 pred_boxes = outputs['pred_boxes'][0].detach()
@@ -928,7 +945,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+            outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
             targets = update_early_or_late_track_divisions(targets,outputs)
 
@@ -979,7 +996,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+            outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
             targets = update_early_or_late_track_divisions(targets,outputs)
 

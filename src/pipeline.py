@@ -48,7 +48,7 @@ def train(args: Namespace) -> None:
     display_worst = False
     run_movie = True
     track= True
-    use_NMS = True
+    use_NMS = False
 
     print(args)
 
@@ -90,7 +90,7 @@ def train(args: Namespace) -> None:
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-    model, criterion, postprocessors = build_model(args)
+    model, criterion = build_model(args)
     model.to(device)
 
     model_without_ddp = model

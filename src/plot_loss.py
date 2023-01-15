@@ -9,8 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '230109_delete_dn_enc_two_stage_dn_track_dab_no_mask'
-# folder = '230105_all_tokens_no_prev_memory_init_enc_embed_two_stage_dn_track_dab_no_mask'
+folder = '230113_mask_matcher_two_stage_dn_enc_dn_track_dab_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -25,7 +24,7 @@ epochs_val = metrics_val['loss'].shape[0]
 
 groups = [None]
 
-training_methods = ['dn_track','dn_object','dn_enc','group_object']
+training_methods = ['dn_track','dn_object','dn_enc','enc']
 
 for training_method in training_methods:
     if 'loss_ce_' + training_method in losses:
@@ -61,7 +60,7 @@ fig,ax = plt.subplots(max(len(groups),2),2,figsize=(10,15))
 min_y = np.inf
 max_y = 0
 for loss in losses:
-    if loss == 'loss' or bool(re.search('\d',loss)):
+    if loss == 'loss' or bool(re.search('\d',loss)) or np.isnan(metrics_train[loss]).all():
         continue
     category = [g in loss for g in groups[1:]]
 
@@ -95,8 +94,8 @@ for g in range(len(groups)):
 plt.savefig(datapath / folder / 'loss_plot_log.png')
 
 
-losses = [loss for loss in losses if loss not in ['loss','loss_mask','loss_dice','loss_ce_enc','loss_bbox_enc','loss_giou_enc']] # Auxillary losses does not have mask / dice loss
-
+losses = [loss for loss in losses if 'mask' not in loss and 'dice' not in loss and loss not in ['loss','loss_ce_enc','loss_bbox_enc','loss_giou_enc']] # Auxillary losses does not have mask / dice loss
+groups.remove('enc')
 
 def plot_aux_losses(losses,metrics_train,metrics_val,groups):
 

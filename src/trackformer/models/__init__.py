@@ -5,9 +5,7 @@ from .backbone import build_backbone
 from .deformable_detr import DeformableDETR, DeformablePostProcess
 from .deformable_transformer import build_deforamble_transformer
 from .detr import DETR, PostProcess, SetCriterion
-from .detr_segmentation import (DeformableDETRSegm, DeformableDETRSegmTracking,
-                                DETRSegm, DETRSegmTracking,
-                                PostProcessPanoptic, PostProcessSegm)
+from .detr_segmentation import (DeformableDETRSegm, DeformableDETRSegmTracking, DETRSegm, DETRSegmTracking)
 from .detr_tracking import DeformableDETRTracking, DETRTracking
 from .matcher import build_matcher
 from .transformer import build_transformer
@@ -39,7 +37,6 @@ def build_model(args):
         'overflow_boxes': args.overflow_boxes,
         'device': device,
         'use_dab': args.use_dab,
-        'group_object': args.group_object,
         'dn_object_l1': args.dn_object_l1,
         'dn_object_l2': args.dn_object_l2,
         'dn_label': args.dn_label,
@@ -47,8 +44,6 @@ def build_model(args):
         'use_div_ref_pts': args.use_div_ref_pts,}
 
     tracking_kwargs = {
-        'track_query_false_positive_prob': args.track_query_false_positive_prob,
-        'track_query_false_negative_prob': args.track_query_false_negative_prob,
         'matcher': matcher,
         'backprop_prev_frame': args.track_backprop_prev_frame,
         'dn_track': args.dn_track,
@@ -61,9 +56,10 @@ def build_model(args):
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,
-        'return_intermediate_masks': args.return_intermediate_masks}
+        'return_intermediate_masks': args.return_intermediate_masks,}
 
     if args.deformable:
+        args.feature_channels = backbone.num_channels
         transformer = build_deforamble_transformer(args)
 
         detr_kwargs['transformer'] = transformer
@@ -159,14 +155,5 @@ def build_model(args):
         args=args,)
     criterion.to(device)
 
-    if args.focal_loss:
-        postprocessors = {'bbox': DeformablePostProcess()}
-    else:
-        postprocessors = {'bbox': PostProcess()}
-    if args.masks:
-        postprocessors['segm'] = PostProcessSegm()
-        if args.dataset == "coco_panoptic":
-            is_thing_map = {i: i <= 90 for i in range(201)}
-            postprocessors["panoptic"] = PostProcessPanoptic(is_thing_map, threshold=0.85)
 
-    return model, criterion, postprocessors
+    return model, criterion

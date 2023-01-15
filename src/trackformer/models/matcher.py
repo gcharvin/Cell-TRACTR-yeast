@@ -6,8 +6,11 @@ import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
+from torch.cuda.amp import autocast
+import torch.nn.functional as F
 
 from ..util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from ..util.misc import point_sample
 
 
 class HungarianMatcher(nn.Module):
@@ -18,8 +21,8 @@ class HungarianMatcher(nn.Module):
     predictions, while the others are un-matched (and thus treated as non-objects).
     """
 
-    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1,
-                 focal_loss: bool = False, focal_alpha: float = 0.25, focal_gamma: float = 2.0):
+    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, cost_mask: float = 1, cost_dice: float = 1,
+                 num_points = 10000, focal_loss: bool = False, focal_alpha: float = 0.25, focal_gamma: float = 2.0,match_masks:bool = False):
         """Creates the matcher
 
         Params:
@@ -33,9 +36,13 @@ class HungarianMatcher(nn.Module):
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
+        self.cost_mask = cost_mask
+        self.cost_dice = cost_dice
         self.focal_loss = focal_loss
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
+        self.match_masks = match_masks
+        self.num_points = num_points
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
     @torch.no_grad()
@@ -69,8 +76,13 @@ class HungarianMatcher(nn.Module):
         # [batch_size * num_queries, num_classes]
         if self.focal_loss:
             out_prob = outputs["pred_logits"]
-            div_out_prob = torch.stack((outputs['pred_logits'][:,:,1],outputs['pred_logits'][:,:,0]),axis=-1)
-            out_prob = torch.cat((out_prob,div_out_prob),axis=1)
+
+            if 'track_queries_mask' in targets[0]:
+                num_tqs = targets[0]['track_queries_mask'].sum()
+                div_out_prob = torch.stack((outputs['pred_logits'][:,:num_tqs,1],outputs['pred_logits'][:,:num_tqs,0]),axis=-1)
+                out_prob = torch.cat((out_prob,div_out_prob),axis=1)
+            else:
+                num_tqs = 0
             
             out_prob = out_prob.flatten(0,1).sigmoid()
             
@@ -80,8 +92,10 @@ class HungarianMatcher(nn.Module):
         # [batch_size * num_queries, 4]
         out_bbox = outputs["pred_boxes"]
         assert torch.sum(torch.isnan(out_bbox)) == 0, 'Nan in boxes before duplication'
-        div_out_bbox = torch.cat((outputs['pred_boxes'][:,:,4:],outputs['pred_boxes'][:,:,:4]),axis=-1)
-        out_bbox = torch.cat((out_bbox,div_out_bbox),axis=1)
+
+        if 'track_queries_mask' in targets[0]:
+            div_out_bbox = torch.cat((outputs['pred_boxes'][:,:num_tqs,4:],outputs['pred_boxes'][:,:num_tqs,:4]),axis=-1)
+            out_bbox = torch.cat((out_bbox,div_out_bbox),axis=1)
         
         out_bbox = out_bbox.flatten(0,1)
 
@@ -123,32 +137,76 @@ class HungarianMatcher(nn.Module):
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[:,:4]),box_cxcywh_to_xyxy(tgt_bbox[:,:4]))
         cost_giou[:,keep] += -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[:,4:]),box_cxcywh_to_xyxy(tgt_bbox[:,4:]))[:,keep]
 
-        
-        # Final cost matrix
         cost_matrix = self.cost_bbox * cost_bbox \
             + self.cost_class * cost_class \
             + self.cost_giou * cost_giou
-        cost_matrix = cost_matrix.view(batch_size, num_queries*2, -1).cpu()
 
-        del cost_bbox
-        del cost_class
-        del cost_giou
+        if self.match_masks and 'pred_masks' in outputs:
+            # for now, matching just first cell, not divisions; following MaskDINO in terms of a batched method
+
+            out_mask = outputs["pred_masks"]
+
+            if 'track_queries_mask' in targets[0]:
+                out_div_mask = torch.cat((outputs["pred_masks"][:,:num_tqs,1:],outputs["pred_masks"][:,:num_tqs,:1]),axis=2)
+                out_mask = torch.cat((out_mask,out_div_mask),axis=1)
+
+            out_mask = out_mask.flatten(0,1)  
+            tgt_mask = torch.cat([target["masks"] for target in targets]).to(out_mask)
+            
+            out_mask = F.interpolate(out_mask, size=tgt_mask.shape[-2:], mode="bilinear", align_corners=False)
+
+            # all masks share the same set of points for efficient matching!
+            if self.num_points < out_mask.shape[-1] * out_mask.shape[-2]:
+                num_points = self.num_points
+            else:
+                num_points = out_mask.shape[-1] * out_mask.shape[-2]
+            point_coords = torch.rand(1, num_points, 2, device=out_mask.device)
+            # get gt labels
+            tgt_mask = point_sample(
+                tgt_mask,
+                point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                align_corners=False,
+            ).squeeze(1)
+
+            out_mask = point_sample(
+                out_mask,
+                point_coords.repeat(out_mask.shape[0], 1, 1),
+                align_corners=False,
+            ).squeeze(1)
+
+            with autocast(enabled=False):
+                out_mask = out_mask.float()
+                tgt_mask = tgt_mask.float()
+                # Compute the focal loss between masks
+                cost_mask = batch_sigmoid_ce_loss_jit(out_mask[:,0], tgt_mask[:,0])
+                cost_mask[:,keep] += batch_sigmoid_ce_loss_jit(out_mask[:,1], tgt_mask[:,1])[:,keep]
+
+                # Compute the dice loss betwen masks
+                cost_dice = batch_dice_loss_jit(out_mask[:,0], tgt_mask[:,0])
+                cost_dice[:,keep] += batch_dice_loss_jit(out_mask[:,1], tgt_mask[:,1])[:,keep]
+
+            cost_matrix += self.cost_mask * cost_mask + self.cost_dice * cost_dice
+
+        
+        # Final cost matrix
+
+        cost_matrix = cost_matrix.view(batch_size, num_queries+num_tqs, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
 
         for i, target in enumerate(targets):
             if 'track_query_match_ids' not in target:
-                cost_matrix[i,cost_matrix.shape[1] // 2:] = np.inf
+                # cost_matrix[i,cost_matrix.shape[1]:] = np.inf
                 continue
 
             prop_i = 0
-            for j in range(cost_matrix.shape[1] // 2):
+            for j in range(num_queries):
                 # if target['track_queries_fal_pos_mask'][j] or target['track_queries_placeholder_mask'][j]:
                 if target['track_queries_fal_pos_mask'][j]:
                     # false positive and palceholder track queries should not
                     # be matched to any target
                     cost_matrix[i, j] = np.inf
-                    cost_matrix[i, j + cost_matrix.shape[1] // 2] = np.inf
+                    cost_matrix[i, j + num_queries] = np.inf
                 elif target['track_queries_mask'][j]:
                     track_query_id = target['track_query_match_ids'][prop_i]
                     prop_i += 1
@@ -156,36 +214,27 @@ class HungarianMatcher(nn.Module):
                     # If the cell tracks to a cell division, we use first prediction and flipped prediction
                     if target['labels'][track_query_id,1] == 0: 
                         save_1 = torch.clone(cost_matrix[i,j,track_query_id + sum(sizes[:i])])
-                        save_2 = torch.clone(cost_matrix[i,j + cost_matrix.shape[1] // 2,track_query_id + sum(sizes[:i])])
+                        save_2 = torch.clone(cost_matrix[i,j + num_queries,track_query_id + sum(sizes[:i])])
 
                         cost_matrix[i, :, track_query_id + sum(sizes[:i])] = np.inf
 
                         cost_matrix[i, j] = np.inf
                         cost_matrix[i, j, track_query_id + sum(sizes[:i])] = save_1
 
-                        cost_matrix[i, j + cost_matrix.shape[1] // 2] = np.inf
-                        cost_matrix[i, j + cost_matrix.shape[1] // 2, track_query_id + sum(sizes[:i])] = save_2
+                        cost_matrix[i, j + num_queries] = np.inf
+                        cost_matrix[i, j + num_queries, track_query_id + sum(sizes[:i])] = save_2
                     # If cells tracks to only one cell, we use only the first prediction
                     else:
                         cost_matrix[i, :, track_query_id + sum(sizes[:i])] = np.inf
                         cost_matrix[i, j] = np.inf
-                        cost_matrix[i, j + cost_matrix.shape[1] // 2] = np.inf
+                        cost_matrix[i, j + num_queries] = np.inf
                         cost_matrix[i, j, track_query_id + sum(sizes[:i])] = -1
-                # New objects cannot predict cell divisions so we ignore the flipped predictions here
-                else:
-                    cost_matrix[i,j + cost_matrix.shape[1] // 2] = np.inf
+                # # New objects cannot predict cell divisions so we ignore the flipped predictions here
+                # else:
+                #     cost_matrix[i,j + cost_matrix.shape[1] // 2] = np.inf
 
         indices = [linear_sum_assignment(c[i])
                    for i, c in enumerate(cost_matrix.split(sizes, -1))]
-
-        # # Meant for debugging purposes only; will check when a flipped division has been matched
-        # if np.sum(indices[0][0] > cost_matrix.shape[1] // 2) + np.sum(indices[1][0] > cost_matrix.shape[1] // 2) > 0:
-        #     a = 0
-
-        for target in targets:
-            if 'track_query_match_ids' not in target:
-                for c in range(cost_matrix.shape[0]):
-                    assert np.sum(indices[c][0] >= cost_matrix.shape[1] // 2) == 0
 
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
                 for i, j in indices]
@@ -196,6 +245,66 @@ def build_matcher(args):
         cost_class=args.set_cost_class,
         cost_bbox=args.set_cost_bbox,
         cost_giou=args.set_cost_giou,
+        cost_mask=args.set_cost_mask,
+        cost_dice=args.set_cost_dice,
         focal_loss=args.focal_loss,
         focal_alpha=args.focal_alpha,
-        focal_gamma=args.focal_gamma,)
+        focal_gamma=args.focal_gamma,
+        match_masks=args.match_masks,
+        num_points=args.num_points)
+
+
+def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
+    """
+    Adapted MaskDINO
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    inputs = inputs.sigmoid()
+    inputs = inputs.flatten(1)
+    numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
+    denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss
+
+
+batch_dice_loss_jit = torch.jit.script(
+    batch_dice_loss
+)  # type: torch.jit.ScriptModule
+
+
+def batch_sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor):
+    """
+    Adapted from MaskDINO
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    Returns:
+        Loss tensor
+    """
+    hw = inputs.shape[1]
+
+    pos = F.binary_cross_entropy_with_logits(
+        inputs, torch.ones_like(inputs), reduction="none"
+    )
+    neg = F.binary_cross_entropy_with_logits(
+        inputs, torch.zeros_like(inputs), reduction="none"
+    )
+
+    loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
+        "nc,mc->nm", neg, (1 - targets)
+    )
+
+    return loss / hw
+
+batch_sigmoid_ce_loss_jit = torch.jit.script(
+    batch_sigmoid_ce_loss
+)  # type: torch.jit.ScriptModule
