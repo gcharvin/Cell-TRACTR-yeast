@@ -137,8 +137,6 @@ def plot_aux_losses(losses,metrics_train,metrics_val,groups):
         plt.savefig(datapath / folder / (f'aux_loss{"_" + group if group is not None else ""}_plot.png'))
 
 plot_aux_losses(losses,metrics_train,metrics_val,groups=groups)
-metrics.remove('rand_FP_track_acc')
-metrics.remove('cells_leaving_track_acc')
 metrics.remove('post_division_track_acc')
 
 # Plot acc

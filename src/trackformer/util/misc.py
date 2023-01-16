@@ -25,7 +25,7 @@ import torchvision
 from torch import Tensor, nn
 from visdom import Visdom
 from pathlib import Path
-from skimage.measure import label
+from torchmetrics.classification import BinaryAveragePrecision
 
 from . import box_ops
 
@@ -1741,10 +1741,15 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
     i: int
     Iteration number
     '''
+    
+    metrics_keys = ['bbox_acc','mask_acc','overall_track_acc','divisions_track_acc','post_division_track_acc']
 
     if i == 0:
-        for metrics_key in acc_dict.keys(): # add the accuracy info; these are two digits; first is # correct; second is total #
-            metrics_dict[metrics_key] = acc_dict[metrics_key]
+        for metrics_key in metrics_keys:
+            if metrics_key in acc_dict.keys(): # add the accuracy info; these are two digits; first is # correct; second is total #
+                metrics_dict[metrics_key] = acc_dict[metrics_key]
+            else:
+                metrics_dict[metrics_key] = np.ones((1,1,2)) * np.nan
 
         for weight_dict_key in weight_dict.keys(): # add the loss info which is a single number
             metrics_dict[weight_dict_key] = (loss_dict[weight_dict_key].detach().cpu().numpy()[None,None] * weight_dict[weight_dict_key]) if weight_dict_key in loss_dict else np.array(np.nan)[None,None]
@@ -1753,8 +1758,11 @@ def update_metrics_dict(metrics_dict:dict,acc_dict:dict,loss_dict:dict,weight_di
             metrics_dict['lr'] = lr
         
     else:
-        for metrics_key in acc_dict.keys():
-            metrics_dict[metrics_key] = np.concatenate((metrics_dict[metrics_key],acc_dict[metrics_key]),axis=1)
+        for metrics_key in metrics_keys:
+            if metrics_key in acc_dict.keys():
+                metrics_dict[metrics_key] = np.concatenate((metrics_dict[metrics_key],acc_dict[metrics_key]),axis=1)
+            else:
+                metrics_dict[metrics_key] = np.concatenate((metrics_dict[metrics_key],np.ones((1,1,2)) * np.nan),axis=1)
 
         for weight_dict_key in weight_dict.keys():
             loss_dict_key_loss = (loss_dict[weight_dict_key].detach().cpu().numpy()[None,None] * weight_dict[weight_dict_key]) if weight_dict_key in loss_dict else np.array(np.nan)[None,None]
@@ -1804,206 +1812,223 @@ def save_metrics_pkl(metrics_dict,output_dir,dataset,epoch):
 
 
 def calc_bbox_acc(outputs,targets, indices, cls_thresh = 0.5, iou_thresh = 0.75):
-    acc = torch.zeros((2),dtype=torch.int32)
+    TP_bbox = TP_mask = 0
+    FN = FP = FP_bbox = FP_mask = 0
+    acc_dict = {}
     for t,target in enumerate(targets):
-        bboxes = target['boxes'].detach().cpu()
+        indices = target['indices']
         pred_logits = outputs['pred_logits'].sigmoid().detach().cpu()[t]
+
+        if target['empty']: # No objects in image so it should be all zero
+            FP += (pred_logits > cls_thresh).sum()
+            continue
+
+        FP += sum([1 for ind in range(pred_logits.shape[0]) if (ind not in ind_out and pred_logits[ind,0] > cls_thresh)])
+
         pred_boxes = outputs['pred_boxes'].detach().cpu()[t]
+        tgt_boxes = target['boxes'].detach().cpu()
 
-        object_detect_only = True if 'track_query_match_ids' not in target else False
-
-        # We are only interestd in calcualting object detection accuracy; not tracking accuracy
-        ind_out,ind_tgt = indices[t]
-        if 'track_queries_mask' in target:
-            num_track = target['track_queries_mask'].sum().cpu()
-            bool_untracked = ~target['track_queries_mask'].cpu()
-        else:
-            num_track = 0 # count the total number of track queries
-            bool_untracked = np.ones((len(bboxes)),dtype=bool)
-
-        bboxes = bboxes[ind_tgt[ind_out >= num_track]]
-
-        pred_logits = pred_logits[bool_untracked]
-        pred_boxes = pred_boxes[bool_untracked]
+        assert len(tgt_boxes) == (~target['track_queries_mask']).sum(), 'This function calculates detection accuracy only; not tracking'
+        assert tgt_boxes[:,4:].sum() == 0, 'All boxes should not contain divisions since only object detection is being done here'
 
         if 'pred_masks' in outputs:
             pred_masks = outputs['pred_masks'].sigmoid().detach().cpu()[t]
-            pred_masks = pred_masks[bool_untracked]
+            tgt_masks = target['masks'].detach().cpu()
 
-        if target['empty']: # No objects in image so it should be all zero
-            acc[1] += (pred_logits > cls_thresh).sum()
-            continue
-        
-        div_keep = bboxes[:,-1] > 0
-        bboxes = torch.cat((bboxes[:,:4],bboxes[div_keep,4:]))
-        num_bboxes = bboxes.shape[0]
-        acc[1] += num_bboxes
+        for ind_out, ind_tgt in indices:
+            if pred_logits[ind_out,0] > cls_thresh:
+                iou = box_ops.generalized_box_iou(
+                    box_ops.box_cxcywh_to_xyxy(pred_boxes[ind_out:ind_out+1,:4]),
+                    box_ops.box_cxcywh_to_xyxy(tgt_boxes[ind_tgt:ind_tgt+1,:4]),
+                    return_iou_only=True)
 
-        for p in range(pred_logits.shape[0]):
-            if pred_logits[p,0] > cls_thresh:
-                match = False
-                for b,bbox in enumerate(bboxes): # For each prediction in pred_logits, check if it matches with a target bbox
-                    iou = box_ops.generalized_box_iou(
-                        box_ops.box_cxcywh_to_xyxy(pred_boxes[p:p+1,:4]),
-                        box_ops.box_cxcywh_to_xyxy(bbox[None]),
-                        return_iou_only=True
-                    )
-                    if iou > iou_thresh:
-                        acc[0] += 1
-                        bboxes = torch.cat((bboxes[:b],bboxes[b+1:]))
-                        match = True
-                        break
-                # bboxes are removed at they are matched; is pred_logit > cls_thresh but does not match to a bbox then it is incorrect
-                if not match:
-                    acc[1] += 1 # Add 1 incorrect for every time it predicts something wrong
+                if iou > iou_thresh:
+                    TP_bbox += 1
+                else:
+                    FP_bbox += 1
 
-            if pred_logits[p,1] > cls_thresh: # can't detect 
-                acc[1] += 1
-                # match = False
-                # for b,bbox in enumerate(bboxes):
-                #     iou = box_ops.generalized_box_iou(
-                #         box_ops.box_cxcywh_to_xyxy(pred_boxes[p:p+1,4:]),
-                #         box_ops.box_cxcywh_to_xyxy(bbox[None]),
-                #         return_iou_only=True
-                #     )
-                #     if iou > iou_thresh:
-                #         acc[0] += 1
-                #         bboxes = torch.cat((bboxes[:b],bboxes[b+1:]))
-                #         match = True
-                #         break
+                if 'pred_masks' in outputs:
+                    mask_iou = box_ops.mask_iou(pred_masks[ind_out:ind_out+1,:1],tgt_masks[ind_tgt:ind_tgt+1,:1])
 
-                # if not match:
-                #     acc[1] += 1 # Add 1 incorrect for every time it predicts something wrong
+                    if mask_iou > iou_thresh:
+                        TP_mask += 1
+                    else:
+                        FP_mask += 1
+            else:
+                FN += 1
 
-    acc = acc[None,None]
+    acc_dict['bbox_acc'] = np.array((TP_bbox,TP_bbox + FN + FP + FP_bbox),dtype=np.int32)[None,None]
 
-    if object_detect_only:
-        return acc, torch.zeros_like(acc)
-    else:
-        return torch.zeros_like(acc), acc
+    if 'pred_masks' in outputs:
+        acc_dict['mask_det_acc'] = np.array((TP_mask,TP_mask + FN + FP + FP_mask ),dtype=np.int32)[None,None]
 
-def calc_track_acc(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
-    num_queries = (~targets[0]['track_queries_mask']).sum().cpu()
-    acc = torch.zeros((2),dtype=torch.int32)
-    div_acc = torch.zeros((2),dtype=torch.int32)
-    track_div_cell_acc = torch.zeros((2),dtype=torch.int32)
-    cells_leaving_acc = torch.zeros((2,),dtype=torch.int32)
-    rand_FP_acc = torch.zeros((2,),dtype=torch.int32)
+    return acc_dict
+
+def calc_AP(outputs,targets,cls_thresh=0.5,iou_thresholds=[0.5]):
+
+    AP_metric = BinaryAveragePrecision(thresholds=None)
+    mAP = torch.zeros((len(targets)))
+
     for t,target in enumerate(targets):
-        if target['track_queries_mask'].sum() == 0:
-            continue
-        pred_logits = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach().cpu()
-        pred_boxes = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach().cpu()
-        track_div_cell = target['track_div_mask'][target['track_queries_TP_mask']].cpu()
+        pred_all_logits = outputs['pred_logits'][t,:,0].detach().cpu().sigmoid()
+        pred_ind = torch.where(pred_all_logits > cls_thresh)[0]
 
-        assert 'cells_leaving_mask' in target
+        pred_logits = pred_all_logits[pred_ind]
+        pred_boxes = outputs['pred_boxes'][t,pred_ind,:4].detach().cpu()
+        tgt_boxes = target['boxes'].detach().cpu()[:,:4]
 
-        # Specifically measures accuracy for cells leaving the frame; ground truth is always 0
-        cell_leaving_pred_logits = outputs['pred_logits'][t][:-num_queries][target['cells_leaving_mask']].sigmoid().detach().cpu()
-        sample_acc = torch.tensor([(cell_leaving_pred_logits[:,0] < cls_thresh).sum(),cell_leaving_pred_logits.shape[0]])
-        cells_leaving_acc += sample_acc
-        acc += sample_acc
+        argmax = torch.argsort(pred_logits)
+        pred_boxes_ord = pred_boxes[argmax]
 
-        # Specifically measures accuracy for the random generated FP track queries; ground truth is always 0
-        if 'rand_FP_mask' in target:
-            FP_pred_logits = outputs['pred_logits'][t][:-num_queries][target['rand_FP_mask']].sigmoid().detach().cpu()
-            sample_acc = torch.tensor([(FP_pred_logits[:,0] < cls_thresh).sum(),FP_pred_logits.shape[0]])
-            rand_FP_acc += sample_acc
-            acc += sample_acc
+        iou_thresholds = [0.5]
+        AP = torch.zeros((len(iou_thresholds)))
+
+        for i,iou_threshold in enumerate(iou_thresholds):
+            labels = torch.zeros((len(pred_logits)))
+            iou = torch.zeros((len(pred_logits)))
+            
+            iou_matrix = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(pred_boxes_ord),box_ops.box_cxcywh_to_xyxy(tgt_boxes),return_iou_only=True)
+
+            for p in range(len(pred_boxes_ord)):
+
+                if (iou_matrix[p] > iou_threshold).sum() > 0:
+                    ind = torch.argmax(iou_matrix[p])
+                    iou[p] = iou_matrix[p,ind]
+                    iou_matrix = torch.cat((iou_matrix[:,:ind],iou_matrix[:,ind+1:]),axis=1)
+                    labels[p] = 1
+
+            if iou_matrix.shape[1] > 0:
+                FP_indices = torch.where(labels == 0)[0]
+                for idx in range(iou_matrix.shape[1]):
+                    if idx < len(FP_indices):
+                        labels[FP_indices[idx]] = 1
+                    else:
+                        labels = torch.cat((labels,torch.ones((1))))
+                        iou = torch.cat((iou,torch.zeros((1))))
+
+            AP[i] = AP_metric(iou,labels)
+
+        mAP[t] = AP.mean()
+
+    return mAP
+
+
+
+
+def calc_track_acc(outputs,targets,cls_thresh=0.5,iou_thresh=0.75):
+    TP = FP = FN = 0
+    div_acc = np.zeros((2),dtype=np.int32)
+    track_div_cell_acc = np.zeros((2),dtype=np.int32)
+    new_cells_acc = np.zeros((2),dtype=np.int32)
+    track_acc_dict = {}
+    for t,target in enumerate(targets):
+        indices = target['indices']
+        pred_logits = outputs['pred_logits'][t].sigmoid().detach().cpu()
+        pred_boxes = outputs['pred_boxes'][t].detach().cpu()
+        tgt_boxes = target['boxes'].detach().cpu()
 
         if target['empty']: # No objects to track
+            FP += (pred_logits[:,0] > cls_thresh).sum()
             continue
 
+        # Coutning False Positives; cells leaving the frame + False Positives added to the frame
+        pred_logits_FPs = pred_logits[~target['track_queries_TP_mask'] * target['track_queries_mask'],0]
+        FP += (pred_logits_FPs > cls_thresh).sum()
+
+        # Calculate accuracy for new objects detected; FPs or TPs
+        for query_id in range(pred_logits.shape[1]):
+            if (~target['track_queries_mask'])[query_id]:
+                if query_id in indices[t][0]:
+                    if pred_logits[query_id,0] > cls_thresh:
+                        ind_loc = torch.where(indices[t][0] == query_id)[0]
+                        iou = box_ops.generalized_box_iou(
+                                box_ops.box_cxcywh_to_xyxy(pred_boxes[query_id,:4].detach().cpu()[None]),
+                                box_ops.box_cxcywh_to_xyxy(tgt_boxes[indices[t][1][ind_loc],:4]),
+                                return_iou_only=True
+                                )
+
+                        if iou > iou_thresh:
+                            TP += 1
+                            new_cells_acc += 1
+                        else:
+                            FP += 1       
+                            new_cells_acc[1] += 1  
+                    else:
+                        FN += 1
+                        new_cells_acc[1] += 1
+                else:
+                    if pred_logits[query_id,0] > cls_thresh:
+                        FP += 1
+
+
+        pred_track_logits = pred_logits[target['track_queries_TP_mask']]
+        pred_track_boxes = pred_boxes[target['track_queries_TP_mask']]
+        track_div_cell = target['track_div_mask'][target['track_queries_TP_mask']].cpu()
+
         box_matching = target['track_query_match_ids'].cpu()
-        bboxes = target['boxes'].detach().cpu()
 
-        acc[1] += target['track_queries_TP_mask'].sum().cpu()
-
-        for p,pred_logit in enumerate(pred_logits):
+        for p,pred_logit in enumerate(pred_track_logits):
             if pred_logit[0] < cls_thresh:
-                # acc[1] += 1  # error having this here
+                FN += 1
                 if track_div_cell[p]:
                     track_div_cell_acc[1] += 1
 
             else:
                 iou = box_ops.generalized_box_iou(
-                        box_ops.box_cxcywh_to_xyxy(pred_boxes[p:p+1,:4]),
-                        box_ops.box_cxcywh_to_xyxy(bboxes[box_matching[p],:4][None]),
+                        box_ops.box_cxcywh_to_xyxy(pred_track_boxes[p:p+1,:4]),
+                        box_ops.box_cxcywh_to_xyxy(tgt_boxes[box_matching[p],:4][None]),
                         return_iou_only=True
                     )
                 
                 if iou > iou_thresh:
-                    acc[0] += 1
+                    TP += 1
                     if track_div_cell[p]:
                         track_div_cell_acc += 1
                 else:
+                    FP += 1
                     if track_div_cell[p]:
                         track_div_cell_acc[1] += 1
 
             # Need to check for divisions
-            if pred_logit[1] > cls_thresh and bboxes[box_matching[p],-1] == 0: # Predicted FP division
-                acc[1] += 1
+            if pred_logit[1] > cls_thresh and tgt_boxes[box_matching[p],-1] == 0: # Predicted FP division
+                FP += 1
                 if track_div_cell[p]:
                     track_div_cell_acc[1] += 1   
                 div_acc[1] += 1           
-            elif pred_logit[1] < cls_thresh and bboxes[box_matching[p],-1] > 0: # Predicted FN division
-                acc[1] += 1
+            elif pred_logit[1] < cls_thresh and tgt_boxes[box_matching[p],-1] > 0: # Predicted FN division
+                FN += 1
                 if track_div_cell[p]:
                     track_div_cell_acc[1] += 1
                 div_acc[1] += 1           
-            elif pred_logit[1] > cls_thresh and bboxes[box_matching[p],-1] > 0: # Correctly predictly TP division
+            elif pred_logit[1] > cls_thresh and tgt_boxes[box_matching[p],-1] > 0: # Correctly predictly TP division
                 iou = box_ops.generalized_box_iou(
-                        box_ops.box_cxcywh_to_xyxy(pred_boxes[p:p+1,4:]),
-                        box_ops.box_cxcywh_to_xyxy(bboxes[box_matching[p],4:][None]),
+                        box_ops.box_cxcywh_to_xyxy(pred_track_boxes[p:p+1,4:]),
+                        box_ops.box_cxcywh_to_xyxy(tgt_boxes[box_matching[p],4:][None]),
                         return_iou_only=True
                     )
                 # Divided cells were not accounted above so we add one to correct & total column
                 if iou > iou_thresh:
-                    acc += 1
+                    TP += 1
                     if track_div_cell[p]:
                         track_div_cell_acc += 1
                     div_acc += 1
                 else:
+                    FP += 1
                     if track_div_cell[p]:
                         track_div_cell_acc[1] += 1
                     div_acc[1] += 1
 
-            elif pred_logit[1] > cls_thresh and bboxes[box_matching[p],-1] == 0: # Predicted TN correctly
+            elif pred_logit[1] > cls_thresh and tgt_boxes[box_matching[p],-1] == 0: # Predicted TN correctly
                 if track_div_cell[p]:
                     track_div_cell_acc += 1
 
-        # Random FPs get added to track queries which will always have no target to track to
-        FPs = outputs['pred_logits'][t][~target['track_queries_TP_mask'] * target['track_queries_mask']].sigmoid().detach().cpu()
-        acc[1] += (FPs > cls_thresh).sum()
+    track_acc_dict['overall_track_acc'] = np.array((TP,TP + FN + FP),dtype=np.int32)[None,None]
+    track_acc_dict['divisions_track_acc'] = div_acc[None,None]
+    track_acc_dict['post_division_track_acc'] = track_div_cell_acc[None,None]
+    track_acc_dict['new_cells_track_acc'] = new_cells_acc[None,None]
 
-    return acc[None,None], div_acc[None,None], track_div_cell_acc[None,None], cells_leaving_acc[None,None], rand_FP_acc[None,None]
+    return track_acc_dict
 
-def calc_object_query_FP(outputs,targets,indices,cls_thresh=0.5,iou_thresh=0.75):
-    acc = torch.zeros((2),dtype=torch.int32)
-    if 'track_query_match_ids' in targets[0]:
-        num_queries = (~targets[0]['track_queries_mask']).sum().cpu()
-        
-        for t,target in enumerate(targets):
-            bboxes = target['boxes'].detach().cpu()
-            query_ids = torch.where((outputs['pred_logits'][t,:,0] > cls_thresh))[0]
-            object_query_ids = torch.tensor([query_id for query_id in query_ids if query_id >= outputs['pred_logits'].shape[1] - num_queries]).cpu()
-            for object_query_id in object_query_ids:
-                if object_query_id not in indices[t][0]:
-                    acc[1] += 1
-                else:
-                    ind_loc = torch.where(indices[t][0] == object_query_id)[0]
-                    iou = box_ops.generalized_box_iou(
-                            box_ops.box_cxcywh_to_xyxy(outputs['pred_boxes'][t,object_query_id,:4].detach().cpu()[None]),
-                            box_ops.box_cxcywh_to_xyxy(bboxes[indices[t][1][ind_loc],:4]),
-                            return_iou_only=True
-                            )
-
-                    if iou > iou_thresh:
-                        acc += 1
-                    else:
-                        acc[1] += 1
-
-    return acc[None,None]
 
 def combine_div_boxes(box, prev_box):
 

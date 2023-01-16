@@ -13,7 +13,7 @@ from ..util import box_ops
 from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
                          interpolate, is_dist_avail_and_initialized, MLP,combine_div_masks,divide_mask,
                          nested_tensor_from_tensor_list, sigmoid_focal_loss,threshold_indices,
-                         calc_bbox_acc, calc_track_acc,combine_div_boxes,calc_iou,divide_box,calc_object_query_FP)
+                        combine_div_boxes,calc_iou,divide_box,)
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection. """
@@ -422,6 +422,9 @@ class SetCriterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         indices, targets = threshold_indices(indices,targets,max_ind=N)
 
+        for target,ind in zip(targets,ind):
+            target['indices'] = ind
+
         for i, (target,(ind_out,ind_tgt)) in enumerate(zip(targets,indices)):
 
             if 'object_detection_div_mask' in target:
@@ -619,25 +622,6 @@ class SetCriterion(nn.Module):
             if sizes[t] != 0 and 'track_div_mask' in target:
                 track_div[sum(sizes[:t]):sum(sizes[:t+1])] = target['track_div_mask'][indices[t][0]]
 
-        # Compute the segmentation and tracking metrics
-        cls_threshold = 0.5
-        iou_threshold = 0.75
-        if return_bbox_track_acc:
-            metrics = {}
-            bbox_det_only_acc, bbox_FN_acc = calc_bbox_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['overall_object_det_acc'] = bbox_det_only_acc + bbox_FN_acc
-            metrics['no_tracking_object_det_acc'] = bbox_det_only_acc
-            metrics['untracked_object_det_acc'] = bbox_FN_acc
-            track_acc, div_acc, track_post_div_acc, cells_leaving_acc, rand_FP_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['track_queries_only_track_acc'] = track_acc
-            metrics['divisions_track_acc'] = div_acc
-            metrics['post_division_track_acc'] = track_post_div_acc
-            metrics['cells_leaving_track_acc'] = cells_leaving_acc
-            metrics['rand_FP_track_acc'] = rand_FP_acc
-            object_query_FP_track_acc = calc_object_query_FP(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['object_query_FP_track_acc'] = object_query_FP_track_acc
-            metrics['overall_track_acc'] = track_acc + object_query_FP_track_acc
-
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
@@ -711,10 +695,7 @@ class SetCriterion(nn.Module):
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
-        if return_bbox_track_acc:
-            return losses, metrics
-        else:
-            return losses
+        return losses
 
 
 class PostProcess(nn.Module):

@@ -54,7 +54,7 @@ def calc_loss_for_training_methods(training_method:str,
     if epoch > 10:
         targets_TM = update_early_or_late_track_divisions(targets_TM,outputs_TM)
 
-    loss_dict_TM = criterion(outputs_TM, targets_TM,return_bbox_track_acc=False)
+    loss_dict_TM = criterion(outputs_TM, targets_TM)
 
     return outputs_TM, loss_dict_TM, groups
 
@@ -211,7 +211,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if epoch > 10:
             targets = update_early_or_late_track_divisions(targets,outputs)
 
-        loss_dict, acc_dict = criterion(outputs, targets)
+        loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
         loss_dict_keys = list(loss_dict.keys())
@@ -241,6 +241,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             lr = np.zeros((1,len(optimizer.param_groups)))
             for p,param_group in enumerate(optimizer.param_groups):
                 lr[0,p] = param_group['lr']
+
+        # Compute the segmentation and tracking metrics
+        cls_threshold = 0.5
+        iou_threshold = 0.75
+        if 'track_query_match_ids' in targets[0]:
+            acc_dict = utils.calc_track_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+        else:
+            acc_dict = utils.calc_bbox_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i,lr)
 
@@ -360,6 +368,14 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
         # weight_dict['loss'] = 1
+
+        # Compute the segmentation and tracking metrics
+        cls_threshold = 0.5
+        iou_threshold = 0.75
+        if 'track_query_match_ids' in targets[0]:
+            acc_dict = utils.calc_track_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+        else:
+            acc_dict = utils.calc_bbox_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
@@ -949,7 +965,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
 
             targets = update_early_or_late_track_divisions(targets,outputs)
 
-            loss_dict, acc_dict = criterion(outputs, targets)
+            loss_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -1000,7 +1016,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
 
             targets = update_early_or_late_track_divisions(targets,outputs)
 
-            loss_dict, acc_dict = criterion(outputs, targets)
+            loss_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)

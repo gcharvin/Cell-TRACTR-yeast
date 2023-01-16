@@ -77,7 +77,7 @@ class HungarianMatcher(nn.Module):
         if self.focal_loss:
             out_prob = outputs["pred_logits"]
 
-            if 'track_queries_mask' in targets[0]:
+            if 'track_query_match_ids' in targets[0]:
                 num_tqs = targets[0]['track_queries_mask'].sum()
                 div_out_prob = torch.stack((outputs['pred_logits'][:,:num_tqs,1],outputs['pred_logits'][:,:num_tqs,0]),axis=-1)
                 out_prob = torch.cat((out_prob,div_out_prob),axis=1)
@@ -93,7 +93,7 @@ class HungarianMatcher(nn.Module):
         out_bbox = outputs["pred_boxes"]
         assert torch.sum(torch.isnan(out_bbox)) == 0, 'Nan in boxes before duplication'
 
-        if 'track_queries_mask' in targets[0]:
+        if 'track_query_match_ids' in targets[0]:
             div_out_bbox = torch.cat((outputs['pred_boxes'][:,:num_tqs,4:],outputs['pred_boxes'][:,:num_tqs,:4]),axis=-1)
             out_bbox = torch.cat((out_bbox,div_out_bbox),axis=1)
         
@@ -146,7 +146,7 @@ class HungarianMatcher(nn.Module):
 
             out_mask = outputs["pred_masks"]
 
-            if 'track_queries_mask' in targets[0]:
+            if 'track_query_match_ids' in targets[0]:
                 out_div_mask = torch.cat((outputs["pred_masks"][:,:num_tqs,1:],outputs["pred_masks"][:,:num_tqs,:1]),axis=2)
                 out_mask = torch.cat((out_mask,out_div_mask),axis=1)
 

@@ -97,3 +97,19 @@ def masks_to_boxes(masks):
     y_min = y_mask.masked_fill(~(masks.bool()), 1e8).flatten(1).min(-1)[0]
 
     return torch.stack([x_min, y_min, x_max, y_max], 1)
+
+
+def mask_iou(inputs, targets):
+    """
+    Compute the IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    intersection = (inputs * targets).sum(1)
+    union = (inputs.sum(-1) + targets.sum(-1) - intersection)
+    iou = intersection / union
+    return iou

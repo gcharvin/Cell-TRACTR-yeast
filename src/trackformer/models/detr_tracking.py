@@ -152,9 +152,6 @@ class DETRTrackingBase(nn.Module):
             num_fps_rand = torch.randint(0,max(3-max(num_FPs),1),(1,)).item()
             num_FPs += num_fps_rand 
 
-        # if return_FPs:
-        #     return num_FPs
-        # else:
         for t,target in enumerate(targets):
             target['num_FPs'] = num_FPs[t]
 
@@ -196,11 +193,6 @@ class DETRTrackingBase(nn.Module):
             random_false_out_ind.append(random_false_out_idx)
 
         target['prev_ind'][0] = torch.tensor(target['prev_ind'][0].tolist() + random_false_out_ind).long()
-
-        target['rand_FP_mask'] = torch.cat([
-            torch.zeros_like(target['target_ind_matching']).bool().to(self.device),
-            torch.tensor([True, ] * len(random_false_out_ind)).bool().to(self.device)
-        ])
 
         target['target_ind_matching'] = torch.cat([
             target['target_ind_matching'],
@@ -291,9 +283,6 @@ class DETRTrackingBase(nn.Module):
         if dn_track:
             self.calc_num_FPs([target['dn_track'] for target in targets])
             assert sum(['num_FPs' in target['dn_track'] for target in targets]) == len(targets), 'False Positives were not properly added to dn_target '
-            # for i,target in enumerate(targets):
-            #     target['dn_track']['num_FPs'] = num_FPs[i]
-
             
         for i, target in enumerate(targets):
 
@@ -315,7 +304,6 @@ class DETRTrackingBase(nn.Module):
             # match track ids between frames
             target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
             target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
-            target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
             target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
             target_ind_not_matched_idx = (1 - target_ind_match_matrix.sum(dim=0)).nonzero()[:,0]
 
@@ -341,7 +329,6 @@ class DETRTrackingBase(nn.Module):
                 # target['track_ids'] has change since FP divided cells have been separated into two boxes
                 target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(target['track_ids'])
                 target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
-                target['cells_leaving_mask'] = torch.cat((~target_ind_match_matrix.any(dim=1),(torch.tensor([False, ] * target['num_FPs'])).bool().to(self.device)))
                 target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
             # Add random false positives
