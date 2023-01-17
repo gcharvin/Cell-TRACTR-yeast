@@ -27,7 +27,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '230109_two_stage_dn_enc_dn_track_dab_no_mask'
+    modelname = '230113_mask_matcher_two_stage_dn_enc_dn_track_dab_mask'
     
     args.dn_track = False
     args.dn_object = False
@@ -47,8 +47,9 @@ def train(args: Namespace) -> None:
 
     display_worst = False
     run_movie = True
-    track= True
-    use_NMS = False
+    track = True
+    display_masks = True
+    use_NMS = True
 
     print(args)
 
@@ -172,7 +173,7 @@ def train(args: Namespace) -> None:
 
     if run_movie:
         model.evaluate_dataset_with_no_data_aug = False
-        Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS)
+        Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
         Pipeline.forward()
     
     if display_worst:

@@ -391,11 +391,13 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
 @torch.no_grad()
 class pipeline():
-    def __init__(self,model, fps, device, output_dir, args, track=True, use_NMS=False):
+    def __init__(self,model, fps, device, output_dir, args, track=True, use_NMS=False, display_masks=False):
         self.model = model
         self.model.tracking()
 
         self.use_NMS = use_NMS
+        self.masks = display_masks and args.masks
+
         self.predictions_folder = 'predictions' if not self.use_NMS else 'predictions_NMS'
 
         self.output_dir = output_dir
@@ -423,7 +425,6 @@ class pipeline():
         if args.two_stage:
             (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
 
-        self.display_masks = False
         self.oq_div = True # Can object queries detect divisions
 
         self.display_decoder_aux = True
@@ -485,8 +486,8 @@ class pipeline():
             ind = np.where(self.track_indices==div_ind)[0][0]
 
             self.max_cellnb += 1             
-            self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add 1 so the mother cell remains same color
-            self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:]))
+            self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add daughter cellnb after mother cellnb
+            self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:])) # order doesn't matter here since they are the same track indices
 
             self.div_track[ind:ind+2] = div_ind # we add 1 because div_track is set as np.zeros so an ind of 0 would blend in with the starting point
 
@@ -498,14 +499,6 @@ class pipeline():
             
             assert np.max(self.cells) >= self.max_cellnb
             self.max_cellnb = np.max(self.cells)
-
-
-    def remove_faulty_divisions(self):
-        # Remove div predictions where there is no prediction for the first box; the model should have learned to not do this
-        for div_ind in self.div_indices:
-            if div_ind not in self.track_indices:
-                print(f'div_ind - {div_ind} being removed because it"s not in track_indices - {self.track_indices}')
-                self.div_indices = self.div_indices[self.div_indices != div_ind ]
 
     def update_div_boxes(self,boxes,masks=None):
         # boxes where div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
@@ -519,7 +512,7 @@ class pipeline():
             if masks is not None:
                 masks[div_ids[1],:1] = masks[div_ids[0],1:] 
 
-        return boxes
+        return boxes, masks
 
     def NMS(self, pred_boxes, keep, keep_div):
 
@@ -559,12 +552,12 @@ class pipeline():
             for i, fp in enumerate(tqdm(fps_ROI)):
 
                 img = PIL.Image.open(fp,mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB')
-                previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for easy analysis
+                previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for analysis later
 
                 samples = self.normalize(img)[0][None]
                 samples = samples.to(self.device)
 
-                if not self.track: # should we set prev_features as None for object detection? --> this means it can't see the previous image features
+                if not self.track: # If object detction only, we don't feed information from the previous frame
                     targets = [{}]
                     self.max_cellnb = 0
                     prev_features = None
@@ -576,11 +569,7 @@ class pipeline():
 
                 keep = (pred_logits[:,0] > self.threshold)
                 keep_div = (pred_logits[:,1] > self.threshold)
-
-                #### consider updating this code; particular for object detection ####
-                if not self.oq_div:
-                    self.keep_div[-self.num_queries:] = False
-                ####
+                keep_div[-self.num_queries:] = False # disregard any divisions predicted by object queries; model should have learned not to do this anyways
 
                 if self.use_NMS and len(keep) > self.num_queries and keep[-self.num_queries:].sum() > 0:
                     keep, keep_div = self.NMS(pred_boxes, keep, keep_div)
@@ -595,14 +584,9 @@ class pipeline():
                 if self.display_object_query_boxes and keep[-self.num_queries:].sum() > 0:
                     self.update_query_box_locations(pred_boxes,keep,keep_div)
 
-                if (pred_logits[~keep,1] > self.threshold).sum() > 0:
-                    print('At least one query track/detected a cell in the second box but not the first')
-
                 if sum(keep) > 0:
                     self.track_indices = keep.nonzero()[0] # Get query indices (object or track) where a cell was detected / tracked; this is used to create track queries for next  frame
                     self.div_indices = keep_div.nonzero()[0] # Get track query indices where a cell division was tracked; object queries should not be able to detect divisions
-
-                    self.remove_faulty_divisions()
 
                     if pred_logits.shape[0] > self.num_queries: # If track queries are fed to the model
                         tq_keep = pred_logits[:len(prevcells),0] > self.threshold
@@ -613,12 +597,12 @@ class pipeline():
                     self.split_up_divided_cells()
 
                     targets[0]['track_query_hs_embeds'] = outputs['hs_embed'][0,self.track_indices] # For div_indices, hs_embeds will be the same; no update
-                    boxes = pred_boxes[self.track_indices] # For div_indices, the boxes will be repeate and will properly updated below
+                    boxes = pred_boxes[self.track_indices] # For div_indices, the boxes will be repeated and will properly updated below
 
-                    if self.display_masks and 'pred_masks' in outputs:
-                        masks = outputs['pred_masks'][0,self.track_indices].sigmoid()
+                    if self.masks:
+                        masks = outputs['pred_masks'][0,self.track_indices].sigmoid().detach()
                     
-                    boxes = self.update_div_boxes(boxes,masks)
+                    boxes,masks = self.update_div_boxes(boxes,masks)
                     boxes = boxes[:,:4] # only one cell is tracked at a time
         
                     if masks is not None: # gets rid of the division mask which we rearrange above
@@ -626,7 +610,7 @@ class pipeline():
 
                     targets[0]['track_query_boxes'] = boxes
 
-                    if i == 0:
+                    if i == 0: # self.new_cells is used to visually highlight errors specifically for the mother machine. This is because no new cells will ever appear so I know this is an erorr
                         self.new_cells = None
 
                 else:
@@ -832,7 +816,7 @@ class pipeline():
             crf = 20
             verbose = 1
             method = 'track' if self.track else 'object_detection'
-            name_mask = 'mask_' if self.display_masks else ''
+            name_mask = 'mask_' if self.masks else ''
             filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
             print(filename)
             height, width, _ = self.color_stack[0].shape
