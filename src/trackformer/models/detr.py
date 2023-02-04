@@ -11,9 +11,9 @@ from scipy.optimize import linear_sum_assignment
 
 from ..util import box_ops
 from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
-                         interpolate, is_dist_avail_and_initialized,
+                         interpolate, is_dist_avail_and_initialized, MLP,combine_div_masks,divide_mask,
                          nested_tensor_from_tensor_list, sigmoid_focal_loss,threshold_indices,
-                         calc_bbox_acc, calc_track_acc,combine_div_boxes,calc_iou,divide_box,calc_object_query_FP)
+                        combine_div_boxes,calc_iou,divide_box,)
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection. """
@@ -241,19 +241,23 @@ class SetCriterion(nn.Module):
         #     if len(swap_ind) > 0:
         #         target_classes_onehot[idx,swap_ind] = torch.flip(target_classes_onehot[idx,swap_ind],dims=[0,1])
 
-        weights = torch.ones((src_logits.shape)).to('cuda')
+        weights = torch.ones((src_logits.shape)).to(self.device)
         weights[target_classes_onehot[:,:,1] == 1.] = self.args.div_loss_coef
 
-        #### need update code. Current method is really confusing
-        #### This tells me which cells divided from frame t-2 to t-1 which we are trying to track from frame t-1 to t
-        if not two_stage:
-            for i in range(len(targets)):
-                track_ind = torch.tensor([int(ind) for ind in indices[i][0] if ind < src_logits.shape[1] - self.args.num_queries])
-                tgt_ind = indices[i][1][indices[i][0].unsqueeze(1).eq(track_ind).nonzero()[:,0]]
+        # could scrap below. a lot of work for potentially any improvment if any
+        # #### need update code. Current method is really confusing
+        # #### This tells me which cells divided from frame t-2 to t-1 which we are trying to track from frame t-1 to t
+        # if not two_stage:
+        #     for i in range(len(targets)):
+        #         track_ind = torch.tensor([int(ind) for ind in indices[i][0] if ind < src_logits.shape[1] - self.args.num_queries])
+        #         tgt_ind = indices[i][1][indices[i][0].unsqueeze(1).eq(track_ind).nonzero()[:,0]]
 
-                if len(track_ind) > 0: 
-                    weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
-        else:
+        #         if len(track_ind) > 0: 
+        #             weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
+        # else:
+        #     weights[:,:,1] = 0
+
+        if two_stage:
             weights[:,:,1] = 0
 
         loss_ce = sigmoid_focal_loss(
@@ -339,11 +343,9 @@ class SetCriterion(nn.Module):
 
         src_masks = outputs["pred_masks"]
 
-        src_masks = torch.cat((src_masks,torch.cat((src_masks[:,:,1:],src_masks[:,:,:1]),axis=2)),axis=1)
-
         target_masks = [t["masks"][i] for t, (_, i) in zip(targets, indices)]
 
-        target_masks = torch.cat(target_masks,axis=0).to(src_masks)
+        target_masks = torch.cat(target_masks,axis=0).to(self.device)
         target_masks,_ = nested_tensor_from_tensor_list(target_masks).decompose()
 
         src_masks = src_masks[src_idx]
@@ -355,38 +357,31 @@ class SetCriterion(nn.Module):
         # upsample predictions to the target size
         src_masks = interpolate(src_masks, size=target_masks.shape[-2:],
                                     mode="bilinear", align_corners=False)
-        division_ind = torch.cat([target['boxes'][:,-1] > 0 for target in targets if target['boxes'][0,0] > 0])
+
+        division_ind = target_masks[:,1].sum(-1).sum(-1) > 0
 
         sizes = [len(target['labels']) for target in targets]
 
-        weights_mask = torch.ones((src_masks.shape)).to('cuda')
+        weights_mask = torch.ones((src_masks.shape)).to(self.device)
         weights_mask[division_ind] *= self.args.div_loss_coef # increase weight for divisions prev to current        
         weights_mask[~division_ind,1] = 0 # You don't care about the second prediction if the cell did not divide
         weights_mask[track_div] *= self.args.track_div_loss_coef # increase weight for divided cells that are using the same track query
-
-        for t in range(len(targets)):
-            if not targets[t]['empty']:
-                mask_all_cells = torch.sum(torch.sum(target_masks[sum(sizes[:t]):sum(sizes[:t+1])],axis=0),axis=0)
-                assert mask_all_cells.max() <= 1
-                assert mask_all_cells.min() >= 0
-                weights_mask[sum(sizes[:t]):sum(sizes[:t+1]),:,mask_all_cells == 1] *= self.args.mask_weight_cells_coef
-
         weights_mask[target_masks > 0] *= self.args.mask_weight_target_cell_coef
 
         weights_mask = weights_mask.flatten(1)
 
-        weights_dice = torch.ones((src_masks.shape)).to('cuda')
+        weights_dice = torch.ones((src_masks.shape)).to(self.device)
         weights_dice[~division_ind,1] = 0 # You don't care about the second prediction
         weights_dice = weights_dice.flatten(1)
 
         src_masks = src_masks.flatten(1)
 
-        target_masks = target_masks.flatten(1)
+        target_masks = target_masks.flatten(1).float()
 
         losses = {
             "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes, weights_mask,
              alpha=self.focal_alpha, gamma=self.focal_gamma),
-            "loss_dice": dice_loss(src_masks.sigmoid(), target_masks, num_boxes)
+            "loss_dice": dice_loss(src_masks.sigmoid()*weights_dice, target_masks, num_boxes)
         }
         return losses
 
@@ -431,12 +426,17 @@ class SetCriterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         indices, targets = threshold_indices(indices,targets,max_ind=N)
 
+        # Indicies are saved in targets for calcualting object detction / tracking accuracy
+        for target,ind in zip(targets,indices):
+            target['indices'] = indices
+
         for i, (target,(ind_out,ind_tgt)) in enumerate(zip(targets,indices)):
 
             if 'object_detection_div_mask' in target:
                 ind_out_clone = ind_out.clone()
                 ind_tgt_clone = ind_tgt.clone()
-                boxes_clone = target['boxes']
+                boxes_clone = target['boxes'].clone()
+                masks_clone = target['masks'].clone()
                 track_ids_clone = target['track_ids']
                 object_detection_div_mask = target['object_detection_div_mask'].clone()
                 skip = []
@@ -485,7 +485,7 @@ class SetCriterion(nn.Module):
 
                         assert iou_combined[max_ind] <= 1 and iou_combined[max_ind] >= 0 and iou <= 1 and iou >= 0
 
-                        if iou_combined[max_ind] - iou > 0:
+                        if iou_combined[max_ind] - iou > 0 and iou_combined[max_ind] > 0.5:
 
                             query_id = unused_object_query_indices[max_ind]
                             
@@ -520,7 +520,13 @@ class SetCriterion(nn.Module):
                             assert len(target['boxes']) == len(target['labels'])
 
                             if 'masks' in target:
-                                raise NotImplementedError
+                                mask_1 = masks_clone[ind_tgt_box_1][:1]
+                                mask_2 = masks_clone[ind_tgt_box_2][:1]
+                                sep_mask = torch.cat((mask_1,mask_2),axis=0)
+                                prev_mask = target['prev_target']['masks'][prev_box_ind]
+                                combined_mask = combine_div_masks(sep_mask,prev_mask)
+                                target['masks'][ind_tgt_box_1_new] = combined_mask
+                                target['masks'] = target['masks'][ind_tgt_boxes]
 
                             indices[i] = (ind_out,ind_tgt)
 
@@ -539,11 +545,12 @@ class SetCriterion(nn.Module):
                 pred_boxes = outputs['pred_boxes'].detach()
                 ind_tgt_clone = ind_tgt.clone()
                 ind_out_clone = ind_out.clone()
-                boxes = target['boxes'].clone()
+                boxes_clone = target['boxes'].clone()
+                masks_clone = target['masks'].clone()
                 for idx in range(len(ind_tgt)):
                     if (~target['track_queries_mask'])[ind_out_clone[idx]] and target['object_detection_div_mask'][ind_tgt_clone[idx]] == 0.: # check that we are looking at non-tracked cells
 
-                        box = boxes[ind_tgt_clone[idx]]
+                        box = boxes_clone[ind_tgt_clone[idx]]
 
                         fut_prev_boxes = target['fut_prev_target']['boxes']
                         box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
@@ -578,7 +585,7 @@ class SetCriterion(nn.Module):
 
                                     assert iou_div <= 1 and iou_div >= 0 and iou <= 1 and iou >= 0
 
-                                    if iou_div - iou > 0:
+                                    if iou_div - iou > 0 and iou_div > 0.5:
                                         target['boxes'][ind_tgt_clone[idx]] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
                                         target['boxes'] = torch.cat((target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
 
@@ -586,7 +593,12 @@ class SetCriterion(nn.Module):
                                         target['labels'] = torch.cat((target['labels'],torch.tensor([0,1])[None,].to(self.device)))
 
                                         if 'masks' in target:
-                                            raise NotImplementedError
+                                            mask = masks_clone[ind_tgt_clone[idx]]
+                                            fut_mask = target['fut_target']['masks'][fut_box_ind]
+                                            div_mask = divide_mask(mask,fut_mask)
+
+                                            target['masks'][ind_tgt_clone[idx]] = torch.cat((div_mask[:1],torch.zeros_like(div_mask[:1])))
+                                            target['masks'] = torch.cat((target['masks'],torch.cat((div_mask[1:],torch.zeros_like(div_mask[:1])))[None]))
 
                                         ind_out[ind_out == ind_out_clone[idx]] = torch.tensor([unused_object_query_indices[match_ind[0]]])
                                         ind_out = torch.cat((ind_out,torch.tensor([unused_object_query_indices[match_ind[1]]])))
@@ -611,28 +623,9 @@ class SetCriterion(nn.Module):
         sizes = [len(target['labels']) - int(target["empty"]) for target in targets] 
         track_div = torch.zeros((int(num_boxes))).bool()
 
-        for t,target in enumerate(targets):
-            if sizes[t] != 0 and 'track_div_mask' in target:
-                track_div[sum(sizes[:t]):sum(sizes[:t+1])] = target['track_div_mask'][indices[t][0]]
-
-        # Compute the segmentation and tracking metrics
-        cls_threshold = 0.5
-        iou_threshold = 0.75
-        if return_bbox_track_acc:
-            metrics = {}
-            bbox_det_only_acc, bbox_FN_acc = calc_bbox_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['overall_object_det_acc'] = bbox_det_only_acc + bbox_FN_acc
-            metrics['no_tracking_object_det_acc'] = bbox_det_only_acc
-            metrics['untracked_object_det_acc'] = bbox_FN_acc
-            track_acc, div_acc, track_post_div_acc, cells_leaving_acc, rand_FP_acc = calc_track_acc(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['track_queries_only_track_acc'] = track_acc
-            metrics['divisions_track_acc'] = div_acc
-            metrics['post_division_track_acc'] = track_post_div_acc
-            metrics['cells_leaving_track_acc'] = cells_leaving_acc
-            metrics['rand_FP_track_acc'] = rand_FP_acc
-            object_query_FP_track_acc = calc_object_query_FP(outputs,targets,indices,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
-            metrics['object_query_FP_track_acc'] = object_query_FP_track_acc
-            metrics['overall_track_acc'] = track_acc + object_query_FP_track_acc
+        # for t,target in enumerate(targets):
+        #     if sizes[t] != 0 and 'track_div_mask' in target:
+        #         track_div[sum(sizes[:t]):sum(sizes[:t+1])] = target['track_div_mask'][indices[t][0]]
 
         # Compute all the requested losses
         losses = {}
@@ -673,6 +666,7 @@ class SetCriterion(nn.Module):
             for b,bin_target in enumerate(bin_targets):
                 bin_target['labels'] = targets[b]['labels'].clone()
                 bin_target['boxes'] = targets[b]['boxes'].clone()
+                bin_target['masks'] = targets[b]['masks'].clone()
                 bin_target['empty'] = targets[b]['empty'].clone()
                 # if 'track_query_match_ids' in bin_target:
                 #     bin_target.pop('track_query_match_ids')
@@ -686,18 +680,16 @@ class SetCriterion(nn.Module):
                     assert (bin_target['labels'][0:,0] == 0).all() and (bin_target['labels'][0:,1] == 1).all()
                     assert (bin_target['boxes'][:,-1] == 0).all()
 
-            enc_outputs['pred_boxes'] = torch.cat((enc_outputs['pred_boxes'],torch.zeros_like(enc_outputs['pred_boxes']).to(self.device)),axis=-1)
-
             num_boxes = sum(len(t["labels"]) for t in bin_targets) - sum(t["empty"] for t in bin_targets)
             track_div = torch.zeros((num_boxes)).bool()
 
             indices = self.matcher(enc_outputs, bin_targets)
 
             # should remove this line in future 
-            indices, targets = threshold_indices(indices,targets,max_ind=N)
+            indices, bin_target = threshold_indices(indices,bin_target,max_ind=N)
             
             for loss in self.losses:
-                if (loss == 'masks' and 'pred_masks' not in aux_outputs) or (sum(sizes) == 0 and loss != 'labels'):
+                if (sum(sizes) == 0 and loss != 'labels') or (loss == 'masks' and 'pred_masks' not in enc_outputs):
                     # Intermediate masks losses are too costly to compute, we ignore them.
                     continue
                 kwargs = {}
@@ -708,10 +700,7 @@ class SetCriterion(nn.Module):
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
-        if return_bbox_track_acc:
-            return losses, metrics
-        else:
-            return losses
+        return losses
 
 
 class PostProcess(nn.Module):
@@ -761,18 +750,4 @@ class PostProcess(nn.Module):
         return results
 
 
-class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
 
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(
-            nn.Linear(n, k)
-            for n, k in zip([input_dim] + h, h + [output_dim]))
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x

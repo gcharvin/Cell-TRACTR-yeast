@@ -31,7 +31,7 @@ class DeformableDETR(DETR):
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,device,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
-                 use_dab=True, random_refpoints_xy=False,group_object=False,
+                 use_dab=True, random_refpoints_xy=False,
                   dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0, refine_object_queries=False,
                   use_div_ref_pts = False):
         """ Initializes the model.
@@ -55,7 +55,6 @@ class DeformableDETR(DETR):
         self.num_feature_levels = num_feature_levels
         self.num_queries = num_queries
 
-        self.group_object = group_object
         self.dn_object_l1 = dn_object_l1
         self.dn_object_l2 = dn_object_l2
 
@@ -88,6 +87,7 @@ class DeformableDETR(DETR):
         ### DN-DETR --> dn_objects
 
         num_channels = backbone.num_channels[-num_feature_levels:]
+        
         if num_feature_levels > 1:
             # return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
             num_backbone_outs = len(backbone.strides) - 1
@@ -162,7 +162,7 @@ class DeformableDETR(DETR):
     #     num_backbone_outs = len(self.backbone.strides)
     #     return [self.hidden_dim, ] * num_backbone_outs
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False, dn_enc=False):
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False, dn_enc=False, add_object_queries_to_dn_track=False,return_features_only=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -180,6 +180,9 @@ class DeformableDETR(DETR):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
+
+        if return_features_only:
+            return features
 
         features_all = features
         # pos_all = pos
@@ -258,12 +261,6 @@ class DeformableDETR(DETR):
                 query_embeds = torch.cat((tgt_embed, refanchor), dim=-1)
 
             num_queries = self.num_queries
-            #### Group-DETR
-            if group_object:
-                raise NotImplementedError
-                num_queries += self.num_queries
-                query_embeds = query_embeds.repeat(1,2,1)
-                training_methods.append('group_object')
 
             # Initialize the attn_mask
             if targets is not None and 'track_query_hs_embeds' in targets[0]:
@@ -274,12 +271,6 @@ class DeformableDETR(DETR):
             num_total_queries = num_queries + num_track_queries 
             query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(self.device)
 
-            #### Group-DETR
-            if group_object:
-                raise NotImplementedError
-                query_attn_mask[:num_total_queries - self.num_queries,num_total_queries - self.num_queries:] = True # Have not accessed the impact of this error
-                query_attn_mask[num_total_queries - self.num_queries:,:num_total_queries - self.num_queries] = True
-
             #### DN-DETR for noised object detection
             if dn_object and torch.tensor([target['empty'] for target in targets]).sum() == 0: # If there is an empty chamber, skip all denoising
                 training_methods.append('dn_object')
@@ -287,6 +278,9 @@ class DeformableDETR(DETR):
                     target['dn_object'] = {}
                     target['dn_object']['boxes'] = target['boxes'].clone()
                     target['dn_object']['labels'] = target['labels'].clone()
+
+                    if 'masks' in targets[0]:
+                        target['dn_object']['masks'] = target['masks'].clone()
 
                     count = 0 
                     for b in range(target['dn_object']['boxes'].shape[0]):
@@ -299,6 +293,13 @@ class DeformableDETR(DETR):
                                                              torch.cat((target['dn_object']['labels'][b+count,:1],torch.ones(1,).long().to(self.device)))[None],
                                                              torch.cat((target['dn_object']['labels'][b+count,1:],torch.ones(1,).long().to(self.device)))[None],
                                                              target['dn_object']['labels'][b+count+1:]))
+
+                            if 'masks' in targets[0]:
+                                _,_,H,W = target['dn_object']['masks'][0].shape
+                                target['dn_object']['masks'] = target['dn_object']['masks'] = torch.cat((target['dn_object']['masks'][:b+count], 
+                                                            torch.cat((target['dn_object']['masks'][b+count,:1],torch.zeros((1,H,W)).to(self.device)))[None], 
+                                                            torch.cat((target['dn_object']['masks'][b+count,1:],torch.zeros((1,H,W),).to(self.device)))[None], 
+                                                            target['dn_object']['masks'][b+count+1:]))
                             count += 1
 
 
@@ -313,6 +314,9 @@ class DeformableDETR(DETR):
                     assert (target['dn_object']['boxes'][:,-1] > 0).sum() == 0
                     boxes = target['dn_object']['boxes'][:,:4].clone()
                     labels = target['dn_object']['labels'][:,0].clone() # need to generate the label embedding
+
+                    if 'masks' in targets[0]:
+                        masks = target
                     random_mask = torch.randperm(boxes.shape[0])
                     boxes = boxes[random_mask]
                     target['dn_object']['track_query_match_ids'] = random_mask ### formality for it work in matcher.py code
@@ -334,11 +338,6 @@ class DeformableDETR(DETR):
                         target['dn_object']['track_queries_fal_pos_mask'][-num_FPs[t]:] = True
 
                         labels = torch.cat((labels,torch.ones((num_FPs[t])).long().to(self.device)))
-
-                    # denoised label not implemented because we only have one class so this doesn't make much sense
-                    if False and self.dn_label > 0:
-                        random_labels_mask = torch.randperm(labels.shape[0])[:torch.ceil(torch.tensor(labels.shape[0] * self.dn_label)).long()]
-                        labels[random_labels_mask] = 1 - labels[random_labels_mask]
 
                     # Also a formality so it works in the mathcer.py code
                     target['dn_object']['track_queries_mask'] = torch.ones((boxes.shape[0])).bool().to(self.device)
@@ -374,8 +373,8 @@ class DeformableDETR(DETR):
                 query_embeds.repeat(2,1)
 
 
-        hs, memory, init_reference, inter_references, class_enc, ref_enc, training_methods = \
-            self.transformer(src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask, dn_enc, training_methods)
+        hs, memory, init_reference, inter_references, enc_outputs, training_methods, mask_features = \
+            self.transformer(features_all, src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask, dn_enc, training_methods, add_object_queries_to_dn_track)
 
         save_references = torch.cat((init_reference[None],inter_references[...,:init_reference.shape[-1]]),axis=0)
 
@@ -415,8 +414,8 @@ class DeformableDETR(DETR):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
-        if class_enc is not None:
-            out['enc_outputs'] = {'pred_logits': class_enc, 'pred_boxes': ref_enc}
+        if bool(enc_outputs):
+            out['enc_outputs'] = enc_outputs
 
         offset = 0
         memory_slices = []
@@ -428,9 +427,9 @@ class DeformableDETR(DETR):
             memory_slices.append(memory_slice)
             offset += height * width
 
-        memory = memory_slices
+        memory = memory_slices[2::-1] # We only care about encoder output from the first frame; this will be used in segmentation; flip the order to follow DINO
 
-        return out, targets, features_all, memory, hs
+        return out, targets, features_all, memory, hs, mask_features
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):

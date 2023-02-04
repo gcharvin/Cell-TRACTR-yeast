@@ -8,8 +8,10 @@ overwrite_lrs: false
 overwrite_lr_scheduler: false
 batch_size: 2
 weight_decay: 0.0001
-epochs: 80
+epochs: 50
 lr_drop: 40
+epoch_to_start_using_flexible_divisions: 10
+use_prev_prev_frame: true
 # gradient clipping max norm
 clip_max_norm: 0.1
 # Deformable DETR
@@ -48,8 +50,8 @@ dec_n_points: 4
 enc_n_points: 4
 # DAB-DETR
 use_dab: true
-group_object: false
 dn_track: true
+dn_track_add_object_queries: true
 dn_track_l1: 0.1
 dn_track_l2: 0.05
 dn_object: false
@@ -64,7 +66,8 @@ refine_track_queries: true
 refine_object_queries: true
 refine_div_track_queries: false
 use_div_ref_pts: true
-init_enc_queries_embeddings: False
+init_enc_queries_embeddings: false
+init_boxes_from_masks: false
 # Tracking
 tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
@@ -74,8 +77,6 @@ track_prev_frame_range: 0
 track_prev_frame_rnd_augs: 0.01
 track_prev_prev_frame: True
 track_backprop_prev_frame: False
-track_query_false_positive_prob: 0.1
-track_query_false_negative_prob: 0.4
 # only for vanilla DETR
 track_query_false_positive_eos_weight: true
 track_attention: false
@@ -85,7 +86,9 @@ multi_frame_attention_separate_encoder: true
 merge_frame_features: true
 overflow_boxes: true
 # Segmentation
-masks: false
+masks: true
+mask_dim: 288
+enc_masks: false
 # Matcher
 # Class coefficient in the matching cost
 set_cost_class: 2.0
@@ -93,6 +96,10 @@ set_cost_class: 2.0
 set_cost_bbox: 5.0
 # giou box coefficient in the matching cost
 set_cost_giou: 2.0
+set_cost_mask: 5.0
+set_cost_dice: 2.0
+match_masks: false
+num_points: 10000
 # Loss
 # Disables auxiliary decoding losses (loss at each layer)
 aux_loss: true
@@ -100,10 +107,10 @@ return_intermediate_masks: false
 group_object_coef: 1.0
 dn_object_coef: 1.0
 dn_track_coef: 1.0
-mask_loss_coef: 25.0
+mask_loss_coef: 20.0
 mask_weight_cells_coef: 1.0 
-mask_weight_target_cell_coef: 10.0
-dice_loss_coef: 2.0
+mask_weight_target_cell_coef: 2.0
+dice_loss_coef: 4.0
 loss_coef: 1.0 # This is just a formality
 cls_loss_coef: 1.0 
 bbox_loss_coef: 5.0
@@ -119,21 +126,8 @@ focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
 dataset: cells
-train_split: mot17_train_1_coco
-val_split: mot17_val_1_coco
-coco_path: data/coco_2017
-coco_panoptic_path: null
 mot_path_train: ../data/cells
 mot_path_val:  ../data/cells
-crowdhuman_path: data/CrowdHuman
-# allows for joint training of mot and crowdhuman/coco_person with the `mot_crowdhuman`/`mot_coco_person` dataset
-crowdhuman_train_split: null
-coco_person_train_split: null
-coco_and_crowdhuman_prev_frame_rnd_augs: 0.2
-coco_min_num_objects: 0
-img_transform:
-  max_size: 1333
-  val_width: 800
 # Miscellaneous
 # path where to save, empty for no saving
 output_dir: /projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results

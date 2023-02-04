@@ -27,7 +27,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '230109_two_stage_dn_enc_dn_track_dab_no_mask'
+    modelname = '230203_prev_prev_track_final_two_stage_dn_enc_dn_track_dab_mask'
     
     args.dn_track = False
     args.dn_object = False
@@ -45,10 +45,12 @@ def train(args: Namespace) -> None:
     args.batch_size = 1
     args.init_enc_queries_embeddings = False
 
-    display_worst = False
+    display_worst = True
     run_movie = True
-    track= True
-    use_NMS = True
+    track = True
+    display_masks = True
+    use_NMS = False
+    args.use_prev_prev_frame = True
 
     print(args)
 
@@ -90,7 +92,7 @@ def train(args: Namespace) -> None:
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-    model, criterion, postprocessors = build_model(args)
+    model, criterion = build_model(args)
     model.to(device)
 
     model_without_ddp = model
@@ -172,7 +174,7 @@ def train(args: Namespace) -> None:
 
     if run_movie:
         model.evaluate_dataset_with_no_data_aug = False
-        Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS)
+        Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
         Pipeline.forward()
     
     if display_worst:

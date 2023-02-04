@@ -15,25 +15,7 @@ from tqdm import tqdm
 from .util import misc as utils
 from .datasets.transforms import Normalize,ToTensor,Compose
 
-def split_outputs(outputs,indices,new_outputs=None,update_masks=False):
 
-    if new_outputs is None:
-        new_outputs = outputs
-    new_outputs['pred_logits'] = outputs['pred_logits'][:,indices[0]:indices[1]]
-    new_outputs['pred_boxes'] = outputs['pred_boxes'][:,indices[0]:indices[1]]
-
-    if update_masks:
-        new_outputs['pred_mask'] = outputs['pred_mask'][:,indices[0]:indices[1]]
-
-    if 'aux_outputs' in outputs:
-        for lid in range(len(outputs['aux_outputs'])):
-            new_outputs['aux_outputs'][lid]['pred_logits'] = outputs['aux_outputs'][lid]['pred_logits'][:,indices[0]:indices[1]]
-            new_outputs['aux_outputs'][lid]['pred_boxes'] = outputs['aux_outputs'][lid]['pred_boxes'][:,indices[0]:indices[1]]
-
-            if update_masks:
-                new_outputs['aux_outputs'][lid]['pred_mask'] = outputs['aux_outputs'][lid]['pred_mask'][:,indices[0]:indices[1]]
-
-    return new_outputs
 
 def calc_loss_for_training_methods(training_method:str,
                                    outputs,
@@ -41,91 +23,24 @@ def calc_loss_for_training_methods(training_method:str,
                                    targets,
                                    criterion,
                                    epoch,
-                                   masks=False):
+                                   args):
     outputs_TM = {}
     outputs_TM['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
 
     groups.append(groups[-1] + targets[0][training_method]['num_queries'])
 
-    outputs_TM = split_outputs(outputs,groups[-2:],outputs_TM,update_masks=masks)
+    outputs_TM = utils.split_outputs(outputs,groups[-2:],outputs_TM,update_masks=args.masks)
 
     targets_TM = [target[training_method] for target in targets]
 
-    if epoch > 10:
-        targets_TM = update_early_or_late_track_divisions(targets_TM,outputs_TM)
+    if epoch > args.epoch_to_start_using_flexible_divisions:
+        targets_TM = utils.update_early_or_late_track_divisions(outputs_TM,targets_TM)
 
-    loss_dict_TM = criterion(outputs_TM, targets_TM,return_bbox_track_acc=False)
+    loss_dict_TM = criterion(outputs_TM, targets_TM)
 
     return outputs_TM, loss_dict_TM, groups
 
-
-def update_early_or_late_track_divisions(targets,outputs):
-
-    # check for early / late cell division and adjust ground truths as necessary
-    # def check_for_early_or_late_cell_divisions():
-    #### Need to update this to work for dn_track as well (just make it a function that works for all groups; if statement will automatically exlcue dn_object + dn_group)
-    for t,target in enumerate(targets):
-
-        if 'track_query_match_ids' in target:
-            # Get all prdictions for TP track queries
-            pred_boxes_track = outputs['pred_boxes'][t][target['track_queries_TP_mask']].detach()
-            pred_logits_track = outputs['pred_logits'][t][target['track_queries_TP_mask']].sigmoid().detach()
-            # Check to see if there were any divisions in the future frame; if not, we skip to check for early division
-            test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
-
-            for p, pred_box in enumerate(pred_boxes_track):
-                box = target['boxes'][target['track_query_match_ids'][p]]
-
-                # First check if the model predicted a single cell instead of a division
-                if box[-1] > 0 and pred_logits_track[p,-1] < 0.5: #division
-                    prev_box = target['prev_target']['boxes'][target['prev_ind'][1]][p]
-                    combined_box = utils.combine_div_boxes(box,prev_box)
-
-                    iou_div = utils.calc_iou(box,pred_box)
-
-                    pred_box[4:] = 0
-                    iou_combined = utils.calc_iou(combined_box,pred_box)
-
-                    if iou_combined - iou_div > 0: 
-                        target['boxes'][target['track_query_match_ids'][p]] = combined_box
-                        target['labels'][target['track_query_match_ids'][p]] = torch.tensor([0,1]).to(outputs['pred_logits'].device)
-
-                        if 'masks' in target:
-                            raise NotImplementedError
-                            
-                elif box[-1] == 0 and test_early_div and pred_logits_track[p,-1] > 0.5:
-                    # if model predcitions division, check future frame and see if there is a division
-                    fut_prev_boxes = target['fut_prev_target']['boxes']
-                    box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
-                    fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
-
-                    if fut_prev_track_id not in target['fut_target']['track_ids']:
-                        continue  # Cell leaves chamber in future frame
-
-                    fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
-                    fut_box = target['fut_target']['boxes'][fut_box_ind]
-
-                    if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
-                        div_box = utils.divide_box(box,fut_box)
-
-                        iou_div, flip = utils.calc_iou(div_box,pred_box,return_flip=True)
-                        pred_box[4:] = 0
-                        iou = utils.calc_iou(box,pred_box)
-
-                        # We flip target div boxes even though the matcher should be able to handle this 
-                        if flip:
-                            div_box = torch.cat((div_box[4:],div_box[:4]))
-
-                        if iou_div - iou > 0:
-                            target['boxes'][target['track_query_match_ids'][p]] = div_box
-                            target['labels'][target['track_query_match_ids'][p]] = torch.tensor([0,0]).to(outputs['pred_logits'].device)
-
-                            if 'masks' in target:
-                                raise NotImplementedError
-
-    return targets
-
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postprocessors,
+def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loaders: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, args, num_plots=10, interval = 50):
     dataset = 'train'
@@ -149,15 +64,23 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
     for i,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
         samples = cur_samples
         targets = cur_targets
-
         targets_og = [{},{}]
 
         for t,target in enumerate(targets):
-
+            target['cur_target'] = cur_targets[t].copy()
+        
+        for t,target in enumerate(targets):
+    
             targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
             targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
             targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
             targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
+            if 'masks' in target:
+                targets_og[t]['masks'] = target['masks'].to(args.device).clone()
+                targets_og[t]['prev_masks'] = prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['prev_prev_masks'] = prev_prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['fut_masks'] = fut_targets[t]['masks'].to(args.device).clone()
 
             target['prev_prev_target'] = prev_prev_targets[t]
             target['prev_prev_image'] = prev_prev_samples.tensors[t]
@@ -180,7 +103,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+        outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold,epoch=epoch)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -190,28 +113,27 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
 
         for training_method in training_methods:
             meta_data[training_method] = {}
-            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args.masks)
+            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args)
 
             meta_data[training_method]['outputs'] = outputs_TM
             meta_data[training_method]['loss_dict'] = loss_dict_TM
 
-        outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
+        outputs = utils.split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
 
-        if epoch > 10:
-            targets = update_early_or_late_track_divisions(targets,outputs)
+        if epoch > args.epoch_to_start_using_flexible_divisions:
+            targets = utils.update_early_or_late_track_divisions(outputs,targets)
 
-        loss_dict, acc_dict = criterion(outputs, targets)
+        loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
         loss_dict_keys = list(loss_dict.keys())
 
         for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
-                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
+                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc','loss_mask_enc','loss_dice_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
                     continue
                 assert (loss_dict_key + '_' + training_method) in weight_dict.keys()
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
-                # weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key]
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
@@ -230,6 +152,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module, postproc
             lr = np.zeros((1,len(optimizer.param_groups)))
             for p,param_group in enumerate(optimizer.param_groups):
                 lr[0,p] = param_group['lr']
+
+        # Compute the segmentation and tracking metrics
+        cls_threshold = 0.5
+        iou_threshold = 0.75
+        if 'track_query_match_ids' in targets[0]:
+            acc_dict = utils.calc_track_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+        else:
+            acc_dict = utils.calc_bbox_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i,lr)
 
@@ -280,35 +210,44 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
         targets_og = [{},{}]
 
         for t,target in enumerate(targets):
+            target['cur_target'] = cur_targets[t].copy()
 
-                targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
-                targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
-                targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
-                targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+        for t,target in enumerate(targets):
 
-                target['prev_prev_target'] = prev_prev_targets[t]
-                target['prev_prev_image'] = prev_prev_samples.tensors[t]
+            targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
+            targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
+            targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
 
-                target['prev_cur_target'] = prev_cur_targets[t]
-                target['prev_cur_image'] = prev_cur_samples.tensors[t]
+            if 'masks' in target:
+                targets_og[t]['masks'] = target['masks'].to(args.device).clone()
+                targets_og[t]['prev_masks'] = prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['prev_prev_masks'] = prev_prev_targets[t]['masks'].to(args.device).clone()
+                targets_og[t]['fut_masks'] = fut_targets[t]['masks'].to(args.device).clone()
 
-                target['prev_target'] = prev_targets[t]
-                target['prev_image'] = prev_samples.tensors[t]
+            target['prev_prev_target'] = prev_prev_targets[t]
+            target['prev_prev_image'] = prev_prev_samples.tensors[t]
 
-                target['fut_prev_target'] = fut_prev_targets[t]
-                target['fut_prev_image'] = fut_prev_samples.tensors[t]
+            target['prev_cur_target'] = prev_cur_targets[t]
+            target['prev_cur_image'] = prev_cur_samples.tensors[t]
 
-                target['fut_target'] = fut_targets[t]
-                target['fut_image'] = fut_samples.tensors[t]
+            target['prev_target'] = prev_targets[t]
+            target['prev_image'] = prev_samples.tensors[t]
 
-                assert target['image_id'] == prev_prev_targets[t]['image_id']
-                assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
+            target['fut_prev_target'] = fut_prev_targets[t]
+            target['fut_prev_image'] = fut_prev_samples.tensors[t]
+
+            target['fut_target'] = fut_targets[t]
+            target['fut_image'] = fut_samples.tensors[t]
+
+            assert target['image_id'] == prev_prev_targets[t]['image_id']
+            assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
         
 
         samples = samples.to(device)
         targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+        outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold,epoch=epoch)
 
         training_methods = outputs['training_methods'] # group_object, dn_object, dn_track
 
@@ -318,31 +257,37 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         for training_method in training_methods:
             meta_data[training_method] = {}
-            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args.masks)
+            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args)
 
             meta_data[training_method]['outputs'] = outputs_TM
             meta_data[training_method]['loss_dict'] = loss_dict_TM
 
-        outputs = split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
+        outputs = utils.split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
 
-        if epoch > 10:
-            targets = update_early_or_late_track_divisions(targets,outputs)
+        if epoch > args.epoch_to_start_using_flexible_divisions:
+            targets = utils.update_early_or_late_track_divisions(outputs,targets)
 
-        loss_dict, acc_dict = criterion(outputs, targets)
+        loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
         loss_dict_keys = list(loss_dict.keys())
 
         for training_method in training_methods:
             for loss_dict_key in loss_dict_keys:
-                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
+                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc','loss_mask_enc','loss_dice_enc']: # enc loss only calculated once since dn_track / dn_object will not affect
                     continue
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
-                # weight_dict[loss_dict_key + '_' + training_method] = weight_dict[loss_dict_key] * args.group_object_coef
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
-        # weight_dict['loss'] = 1
+
+        # Compute the segmentation and tracking metrics
+        cls_threshold = 0.5
+        iou_threshold = 0.75
+        if 'track_query_match_ids' in targets[0]:
+            acc_dict = utils.calc_track_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
+        else:
+            acc_dict = utils.calc_bbox_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
@@ -358,12 +303,19 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
 @torch.no_grad()
 class pipeline():
-    def __init__(self,model, fps, device, output_dir, args, track=True, use_NMS=False):
+    def __init__(self,model, fps, device, output_dir, args, track=True, use_NMS=False, display_masks=False):
         self.model = model
         self.model.tracking()
 
         self.use_NMS = use_NMS
-        self.predictions_folder = 'predictions' if not self.use_NMS else 'predictions_NMS'
+        self.masks = display_masks and args.masks
+
+        self.predictions_folder = 'predictions' 
+        
+        if self.use_NMS:
+            self.predictions_folder += '_NMS'
+
+
 
         self.output_dir = output_dir
         (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
@@ -390,7 +342,6 @@ class pipeline():
         if args.two_stage:
             (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
 
-        self.display_masks = False
         self.oq_div = True # Can object queries detect divisions
 
         self.display_decoder_aux = True
@@ -452,8 +403,8 @@ class pipeline():
             ind = np.where(self.track_indices==div_ind)[0][0]
 
             self.max_cellnb += 1             
-            self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add 1 so the mother cell remains same color
-            self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:]))
+            self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add daughter cellnb after mother cellnb
+            self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:])) # order doesn't matter here since they are the same track indices
 
             self.div_track[ind:ind+2] = div_ind # we add 1 because div_track is set as np.zeros so an ind of 0 would blend in with the starting point
 
@@ -465,14 +416,6 @@ class pipeline():
             
             assert np.max(self.cells) >= self.max_cellnb
             self.max_cellnb = np.max(self.cells)
-
-
-    def remove_faulty_divisions(self):
-        # Remove div predictions where there is no prediction for the first box; the model should have learned to not do this
-        for div_ind in self.div_indices:
-            if div_ind not in self.track_indices:
-                print(f'div_ind - {div_ind} being removed because it"s not in track_indices - {self.track_indices}')
-                self.div_indices = self.div_indices[self.div_indices != div_ind ]
 
     def update_div_boxes(self,boxes,masks=None):
         # boxes where div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
@@ -486,7 +429,7 @@ class pipeline():
             if masks is not None:
                 masks[div_ids[1],:1] = masks[div_ids[0],1:] 
 
-        return boxes
+        return boxes, masks
 
     def NMS(self, pred_boxes, keep, keep_div):
 
@@ -526,28 +469,24 @@ class pipeline():
             for i, fp in enumerate(tqdm(fps_ROI)):
 
                 img = PIL.Image.open(fp,mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB')
-                previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for easy analysis
+                previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for analysis later
 
                 samples = self.normalize(img)[0][None]
                 samples = samples.to(self.device)
 
-                if not self.track: # should we set prev_features as None for object detection? --> this means it can't see the previous image features
+                if not self.track: # If object detction only, we don't feed information from the previous frame
                     targets = [{}]
                     self.max_cellnb = 0
                     prev_features = None
 
-                outputs, targets, prev_features, memory, hs, prev_outputs = self.model(samples,targets=targets,prev_features=prev_features)
+                outputs, targets, prev_features, memory, hs, mask_features, prev_outputs = self.model(samples,targets=targets,prev_features=prev_features)
 
                 pred_logits = outputs['pred_logits'][0].sigmoid().detach().cpu().numpy()
                 pred_boxes = outputs['pred_boxes'][0].detach()
 
                 keep = (pred_logits[:,0] > self.threshold)
                 keep_div = (pred_logits[:,1] > self.threshold)
-
-                #### consider updating this code; particular for object detection ####
-                if not self.oq_div:
-                    self.keep_div[-self.num_queries:] = False
-                ####
+                keep_div[-self.num_queries:] = False # disregard any divisions predicted by object queries; model should have learned not to do this anyways
 
                 if self.use_NMS and len(keep) > self.num_queries and keep[-self.num_queries:].sum() > 0:
                     keep, keep_div = self.NMS(pred_boxes, keep, keep_div)
@@ -562,14 +501,9 @@ class pipeline():
                 if self.display_object_query_boxes and keep[-self.num_queries:].sum() > 0:
                     self.update_query_box_locations(pred_boxes,keep,keep_div)
 
-                if (pred_logits[~keep,1] > self.threshold).sum() > 0:
-                    print('At least one query track/detected a cell in the second box but not the first')
-
                 if sum(keep) > 0:
                     self.track_indices = keep.nonzero()[0] # Get query indices (object or track) where a cell was detected / tracked; this is used to create track queries for next  frame
                     self.div_indices = keep_div.nonzero()[0] # Get track query indices where a cell division was tracked; object queries should not be able to detect divisions
-
-                    self.remove_faulty_divisions()
 
                     if pred_logits.shape[0] > self.num_queries: # If track queries are fed to the model
                         tq_keep = pred_logits[:len(prevcells),0] > self.threshold
@@ -580,12 +514,12 @@ class pipeline():
                     self.split_up_divided_cells()
 
                     targets[0]['track_query_hs_embeds'] = outputs['hs_embed'][0,self.track_indices] # For div_indices, hs_embeds will be the same; no update
-                    boxes = pred_boxes[self.track_indices] # For div_indices, the boxes will be repeate and will properly updated below
+                    boxes = pred_boxes[self.track_indices] # For div_indices, the boxes will be repeated and will properly updated below
 
-                    if self.display_masks and 'pred_masks' in outputs:
-                        masks = outputs['pred_masks'][0,self.track_indices].sigmoid()
+                    if self.masks:
+                        masks = outputs['pred_masks'][0,self.track_indices].sigmoid().detach()
                     
-                    boxes = self.update_div_boxes(boxes,masks)
+                    boxes,masks = self.update_div_boxes(boxes,masks)
                     boxes = boxes[:,:4] # only one cell is tracked at a time
         
                     if masks is not None: # gets rid of the division mask which we rearrange above
@@ -593,7 +527,7 @@ class pipeline():
 
                     targets[0]['track_query_boxes'] = boxes
 
-                    if i == 0:
+                    if i == 0: # self.new_cells is used to visually highlight errors specifically for the mother machine. This is because no new cells will ever appear so I know this is an erorr
                         self.new_cells = None
 
                 else:
@@ -799,7 +733,7 @@ class pipeline():
             crf = 20
             verbose = 1
             method = 'track' if self.track else 'object_detection'
-            name_mask = 'mask_' if self.display_masks else ''
+            name_mask = 'mask_' if self.masks else ''
             filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
             print(filename)
             height, width, _ = self.color_stack[0].shape
@@ -874,6 +808,9 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
     if track:
         save_folder = 'save_worst_predictions_track'
         tm_threshold = 0
+
+        if args.use_prev_prev_frame:
+            save_folder += '_prev_prev_frame_fix' 
     else:
         save_folder = 'save_worst_predcitions_object_det'
         tm_threshold = 1
@@ -895,17 +832,23 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
 
             samples = cur_samples
             targets = cur_targets
-
-            assert samples.tensors.shape[0] == 1
-
             targets_og = [{},{}]
 
             for t,target in enumerate(targets):
-
+                target['cur_target'] = cur_targets[t].copy()
+            
+            for t,target in enumerate(targets):
+        
                 targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
                 targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
                 targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
                 targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
+                if 'masks' in target:
+                    targets_og[t]['masks'] = target['masks'].to(args.device).clone()
+                    targets_og[t]['prev_masks'] = prev_targets[t]['masks'].to(args.device).clone()
+                    targets_og[t]['prev_prev_masks'] = prev_prev_targets[t]['masks'].to(args.device).clone()
+                    targets_og[t]['fut_masks'] = fut_targets[t]['masks'].to(args.device).clone()
 
                 target['prev_prev_target'] = prev_prev_targets[t]
                 target['prev_prev_image'] = prev_prev_samples.tensors[t]
@@ -928,11 +871,11 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+            outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
-            targets = update_early_or_late_track_divisions(targets,outputs)
+            targets = utils.update_early_or_late_track_divisions(outputs,targets)
 
-            loss_dict, acc_dict = criterion(outputs, targets)
+            loss_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -948,15 +891,23 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
 
             samples = cur_samples
             targets = cur_targets
-
             targets_og = [{},{}]
 
             for t,target in enumerate(targets):
-
+                target['cur_target'] = cur_targets[t].copy()
+            
+            for t,target in enumerate(targets):
+        
                 targets_og[t]['boxes'] = target['boxes'].to(args.device).clone()
                 targets_og[t]['prev_boxes'] = prev_targets[t]['boxes'].to(args.device).clone()
                 targets_og[t]['prev_prev_boxes'] = prev_prev_targets[t]['boxes'].to(args.device).clone()
                 targets_og[t]['fut_boxes'] = fut_targets[t]['boxes'].to(args.device).clone()
+
+                if 'masks' in target:
+                    targets_og[t]['masks'] = target['masks'].to(args.device).clone()
+                    targets_og[t]['prev_masks'] = prev_targets[t]['masks'].to(args.device).clone()
+                    targets_og[t]['prev_prev_masks'] = prev_prev_targets[t]['masks'].to(args.device).clone()
+                    targets_og[t]['fut_masks'] = fut_targets[t]['masks'].to(args.device).clone()
 
                 target['prev_prev_target'] = prev_prev_targets[t]
                 target['prev_prev_image'] = prev_prev_samples.tensors[t]
@@ -979,11 +930,11 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             samples = samples.to(device)
             targets = [utils.nested_dict_to_device(t, device) for t in targets]
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
+            outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold)
 
-            targets = update_early_or_late_track_divisions(targets,outputs)
+            targets = utils.update_early_or_late_track_divisions(outputs,targets)
 
-            loss_dict, acc_dict = criterion(outputs, targets)
+            loss_dict = criterion(outputs, targets)
             weight_dict = criterion.weight_dict
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)

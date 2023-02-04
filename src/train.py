@@ -7,6 +7,8 @@ from argparse import Namespace
 from pathlib import Path
 from datetime import date
 
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
 import numpy as np
 import sacred
 import torch
@@ -32,7 +34,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 def train(args: Namespace) -> None:
 
     
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_group" if args.group_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
+    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
     # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/221208_dn_track_dab_no_mask/checkpoint.pth')
     args.save_model_interval = False
     # args.resume_optim = False
@@ -103,7 +105,7 @@ def train(args: Namespace) -> None:
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-    model, criterion, postprocessors = build_model(args)
+    model, criterion = build_model(args)
     model.to(device)
 
     model_without_ddp = model
@@ -271,7 +273,7 @@ def train(args: Namespace) -> None:
 
     if args.eval_only:
         evaluate(
-            model, criterion, postprocessors, data_loader_val, device,
+            model, criterion, data_loader_val, device,
             output_dir, args, 0)
         return
 
@@ -283,7 +285,7 @@ def train(args: Namespace) -> None:
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_one_epoch(
-            model, criterion, postprocessors, data_loaders_train, optimizer, device, epoch, args, num_plots)
+            model, criterion, data_loaders_train, optimizer, device, epoch, args, num_plots)
 
         if args.eval_train:
             random_transforms = data_loader_train.dataset._transforms
@@ -292,7 +294,7 @@ def train(args: Namespace) -> None:
                 data_loader_train.dataset._transforms = data_loaders_val[0].dataset._transforms
 
             evaluate(
-                model, criterion, postprocessors, data_loaders_train, device,
+                model, criterion, data_loaders_train, device,
                 output_dir, args, epoch, train=True)
 
             for data_loader_train in data_loaders_train:
