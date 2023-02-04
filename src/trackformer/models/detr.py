@@ -244,16 +244,20 @@ class SetCriterion(nn.Module):
         weights = torch.ones((src_logits.shape)).to(self.device)
         weights[target_classes_onehot[:,:,1] == 1.] = self.args.div_loss_coef
 
-        #### need update code. Current method is really confusing
-        #### This tells me which cells divided from frame t-2 to t-1 which we are trying to track from frame t-1 to t
-        if not two_stage:
-            for i in range(len(targets)):
-                track_ind = torch.tensor([int(ind) for ind in indices[i][0] if ind < src_logits.shape[1] - self.args.num_queries])
-                tgt_ind = indices[i][1][indices[i][0].unsqueeze(1).eq(track_ind).nonzero()[:,0]]
+        # could scrap below. a lot of work for potentially any improvment if any
+        # #### need update code. Current method is really confusing
+        # #### This tells me which cells divided from frame t-2 to t-1 which we are trying to track from frame t-1 to t
+        # if not two_stage:
+        #     for i in range(len(targets)):
+        #         track_ind = torch.tensor([int(ind) for ind in indices[i][0] if ind < src_logits.shape[1] - self.args.num_queries])
+        #         tgt_ind = indices[i][1][indices[i][0].unsqueeze(1).eq(track_ind).nonzero()[:,0]]
 
-                if len(track_ind) > 0: 
-                    weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
-        else:
+        #         if len(track_ind) > 0: 
+        #             weights[i,track_ind[targets[i]['track_div_mask'][tgt_ind]]] = self.args.track_div_loss_coef
+        # else:
+        #     weights[:,:,1] = 0
+
+        if two_stage:
             weights[:,:,1] = 0
 
         loss_ce = sigmoid_focal_loss(
@@ -422,8 +426,9 @@ class SetCriterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         indices, targets = threshold_indices(indices,targets,max_ind=N)
 
-        for target,ind in zip(targets,ind):
-            target['indices'] = ind
+        # Indicies are saved in targets for calcualting object detction / tracking accuracy
+        for target,ind in zip(targets,indices):
+            target['indices'] = indices
 
         for i, (target,(ind_out,ind_tgt)) in enumerate(zip(targets,indices)):
 
@@ -480,7 +485,7 @@ class SetCriterion(nn.Module):
 
                         assert iou_combined[max_ind] <= 1 and iou_combined[max_ind] >= 0 and iou <= 1 and iou >= 0
 
-                        if iou_combined[max_ind] - iou > 0:
+                        if iou_combined[max_ind] - iou > 0 and iou_combined[max_ind] > 0.5:
 
                             query_id = unused_object_query_indices[max_ind]
                             
@@ -580,7 +585,7 @@ class SetCriterion(nn.Module):
 
                                     assert iou_div <= 1 and iou_div >= 0 and iou <= 1 and iou >= 0
 
-                                    if iou_div - iou > 0:
+                                    if iou_div - iou > 0 and iou_div > 0.5:
                                         target['boxes'][ind_tgt_clone[idx]] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
                                         target['boxes'] = torch.cat((target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
 
@@ -618,9 +623,9 @@ class SetCriterion(nn.Module):
         sizes = [len(target['labels']) - int(target["empty"]) for target in targets] 
         track_div = torch.zeros((int(num_boxes))).bool()
 
-        for t,target in enumerate(targets):
-            if sizes[t] != 0 and 'track_div_mask' in target:
-                track_div[sum(sizes[:t]):sum(sizes[:t+1])] = target['track_div_mask'][indices[t][0]]
+        # for t,target in enumerate(targets):
+        #     if sizes[t] != 0 and 'track_div_mask' in target:
+        #         track_div[sum(sizes[:t]):sum(sizes[:t+1])] = target['track_div_mask'][indices[t][0]]
 
         # Compute all the requested losses
         losses = {}
@@ -684,7 +689,7 @@ class SetCriterion(nn.Module):
             indices, bin_target = threshold_indices(indices,bin_target,max_ind=N)
             
             for loss in self.losses:
-                if sum(sizes) == 0 and loss != 'labels':
+                if (sum(sizes) == 0 and loss != 'labels') or (loss == 'masks' and 'pred_masks' not in enc_outputs):
                     # Intermediate masks losses are too costly to compute, we ignore them.
                     continue
                 kwargs = {}

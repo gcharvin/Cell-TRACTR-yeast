@@ -52,7 +52,10 @@ def build_model(args):
         'dn_object': args.dn_object,
         'dn_enc':args.dn_enc,
         'refine_div_track_queries': args.refine_div_track_queries,
-        'evaluate_dataset_with_no_data_aug': args.evaluate_dataset_with_no_data_aug}
+        'evaluate_dataset_with_no_data_aug': args.evaluate_dataset_with_no_data_aug,
+        'epoch_to_start_using_flexible_divisions': args.epoch_to_start_using_flexible_divisions,
+        'use_prev_prev_frame': args.use_prev_prev_frame,
+        'dn_track_add_object_queries': args.dn_track_add_object_queries}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,

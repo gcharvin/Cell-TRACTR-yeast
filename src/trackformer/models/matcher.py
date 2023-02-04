@@ -196,7 +196,7 @@ class HungarianMatcher(nn.Module):
 
         for i, target in enumerate(targets):
             if 'track_query_match_ids' not in target:
-                # cost_matrix[i,cost_matrix.shape[1]:] = np.inf
+                cost_matrix[i,cost_matrix.shape[1]:] = np.inf
                 continue
 
             prop_i = 0

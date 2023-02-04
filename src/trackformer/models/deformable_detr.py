@@ -162,7 +162,7 @@ class DeformableDETR(DETR):
     #     num_backbone_outs = len(self.backbone.strides)
     #     return [self.hidden_dim, ] * num_backbone_outs
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False, dn_enc=False):
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, group_object=False, dn_object=False, dn_enc=False, add_object_queries_to_dn_track=False,return_features_only=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -180,6 +180,9 @@ class DeformableDETR(DETR):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
+
+        if return_features_only:
+            return features
 
         features_all = features
         # pos_all = pos
@@ -371,7 +374,7 @@ class DeformableDETR(DETR):
 
 
         hs, memory, init_reference, inter_references, enc_outputs, training_methods, mask_features = \
-            self.transformer(features_all, src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask, dn_enc, training_methods)
+            self.transformer(features_all, src_list, mask_list, pos_list, query_embeds, targets,query_attn_mask, dn_enc, training_methods, add_object_queries_to_dn_track)
 
         save_references = torch.cat((init_reference[None],inter_references[...,:init_reference.shape[-1]]),axis=0)
 

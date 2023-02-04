@@ -43,8 +43,8 @@ class DETRSegmBase(nn.Module):
 
         return outputs_mask
 
-    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, tm_threshold=None):
-        out, targets, features, memory, hs, mask_features, prev_out = super().forward(samples, targets, prev_features=prev_features, tm_threshold=tm_threshold)
+    def forward(self, samples: NestedTensor, targets: list = None, prev_features=None, tm_threshold=None,epoch=None):
+        out, targets, features, memory, hs, mask_features, prev_out = super().forward(samples, targets, prev_features=prev_features, tm_threshold=tm_threshold,epoch=epoch)
 
         pred_masks = self.forward_prediction_heads(hs[-1],mask_features)
 

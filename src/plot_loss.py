@@ -9,7 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '230113_mask_matcher_two_stage_dn_enc_dn_track_dab_mask'
+folder = '230203_prev_prev_track_final_two_stage_dn_enc_dn_track_dab_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -144,22 +144,23 @@ fig,ax = plt.subplots(1,2,figsize=(10,5))
 colors = ['b','g','r','c','m','y']
 for midx,metric in enumerate(metrics):
 
-    i = 0 if 'object_det_acc' in metric or 'objects_det_acc' in metric else 1
+    i = 0 if 'det_acc' in metric else 1
     
     train_acc = np.nanmean(metrics_train[metric],axis=-2)
     train_acc = train_acc[:,0] / train_acc[:,1]
     val_acc = np.nanmean(metrics_val[metric],axis=-2)
     val_acc = val_acc[:,0] / val_acc[:,1]
 
-    replace_word = '_object_det_acc' if i ==0 else '_track_acc'
+    replace_word = '_det_acc' if i ==0 else '_track_acc'
     metric = metric.replace(replace_word,'')
 
 
     ax[i].plot(np.arange(1,epochs+1),train_acc, color = colors[midx] if 'overall' not in metric else 'k',label=metric)
     ax[i].plot(np.arange(1,epochs_val+1),val_acc, '--', color = colors[midx] if 'overall' not in metric else 'k',)
 
-    if metric in ['overall']:
-        print(f'{"Track" if i == 1 else "Object Detection"}\nTrain: {train_acc[-1]}\nVal: {val_acc[-1]}')
+    if metric in ['overall', 'mask', 'bbox']:
+        metric = 'track' if metric == 'overall' else metric
+        print(f'{metric}\nTrain: {train_acc[-1]}\nVal: {val_acc[-1]}')
 
 for i in range(2):
     ax[i].set_xlabel('Epochs')

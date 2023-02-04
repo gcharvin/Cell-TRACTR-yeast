@@ -34,7 +34,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 def train(args: Namespace) -> None:
 
     
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_mask_matcher{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
+    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
     # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/221208_dn_track_dab_no_mask/checkpoint.pth')
     args.save_model_interval = False
     # args.resume_optim = False

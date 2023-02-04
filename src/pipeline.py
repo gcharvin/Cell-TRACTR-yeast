@@ -27,7 +27,7 @@ ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/c
 
 def train(args: Namespace) -> None:
 
-    modelname = '230113_mask_matcher_two_stage_dn_enc_dn_track_dab_mask'
+    modelname = '230203_prev_prev_track_final_two_stage_dn_enc_dn_track_dab_mask'
     
     args.dn_track = False
     args.dn_object = False
@@ -45,11 +45,12 @@ def train(args: Namespace) -> None:
     args.batch_size = 1
     args.init_enc_queries_embeddings = False
 
-    display_worst = False
+    display_worst = True
     run_movie = True
     track = True
     display_masks = True
-    use_NMS = True
+    use_NMS = False
+    args.use_prev_prev_frame = True
 
     print(args)
 

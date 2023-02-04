@@ -30,7 +30,8 @@ class DeformableTransformer(nn.Module):
                  multi_frame_attention_separate_encoder=False, 
                  refine_track_queries=False, refine_div_track_queries=False,
                  init_enc_queries_embeddings=False,device='cuda',masks=False,
-                 dn_enc_l1=0, dn_enc_l2=0, mask_dim=288,init_boxes_from_masks=False):
+                 dn_enc_l1=0, dn_enc_l2=0, mask_dim=288,init_boxes_from_masks=False,
+                 dn_track_add_object_queries=False,enc_masks=False):
         super().__init__()
 
         self.d_model = d_model
@@ -43,11 +44,14 @@ class DeformableTransformer(nn.Module):
         self.use_dab = use_dab
         self.device = device
         self.masks = masks
+        self.enc_masks=enc_masks
 
         self.refine_track_queries = refine_track_queries
         self.refine_div_track_queries = refine_div_track_queries
         self.init_enc_queries_embeddings = init_enc_queries_embeddings
         self.init_boxes_from_masks = init_boxes_from_masks
+
+        self.dn_track_add_object_queries = dn_track_add_object_queries
 
         if self.refine_track_queries:
             self.track_embedding = nn.Embedding(1,self.d_model)
@@ -218,7 +222,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None, dn_enc=False,training_methods=[]):
+    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None, dn_enc=False,training_methods=[],add_object_queries_to_dn_track=False):
         assert self.two_stage or query_embed is not None
         if not self.two_stage:
             assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
@@ -315,13 +319,13 @@ class DeformableTransformer(nn.Module):
             tgt_undetach = torch.gather(output_memory, 1,
                             topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))  # unsigmoid
             
-            if self.masks:
-                outputs_mask = self.forward_prediction_heads(tgt_undetach,mask_features)
+            if self.masks and self.enc_masks:
                 outputs_mask_all = self.forward_prediction_heads(output_memory,mask_features)
+                enc_outputs['pred_masks'] = torch.stack((outputs_mask_all,torch.zeros_like(outputs_mask_all)),axis=2)
             
             enc_outputs['pred_logits'] = torch.cat((enc_outputs_class,torch.zeros_like(enc_outputs_class)),axis=-1)  # I use weight map to discard the second prediction
             enc_outputs['pred_boxes'] = torch.cat((enc_outputs_coord_unact.sigmoid(),torch.zeros_like(enc_outputs_coord_unact)),axis=-1)
-            enc_outputs['pred_masks'] = torch.stack((outputs_mask_all,torch.zeros_like(outputs_mask_all)),axis=2)
+            
 
             if self.init_enc_queries_embeddings:
                 tgt = self.enc_query_embeddings.weight.repeat(self.batch_size,self.num_queries,1)
@@ -329,7 +333,12 @@ class DeformableTransformer(nn.Module):
                 # gather tgt
                 tgt = tgt_undetach.detach()
 
+            if targets is not None and 'dn_track' in targets[0] and self.dn_track_add_object_queries and add_object_queries_to_dn_track:
+                tgt_oqs_clone = tgt.clone()
+                boxes_oqs_clone = reference_points.clone()
+
             if self.masks and self.init_boxes_from_masks:
+                outputs_mask = self.forward_prediction_heads(tgt_undetach,mask_features)
                 flaten_mask = outputs_mask.detach().flatten(0, 1)
                 h, w = outputs_mask.shape[-2:]
 
@@ -347,17 +356,18 @@ class DeformableTransformer(nn.Module):
                 enc_thresh = 0.2
                 topk_cls_undetach = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
                 keep_enc_boxes = topk_cls_undetach[:,:,0].sigmoid() > enc_thresh
-                max_boxes = max([target['boxes'].shape[0] for target in targets])
+                # max_boxes = max([target['boxes'].shape[0] for target in targets])
+                num_enc_boxes = max([target['boxes'].shape[0] + (target['boxes'][:,-1] > 0).sum() for target in targets])
                 total_boxes = sum([target['boxes'].shape[0] for target in targets])
                 if keep_enc_boxes.sum() > total_boxes - 2: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 
-                    max_enc_boxes = max_boxes * 2
-                    topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], max_enc_boxes, dim=1)[1]
+                    num_enc_boxes = num_enc_boxes
+                    topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], num_enc_boxes, dim=1)[1]
 
                     tgt_enc = torch.gather(tgt,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,self.d_model))
                     tgt = torch.cat((tgt,tgt_enc),axis=1)
 
-                    assert max_enc_boxes == tgt_enc.shape[1]
-                    assert tgt_enc.shape[1] >= max_boxes
+                    assert num_enc_boxes == tgt_enc.shape[1]
+                    assert tgt_enc.shape[1] >= num_enc_boxes
 
                     reference_points_enc = torch.gather(reference_points,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4))
 
@@ -368,15 +378,16 @@ class DeformableTransformer(nn.Module):
 
                     reference_points = torch.cat((reference_points,reference_points_enc_noised),axis=1)
 
-                    if query_attn_mask is not None:
-                        new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1])).bool().to(tgt.device)
-                        new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
-                        query_attn_mask = new_query_attn_mask                          
-                    else:
-                        query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1])).bool().to(self.device)
+                    assert len(tgt_enc) == len(reference_points_enc)
+                    assert len(tgt) == len(reference_points)
+                    assert query_attn_mask is not None
 
-                    query_attn_mask[-max_enc_boxes:,:-max_enc_boxes] = True
-                    query_attn_mask[:-max_enc_boxes,-max_enc_boxes:] = True
+                    new_query_attn_mask = torch.zeros((query_attn_mask.shape[0] + tgt_enc.shape[1],query_attn_mask.shape[1] + tgt_enc.shape[1])).bool().to(tgt.device)
+                    new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
+                    query_attn_mask = new_query_attn_mask                          
+
+                    query_attn_mask[-num_enc_boxes:,:-num_enc_boxes] = True
+                    query_attn_mask[:-num_enc_boxes,-num_enc_boxes:] = True
 
                     for t,target in enumerate(targets):
                         target['dn_enc'] = {}
@@ -384,7 +395,6 @@ class DeformableTransformer(nn.Module):
                         target['dn_enc']['enc_boxes_noised'] = reference_points_enc_noised[t]
                         target['dn_enc']['enc_boxes'] = reference_points_enc[t]
                         target['dn_enc']['enc_logits'] = topk_cls_undetach[:,:,0].sigmoid()[t]
-                        target['dn_enc']['enc_masks'] = outputs_mask[t]
                         target['dn_enc']['labels'] = target['labels'].clone()
                         target['dn_enc']['track_ids'] = target['track_ids'].clone()
                         target['dn_enc']['prev_target'] = target['prev_target'].copy()
@@ -418,10 +428,12 @@ class DeformableTransformer(nn.Module):
             prev_hs_embed = torch.stack([t['track_query_hs_embeds'] for t in targets])
             prev_boxes = torch.stack([t['track_query_boxes'] for t in targets])
 
+            if self.refine_track_queries:
+                prev_hs_embed += self.track_embedding.weight
+
             assert torch.sum(torch.isnan(prev_hs_embed)) == 0, 'Nan in track query_hs embeds'
             assert torch.sum(torch.isnan(prev_boxes)) == 0, 'Nan in track boxes'
 
-            #### Group DETR - get rid of attn mask and do all masking on deformalbe_detr.py
             if not self.use_dab:
                 prev_query_embed = torch.zeros_like(prev_hs_embed)
                 query_embed = torch.cat([prev_query_embed, query_embed], dim=1)
@@ -438,31 +450,30 @@ class DeformableTransformer(nn.Module):
                 num_dn_track = targets_dn_track[0]['boxes'].shape[0]
                 assert num_dn_track > 0
 
-                prev_hs_embed_dn_track = [t['track_query_hs_embeds'] for t in targets_dn_track]
+                prev_hs_embed_dn_track = torch.stack([t['track_query_hs_embeds'] for t in targets_dn_track])
                 prev_boxes_dn_track = torch.stack([t['track_query_boxes'] for t in targets_dn_track])
-
-                prev_hs_embed_dn_track = torch.stack(prev_hs_embed_dn_track)
 
                 assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
                 assert torch.sum(torch.isnan(prev_boxes_dn_track)) == 0, 'Nan in track boxes'
 
-                if self.refine_track_queries:
-                    prev_hs_embed_dn_track += self.track_embedding.weight
-
-                #### Group DETR - get rid of attn mask and do all masking on deformalbe_detr.py
                 if not self.use_dab:
                     prev_query_embed_dn_track = torch.zeros_like(prev_hs_embed_dn_track)
                     query_embed = torch.cat([query_embed,prev_query_embed_dn_track], dim=1)
 
                 prev_tgt_dn_track = prev_hs_embed_dn_track
-                tgt = torch.cat([tgt,prev_tgt_dn_track], dim=1)
 
+                if self.dn_track_add_object_queries and add_object_queries_to_dn_track:
+                    prev_tgt_dn_track = torch.cat([prev_tgt_dn_track,tgt_oqs_clone], dim=1)
+                    prev_boxes_dn_track = torch.cat([prev_boxes_dn_track[..., :reference_points.shape[-1]],boxes_oqs_clone], dim=1)
+                    num_dn_track += self.num_queries
+
+                tgt = torch.cat([tgt,prev_tgt_dn_track], dim=1)
                 reference_points = torch.cat([reference_points,prev_boxes_dn_track[..., :reference_points.shape[-1]]], dim=1)
 
                 new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=tgt.device).bool()
 
-                if query_attn_mask is not None:
-                    new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
+                assert query_attn_mask is not None
+                new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
 
                 new_query_attn_mask[:-num_dn_track,-num_dn_track:] = True
                 new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
@@ -736,7 +747,9 @@ def build_deforamble_transformer(args):
         init_boxes_from_masks=args.init_boxes_from_masks,
         feature_channels = args.feature_channels,
         device=args.device,
-        masks=args.masks
+        masks=args.masks,
+        dn_track_add_object_queries=args.dn_track_add_object_queries,
+        enc_masks=args.enc_masks,
         )
 
 class MLP(nn.Module):
