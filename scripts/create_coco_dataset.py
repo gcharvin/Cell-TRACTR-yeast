@@ -44,40 +44,103 @@ def polygonFromMask(seg):
     return segmentation
 
 
-def read_image(filepath,width=32,height=256):
+class reader():
+    def __init__(self,mothermachine,target_size):
 
-    img = cv2.imread(str(filepath),cv2.IMREAD_ANYDEPTH)
-    img = (img - np.min(img)) / np.ptp(img)
-    img = cv2.resize(img,(width,height))
-    img = (255 * img).astype(np.uint8)
+        self.target_size = target_size
 
-    return img
+        if mothermachine:
+            self.crop = False
+        else:
+            self.crop = True
 
-def read_gts(fp,reset = False, width=32, height=256):
+    def get_slices(self,seg):
 
-    # Read and resize inputs
-    prev_gt = (cv2.imread(str(fp.parents[1] / 'inputs' / fp.name),cv2.IMREAD_ANYDEPTH))
-    orginal_size_prev_gt = np.unique(label(prev_gt))[1:]
-    prev_gt = cv2.resize(prev_gt,(width,height),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
+        y,x = np.where(seg)
+        y,x = int(np.mean(y)), int(np.mean(x))
 
-    # Read and resize outputs
-    cur_gt = (cv2.imread(str(fp.parents[1] / 'outputs' / fp.name),cv2.IMREAD_ANYDEPTH))
-    original_size_cur_gt = np.unique(label(cur_gt))[1:]
-    cur_gt = cv2.resize(cur_gt,(width,height),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
-
-    prev_gt_label = np.unique(label(prev_gt > 0))[1:]
-    cur_gt_label = np.unique(label(cur_gt > 0))[1:]
-    # Check for resizing artifacts and remove them
-    if len(prev_gt_label) != len(orginal_size_prev_gt) or len(cur_gt_label) != len(original_size_cur_gt):
-        print(f'Resizing error\nRemoving: {fp.stem}')
-        for data_folder in ['img','previmg','inputs','outputs']:
-            (fp.parents[1] / data_folder / fp.name).unlink()
+        if (y - self.target_size[0]/2 > 0 and y + self.target_size[0]/2 - 1 < seg.shape[0]):
+            y0 = int(y - self.target_size[0] / 2)
+        elif y + self.target_size[0]/2 - 1 > seg.shape[0] and seg.shape[0] - self.target_size[0] > 0:
+            y0 = seg.shape[0] - self.target_size[0]
+        else:
+            y0 = 0
+            
+        y1 = y0 + self.target_size[0] if y0 + self.target_size[0] < seg.shape[0] else seg.shape[0]
         
-        reset = True
+        if (x - self.target_size[1]/2 > 0 and x + self.target_size[1]/2 - 1 < seg.shape[1]):
+            x0 = int(x - self.target_size[1] / 2)
+        elif x + self.target_size[1]/2 - 1 > seg.shape[1] and seg.shape[1] - self.target_size[1] > 0:
+            x0 = seg.shape[1] - self.target_size[1]
+        else: 
+            x0 = 0
+            
+        x1 = x0 + self.target_size[1] if x0 + self.target_size[1] < seg.shape[1] else seg.shape[1]   
 
-    return prev_gt, cur_gt, reset
+        self.y = [y0,y1]
+        self.x = [x0,x1]
 
-def create_anno(mask,cell,image_id,track_id,annotation_id,category_id,min_area=20):
+
+
+    def read_image(self,fp):
+
+        img = cv2.imread(str(fp),cv2.IMREAD_ANYDEPTH)
+        img = (img - np.min(img)) / np.ptp(img) if np.ptp(img) != 0 else np.zeros_like(img)
+
+        if self.crop:
+            img = img[self.y[0]:self.y[1],self.x[0]:self.x[1]]
+
+            if img.shape[0] < target_size[0]:
+                img = np.pad(img,((0,target_size[0] - img.shape[0]),(0,0)))
+
+            if img.shape[1] < target_size[1]:
+                img = np.pad(img,((0,0),(0,target_size[1] - img.shape[1])))
+                
+        else:
+            img = cv2.resize(img,(self.target_size[1],self.target_size[0]))
+
+        img = (255 * img).astype(np.uint8)
+
+        return img
+
+    def read_gt(self,fp):
+
+        # Read inputs and outputs
+        prev_gt = (cv2.imread(str(fp.parents[1] / 'inputs' / fp.name),cv2.IMREAD_ANYDEPTH))
+        cur_gt = (cv2.imread(str(fp.parents[1] / 'outputs' / fp.name),cv2.IMREAD_ANYDEPTH))
+
+        # Crop or resize inputs and outputs to target_size
+        if self.crop:
+            prev_gt = prev_gt[self.y[0]:self.y[1],self.x[0]:self.x[1]]
+            cur_gt = cur_gt[self.y[0]:self.y[1],self.x[0]:self.x[1]]
+
+            if prev_gt.shape[0] < target_size[0]:
+                prev_gt = np.pad(prev_gt,((0,target_size[0] - prev_gt.shape[0]),(0,0)))
+                cur_gt = np.pad(cur_gt,((0,target_size[0] - cur_gt.shape[0]),(0,0)))
+
+            if cur_gt.shape[1] < target_size[1]:
+                prev_gt = np.pad(prev_gt,((0,0),(0,target_size[1] - prev_gt.shape[1])))
+                cur_gt = np.pad(cur_gt,((0,0),(0,target_size[1] - cur_gt.shape[1])))
+        else:
+            orginal_size_prev_gt = np.unique(label(prev_gt))[1:]
+            prev_gt = cv2.resize(prev_gt,(target_size[1],target_size[0]),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
+       
+            original_size_cur_gt = np.unique(label(cur_gt))[1:]
+            cur_gt = cv2.resize(cur_gt,(target_size[1],target_size[0]),interpolation= cv2.INTER_NEAREST).astype(np.uint16)
+
+            prev_gt_label = np.unique(label(prev_gt > 0))[1:]
+            cur_gt_label = np.unique(label(cur_gt > 0))[1:]
+            # Check for resizing artifacts and remove them
+            if len(prev_gt_label) != len(orginal_size_prev_gt) or len(cur_gt_label) != len(original_size_cur_gt):
+                print(f'Resizing error\nRemoving: {fp.stem}')
+                for data_folder in ['img','previmg','inputs','outputs']:
+                    (fp.parents[1] / data_folder / fp.name).unlink()
+            
+                raise Exception
+
+        return prev_gt, cur_gt
+
+def create_anno(mask,cell,image_id,track_id,annotation_id,category_id,min_area=50):
    
     mask_sc = mask == cell  
 
@@ -176,7 +239,7 @@ def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id
     cells_track = [i for i in cells_prev if i in cells_cur]
     # 2.) Cells that appear in the new frame (this should not happen for mothermachine)
     cells_new = [i for i in cells_cur if i not in cells_prev]
-    assert len(cells_new) == 0
+
     # 3.) Cells that exit the chamber; The cell exists in the previous frame but is gone in the current frame
     cells_leave = [i for i in cells_prev if i not in cells_cur]
 
@@ -189,7 +252,7 @@ def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id
     cell = -1 # This will be used to label an empty chamber with cellnb -1
 
     if len(cells_prev) == 0 and len(cells_cur) != 0:
-        print('Empty chamber in previous frame only')
+        print('No cells in previous frame only')
         if mothermachine:
             raise Exception('Cells cannot spontaneously spawn in the current frame if they don"t exist in the previous frame')
         annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
@@ -197,13 +260,13 @@ def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id
         prev_annotation_id += 1
 
     elif len(cells_prev) != 0 and len(cells_cur) == 0:
-        print('Empty chamber in current frame only')
+        print('No cells in current frame only')
         annotation = create_anno(cur_gt,cell,image_id,-1,cur_annotation_id,category_id)
         cur_annotations.append(annotation)
         cur_annotation_id += 1        
 
     elif len(cells_prev) == 0 and len(cells_cur) == 0:
-        print('Empty chambers in previous and current frame')
+        print('No cells in previous and current frame')
         annotation = create_anno(prev_gt,cell,image_id,-1,prev_annotation_id,category_id)
         prev_annotations.append(annotation)
         prev_annotation_id += 1
@@ -233,7 +296,6 @@ def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id
             track_id += 1
 
         elif cell in cells_new:
-            assert False
             cur_annotation = create_anno(cur_gt,cell,image_id,track_id,cur_annotation_id,category_id)
             cur_annotations.append(cur_annotation)                    
             cur_annotation_id += 1
@@ -246,62 +308,88 @@ def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id
 
     return updated_annotations, track_id, updated_annotation_ids
 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
+# datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
+datapath = Path('/projectnb/dunlop/ooconnor/16bit/celltrackformer')
 
 anno_folder = 'annotations'
-folders = ['train','val']
-
 (datapath / anno_folder).mkdir(exist_ok=True)
+
+folders = ['train','val']
+for folder in folders:
+    (datapath / folder).mkdir(exist_ok=True)
 
 category_id = 1
 no_cell = 0
-min_area = 20
-mothermachine = True
+min_area = 75
+mothermachine = False
+target_size = (256,256)
 
 img_fps = list((datapath / 'raw_data' / 'img').glob("*.png"))[:]
 
 # Configure metadata
-meta_data = np.zeros((len(img_fps),5),dtype=int)
-for idx,fp in enumerate(img_fps):
+if mothermachine:
+    meta_data = np.zeros((len(img_fps),5),dtype=int)
+    for idx,fp in enumerate(img_fps):
 
-    fn = fp.stem
+        fn = fp.stem
 
-    numbers = list(map(int,re.findall('\d+',fn)))
+        numbers = list(map(int,re.findall('\d+',fn)))
 
-    meta_data[idx] = numbers
+        meta_data[idx] = numbers
 
-fns = []
+    fns = []
 
-exps = np.unique(meta_data[:,0])
+    exps = np.unique(meta_data[:,0])
 
-for exp in exps:
-    exp_data = meta_data[meta_data[:,0] == exp][:,1:]
+    for exp in exps:
+        exp_data = meta_data[meta_data[:,0] == exp][:,1:]
 
-    training_sets = np.unique(exp_data[:,0])
+        training_sets = np.unique(exp_data[:,0])
 
-    for training_set in training_sets:
-        ts_data = exp_data[exp_data[:,0] == training_set][:,1:]
+        for training_set in training_sets:
+            ts_data = exp_data[exp_data[:,0] == training_set][:,1:]
 
-        positions = np.unique(ts_data[:,0])
+            positions = np.unique(ts_data[:,0])
 
-        for position in positions:
-            pos_data = ts_data[ts_data[:,0] == position][:,1:]
+            for position in positions:
+                pos_data = ts_data[ts_data[:,0] == position][:,1:]
 
-            chambers = np.unique(pos_data[:,0])
+                chambers = np.unique(pos_data[:,0])
 
-            for chamber in chambers:
+                for chamber in chambers:
 
-                cha_data = pos_data[pos_data[:,0] == chamber][:,1:]
+                    cha_data = pos_data[pos_data[:,0] == chamber][:,1:]
 
-                frames = np.unique(cha_data[:,0])
+                    frames = np.unique(cha_data[:,0])
 
-                for frame in frames:
+                    for frame in frames:
 
-                    if frame - 1 in frames and frame + 1 in frames:
+                        if frame - 1 in frames and frame + 1 in frames:
 
-                        ind = np.where((meta_data[:,0] == exp) * (meta_data[:,1] == training_set) * (meta_data[:,2] == position) * (meta_data[:,3] == chamber) * (meta_data[:,4] == frame) == True)[0][0]
+                            ind = np.where((meta_data[:,0] == exp) * (meta_data[:,1] == training_set) * (meta_data[:,2] == position) * (meta_data[:,3] == chamber) * (meta_data[:,4] == frame) == True)[0][0]
 
-                        fns.append(img_fps[ind].name)
+                            fns.append(img_fps[ind].name)
+
+else:
+    fns = []
+
+    for idx,fp in enumerate(img_fps):
+    
+        fn = fp.stem
+
+        framenb_str = re.findall('\d+',fn)[-1]
+        pad = len(framenb_str)
+        framenb = int(framenb_str)
+        index_str = fn.index(framenb_str)
+
+        basename = fn[:index_str]
+
+        prev_basename = basename + f'{framenb-1:0{pad}d}{fp.suffix}'
+        fut_basename = basename + f'{framenb+1:0{pad}d}{fp.suffix}'
+
+        if (datapath / 'raw_data' / 'img' / prev_basename).exists() and (datapath / 'raw_data' / 'img' / fut_basename).exists():
+            fns.append(img_fps[idx].name)
+
 
 random.seed(1)
 random.shuffle(fns)
@@ -358,35 +446,34 @@ for idx,dataset_fns in enumerate([train_fns,val_fns]):
     # 5 - fut
 
     images = []
-
     categories = []
-    
-    width = 32
-    height = 256
+
+    img_reader = reader(mothermachine=mothermachine, target_size=target_size)
 
     for counter,fn in enumerate(tqdm(dataset_fns)):
 
-        prev_img = read_image(datapath / 'raw_data' / 'previmg' / fn)
-        cur_img = read_image(datapath / 'raw_data' / 'img' / fn)
+        prev_inputs = cv2.imread(str(datapath / 'raw_data' / 'inputs' / fn),cv2.IMREAD_ANYDEPTH)
+        
+        img_reader.get_slices((prev_inputs > 0) * 1)
 
-        prev_gt, cur_gt, reset = read_gts(datapath / 'raw_data' / 'inputs' / fn)
+        prev_img = img_reader.read_image(datapath / 'raw_data' / 'previmg' / fn)
+        cur_img = img_reader.read_image(datapath / 'raw_data' / 'img' / fn)
 
+        prev_gt, cur_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn)
 
-        framenb = (re.findall('\d+',fn)[-1])
-        framenb_plus1 = f'{int(framenb)+1:06d}'
-        framenb_minus1 = f'{int(framenb)-1:06d}'
+        framenb = re.findall('\d+',fn)[-1]
+        pad = len(framenb)
+        framenb_plus1 = f'{int(framenb)+1:0{pad}d}'
+        framenb_minus1 = f'{int(framenb)-1:0{pad}d}'
 
         fn_plus1 = fn.replace(framenb,framenb_plus1)
         fn_minus1 = fn.replace(framenb,framenb_minus1)
 
-        prev_prev_img = read_image(datapath / 'raw_data' / 'previmg' / fn_minus1)
-        fut_img = read_image(datapath / 'raw_data' / 'img' / fn_plus1)
+        prev_prev_img = img_reader.read_image(datapath / 'raw_data' / 'previmg' / fn_minus1)
+        fut_img = img_reader.read_image(datapath / 'raw_data' / 'img' / fn_plus1)
 
-        prev_prev_gt, prev_cur_gt, reset = read_gts(datapath / 'raw_data' / 'inputs' / fn_minus1)
-        fut_prev_gt, fut_gt, reset = read_gts(datapath / 'raw_data' / 'inputs' / fn_plus1)
-
-        if reset:
-            raise Exception
+        prev_prev_gt, prev_cur_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn_minus1)
+        fut_prev_gt, fut_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn_plus1)
 
         gts = [[prev_prev_gt,prev_cur_gt],[prev_gt,cur_gt],[fut_prev_gt,fut_gt]]
 
