@@ -5,9 +5,10 @@ import cv2
 from tqdm import tqdm
 import numpy as np
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
+datapath = Path('/projectnb/dunlop/ooconnor/16bit/cell-trackformer/data/cells')
 
 trainingsets = ['train','val']
-remove = True
+remove = False
 target_size = (256,32)
 
 subfolders = [['prev_cur','prev'],['cur','fut_prev']]
@@ -19,19 +20,19 @@ for trainingset in trainingsets:
 
         for fp in fps:
             remove_file = False
-            inputs = cv2.imread(str(fp),cv2.IMREAD_UNCHANGED)      
-            assert inputs.shape == target_size
+            prev_outputs = cv2.imread(str(fp),cv2.IMREAD_UNCHANGED)      
+            # assert inputs.shape == target_size
 
-            inputs_cellnbs = np.unique(inputs)[1:]
-            for inputs_cellnb in inputs_cellnbs:
-                if np.sum(inputs == inputs_cellnb) < 40:
-                    if np.max(np.where(inputs==inputs_cellnb)[0]) < 40:
-                        remove_file = True
+            # inputs_cellnbs = np.unique(inputs)[1:]
+            # for inputs_cellnb in inputs_cellnbs:
+            #     if np.sum(inputs == inputs_cellnb) < 40:
+            #         if np.max(np.where(inputs==inputs_cellnb)[0]) < 40:
+            #             remove_file = True
 
-            outputs = cv2.imread(str(datapath / trainingset / (subfolder[1] + '_gt') / fp.name),cv2.IMREAD_UNCHANGED)
-            assert outputs.shape == target_size
+            cur_inputs = cv2.imread(str(datapath / trainingset / (subfolder[1] + '_gt') / fp.name),cv2.IMREAD_UNCHANGED)
+            # assert outputs.shape == target_size
 
-            if not ((inputs > 0) == (outputs > 0)).all() or remove_file:
+            if not ((prev_outputs > 0) == (cur_inputs > 0)).all() or remove_file:
                 print(fp.name)
                 if remove:
                     for folder in ['prev_prev','prev_cur','prev','cur','fut_prev','fut']:

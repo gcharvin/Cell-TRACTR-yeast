@@ -70,7 +70,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
     pred_masks = 'pred_masks' in outputs
     box_converter = box_cxcy_to_xyxy(height,width)
     batch_enc_frames = []
-    enc_colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+    enc_colors = [tuple((255*np.random.random(3))) for _ in range(400)]
     
     if meta_data is not None:
         meta_data_keys = list(meta_data.keys())
@@ -83,7 +83,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             if meta_data_key == 'dn_track':
                 # dn_track = np.zeros((height,(width*7 + spacer)*bs,3))
                 for i in range(bs):
-                    colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+                    colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
                     img = samples[i].permute(1,2,0)                
                     
@@ -281,7 +281,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             elif meta_data_key == 'dn_enc':
                 dn_encs = []
                 for i in range(bs):
-                    colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+                    colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
                     img = samples[i].permute(1,2,0)                
                     
@@ -448,7 +448,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             elif meta_data_key == 'dn_object':
                 dn_object = np.zeros((height,(width*5 + spacer)*bs,3))
                 for i in range(bs):
-                    colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+                    colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
                     # img = samples.tensors[i].permute(1,2,0)                
                     img = samples[i].permute(1,2,0)                
@@ -550,7 +550,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
         if i > 0:
             blank = np.concatenate((blank,np.zeros((blank.shape[0],15,3))),axis=1)
 
-        colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+        colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
         previmg = targets[i]['prev_image'].permute(1,2,0)
         previmg = previmg.detach().cpu().numpy().copy()
@@ -892,7 +892,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
             target = targets[i]
             target_og = targets_og[i]
-            colors = [tuple((255*np.random.random(3))) for _ in range(50)]
+            colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
             if prev_outputs is not None:
                 # If just object detection, then just current frame is used so two frames back gives us no valuable information
