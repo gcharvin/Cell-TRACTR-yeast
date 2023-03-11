@@ -4,6 +4,7 @@ lr_backbone: 0.00002
 lr_linear_proj_names: ['reference_points', 'sampling_offsets']
 lr_linear_proj_mult: 0.1
 lr_track: 0.0001
+object_detection_only: false
 overwrite_lrs: false
 overwrite_lr_scheduler: false
 batch_size: 2
@@ -48,7 +49,7 @@ num_queries: 30
 pre_norm: false
 dec_n_points: 4
 enc_n_points: 4
-# DAB-DETR
+# DAB-DETR - denoising parameters
 use_dab: true
 dn_track: true
 dn_track_add_object_queries: true
@@ -73,8 +74,6 @@ tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
 tracking_eval: true
 # Range of possible random previous frames
-track_prev_frame_range: 0
-track_prev_frame_rnd_augs: 0.01
 track_prev_prev_frame: True
 track_backprop_prev_frame: False
 # only for vanilla DETR
@@ -125,9 +124,7 @@ focal_loss: true
 focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
-dataset: cells
-mot_path_train: ../data/cells
-mot_path_val:  ../data/cells
+dataset: moma
 # Miscellaneous
 # path where to save, empty for no saving
 output_dir: /projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results
@@ -154,9 +151,3 @@ save_model_interval: false
 world_size: 1
 # url used to set up distributed training
 dist_url: env://
-# Visdom params
-# vis_server: http://localhost
-vis_server: ''
-vis_port: 8080
-vis_and_log_interval: 50
-no_vis: false
