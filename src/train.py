@@ -20,54 +20,56 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
+moma = False
+
+if moma:
+    yaml_file = ''
+else:
+    yaml_file = '_2D'
 
 ex = sacred.Experiment('train')
-# ex.add_config('../cfgs/train.yaml')
-# ex.add_config(str(Path('../cfgs/train.yaml').resolve()))
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train.yaml')
+ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train' + yaml_file + '.yaml')
 ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
-
-#### TODO 
-# Need to properly update data augmentations so that the multiple frames in a row will get properly flipped
-# Also only certain data augmentations for the 16 bit gt
 
 def train(args: Namespace) -> None:
 
-    
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
+    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_moma" if moma else "_2D"}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
     # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/221208_dn_track_dab_no_mask/checkpoint.pth')
-    args.save_model_interval = False
     # args.resume_optim = False
     # args.freeze_detr = True
     # args.overwrite_lrs = True
+    args.moma = moma
 
     if args.dn_track or args.dn_object or args.group_object:
         assert args.use_dab, f'DAB-DETR is needed to use denoised boxes for tracking / object detection. args.use_dab is currently set to {args.use_dab}'
 
     print(args)
 
-    args.output_dir.mkdir(exist_ok=True)
-    (args.output_dir / 'eval_outputs').mkdir(exist_ok=True)
-    (args.output_dir / 'train_outputs').mkdir(exist_ok=True)
+    val_output_folder = 'val_outputs'
+    train_output_folder = 'train_outputs'
 
-    (args.output_dir / 'eval_outputs' / 'standard').mkdir(exist_ok=True)
-    (args.output_dir / 'train_outputs' / 'standard').mkdir(exist_ok=True)
+    args.output_dir.mkdir(exist_ok=True)
+    (args.output_dir / val_output_folder).mkdir(exist_ok=True)
+    (args.output_dir / train_output_folder).mkdir(exist_ok=True)
+
+    (args.output_dir / val_output_folder / 'standard').mkdir(exist_ok=True)
+    (args.output_dir / train_output_folder / 'standard').mkdir(exist_ok=True)
 
     if args.two_stage:
-        (args.output_dir / 'eval_outputs' / 'enc_outputs').mkdir(exist_ok=True)
-        (args.output_dir / 'train_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+        (args.output_dir / val_output_folder / 'enc_outputs').mkdir(exist_ok=True)
+        (args.output_dir / train_output_folder / 'enc_outputs').mkdir(exist_ok=True)
 
-    if args.dn_track:
-        (args.output_dir / 'eval_outputs' / 'dn_track').mkdir(exist_ok=True)
-        (args.output_dir / 'train_outputs' / 'dn_track').mkdir(exist_ok=True)     
+    if args.dn_track and not args.object_detection_only:
+        (args.output_dir / val_output_folder / 'dn_track').mkdir(exist_ok=True)
+        (args.output_dir / train_output_folder / 'dn_track').mkdir(exist_ok=True)     
 
     if args.dn_object:
-        (args.output_dir / 'eval_outputs' / 'dn_object').mkdir(exist_ok=True)
-        (args.output_dir / 'train_outputs' / 'dn_object').mkdir(exist_ok=True)   
+        (args.output_dir / val_output_folder / 'dn_object').mkdir(exist_ok=True)
+        (args.output_dir / train_output_folder / 'dn_object').mkdir(exist_ok=True)   
 
     if args.dn_enc:
-        (args.output_dir / 'eval_outputs' / 'dn_enc').mkdir(exist_ok=True)
-        (args.output_dir / 'train_outputs' / 'dn_enc').mkdir(exist_ok=True) 
+        (args.output_dir / val_output_folder / 'dn_enc').mkdir(exist_ok=True)
+        (args.output_dir / train_output_folder / 'dn_enc').mkdir(exist_ok=True) 
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -78,18 +80,11 @@ def train(args: Namespace) -> None:
 
     if not args.deformable:
         assert args.num_feature_levels == 1
-        
-    if args.tracking:
-        if args.tracking_eval:
-            assert 'mot' in args.dataset or 'cells' in args.dataset
 
-    output_dir = Path(args.output_dir)
     if args.output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         yaml.dump(
             vars(args),
-            open(output_dir / 'config.yaml', 'w'), allow_unicode=True)
+            open(args.output_dir / 'config.yaml', 'w'), allow_unicode=True)
 
     device = torch.device(args.device)
 
@@ -274,7 +269,7 @@ def train(args: Namespace) -> None:
     if args.eval_only:
         evaluate(
             model, criterion, data_loader_val, device,
-            output_dir, args, 0)
+            args.output_dir, args, 0)
         return
 
     print("Start training")
@@ -285,7 +280,7 @@ def train(args: Namespace) -> None:
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_one_epoch(
-            model, criterion, data_loaders_train, optimizer, device, epoch, args, num_plots)
+            model, criterion, data_loaders_train, optimizer, epoch, args, num_plots)
 
         if args.eval_train:
             random_transforms = data_loader_train.dataset._transforms
@@ -295,23 +290,23 @@ def train(args: Namespace) -> None:
 
             evaluate(
                 model, criterion, data_loaders_train, device,
-                output_dir, args, epoch, train=True)
+                args.output_dir, args, epoch)
 
             for data_loader_train in data_loaders_train:
                 data_loader_train.dataset._transforms = random_transforms
 
         lr_scheduler.step()
 
-        checkpoint_paths = [output_dir / 'checkpoint.pth']
+        checkpoint_paths = [args.output_dir / 'checkpoint.pth']
 
         evaluate(
-            model, criterion, data_loaders_val, device,
-            output_dir, args, epoch, train=True)
+            model, criterion, data_loaders_val,
+            args, epoch)
 
         # MODEL SAVING
         if args.output_dir:
             if args.save_model_interval and not epoch % args.save_model_interval:
-                checkpoint_paths.append(output_dir / f"checkpoint_epoch_{epoch}.pth")
+                checkpoint_paths.append(args.output_dir / f"checkpoint_epoch_{epoch}.pth")
 
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
