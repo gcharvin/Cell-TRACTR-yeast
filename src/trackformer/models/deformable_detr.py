@@ -278,10 +278,13 @@ class DeformableDETR(DETR):
                     target['dn_object'] = {}
                     target['dn_object']['boxes'] = target['boxes'].clone()
                     target['dn_object']['labels'] = target['labels'].clone()
+                    target['dn_object']['track_ids'] = target['track_ids'].clone()
 
                     if 'masks' in targets[0]:
                         target['dn_object']['masks'] = target['masks'].clone()
 
+                    
+                    store_div_ind = []
                     count = 0 
                     for b in range(target['dn_object']['boxes'].shape[0]):
                         if target['dn_object']['boxes'][b+count,-1] > 0:
@@ -294,19 +297,32 @@ class DeformableDETR(DETR):
                                                              torch.cat((target['dn_object']['labels'][b+count,1:],torch.ones(1,).long().to(self.device)))[None],
                                                              target['dn_object']['labels'][b+count+1:]))
 
+                            target['dn_object']['track_ids'] = torch.cat((target['dn_object']['track_ids'][:b+count],
+                                                             torch.tensor([-1]).to(self.device),
+                                                             target['dn_object']['track_ids'][b+count:]))
+
                             if 'masks' in targets[0]:
-                                _,_,H,W = target['dn_object']['masks'][0].shape
+                                _,_,H,W = target['dn_object']['masks'].shape
                                 target['dn_object']['masks'] = target['dn_object']['masks'] = torch.cat((target['dn_object']['masks'][:b+count], 
                                                             torch.cat((target['dn_object']['masks'][b+count,:1],torch.zeros((1,H,W)).to(self.device)))[None], 
                                                             torch.cat((target['dn_object']['masks'][b+count,1:],torch.zeros((1,H,W),).to(self.device)))[None], 
                                                             target['dn_object']['masks'][b+count+1:]))
+                            store_div_ind.append(torch.tensor([b+count,b+count+1]))
                             count += 1
 
+                    target['dn_object']['object_detection_div_mask'] = torch.zeros(target['dn_object']['boxes'].shape[0]).to(self.device)
+
+                    if len(store_div_ind) > 0:
+                        for s,ind in enumerate(store_div_ind):
+                            target['dn_object']['object_detection_div_mask'][ind] = s + 1
 
                 num_boxes = torch.tensor([target['dn_object']['boxes'].shape[0] for target in targets]).long()
                 num_FPs = max(num_boxes) - num_boxes
 
-                query_embed_dn_object = torch.zeros((bs,max(num_boxes),query_embeds.shape[-1])).to(self.device)
+                if self.two_stage:
+                    query_embed_dn_object = torch.zeros((bs,max(num_boxes),self.hidden_dim + 4)).to(self.device)
+                else:
+                    query_embed_dn_object = torch.zeros((bs,max(num_boxes),query_embeds.shape[-1])).to(self.device)
 
                 for t,target in enumerate(targets):
 
@@ -315,11 +331,8 @@ class DeformableDETR(DETR):
                     boxes = target['dn_object']['boxes'][:,:4].clone()
                     labels = target['dn_object']['labels'][:,0].clone() # need to generate the label embedding
 
-                    if 'masks' in targets[0]:
-                        masks = target
                     random_mask = torch.randperm(boxes.shape[0])
                     boxes = boxes[random_mask]
-                    target['dn_object']['track_query_match_ids'] = random_mask ### formality for it work in matcher.py code
                     target['dn_object']['empty'] = target['empty']
                     target['dn_object']['noised_boxes_gt'] = boxes.clone()
 
@@ -330,14 +343,24 @@ class DeformableDETR(DETR):
                     target['dn_object']['track_queries_fal_pos_mask'] = torch.zeros((boxes.shape[0] + num_FPs[t])).bool().to(self.device)
 
                     if num_FPs[t] > 0:
-                        random_FP_mask = torch.randperm(num_FPs[t])
+                        random_FP_mask = torch.randperm(min(num_FPs[t],target['dn_object']['boxes'].shape[0]))
                         FP_boxes = target['dn_object']['boxes'][random_FP_mask,:4].clone()
+
+                        while num_FPs[t] > FP_boxes.shape[0]:
+                            random_FP_mask = torch.randperm(min(num_FPs[t] - FP_boxes.shape[0],target['dn_object']['boxes'].shape[0]))
+                            FP_boxes = torch.cat((FP_boxes,target['dn_object']['boxes'][random_FP_mask,:4].clone()))
+
                         FP_boxes = add_noise_to_boxes(FP_boxes,l_1*3,l_2*3)
                         boxes = torch.cat((boxes, FP_boxes),axis=0)
                         # No tracking is done here; just a formality so it works in the matcher.py code; but there are FPs as in empty tracking boxes
                         target['dn_object']['track_queries_fal_pos_mask'][-num_FPs[t]:] = True
 
                         labels = torch.cat((labels,torch.ones((num_FPs[t])).long().to(self.device)))
+                    
+                    target['dn_object']['prev_target'] = target['prev_target'].copy()
+                    target['dn_object']['fut_target'] = target['fut_target'].copy()
+                    target['dn_object']['fut_prev_target'] = target['fut_prev_target'].copy()
+                    
 
                     # Also a formality so it works in the mathcer.py code
                     target['dn_object']['track_queries_mask'] = torch.ones((boxes.shape[0])).bool().to(self.device)
@@ -355,12 +378,11 @@ class DeformableDETR(DETR):
 
                 num_dn_object_queries = query_embed_dn_object.shape[1]
                 num_total_queries += num_dn_object_queries
-                new_query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(tgt_embed.device)    
+                new_query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(self.device)    
                 new_query_attn_mask[:-num_dn_object_queries,:-num_dn_object_queries] = query_attn_mask
                 new_query_attn_mask[-num_dn_object_queries:,:-num_dn_object_queries] = True
                 new_query_attn_mask[:-num_dn_object_queries,-num_dn_object_queries:] = True
                 query_attn_mask = new_query_attn_mask
-
 
         else:
             if self.two_stage:
