@@ -1,19 +1,21 @@
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
-import yaml
 import sacred
 import numpy as np
 import cv2
-from pycocotools import mask as coco_mask
 from pathlib import Path
+import sys
+
+cell_trackformer = Path(__file__).parents[1] / 'src'
+sys.path.insert(0,str(cell_trackformer))
 
 from trackformer.datasets import build_dataset
 import trackformer.util.misc as utils
 from trackformer.util.misc import nested_dict_to_namespace
 
 ex = sacred.Experiment('train')
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/trackformer_mask/cfgs/train.yaml')
-ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/trackformer_mask/cfgs/train_deformable.yaml')
+ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train.yaml')
+ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
 
 @ex.main
 def load_config(_config, _run):
