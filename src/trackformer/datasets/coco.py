@@ -202,7 +202,6 @@ def make_coco_transforms_cells(image_set):
 
     if image_set == 'train':
         transforms = [
-            # T.RandomHorizontalFlip(),
             T.RandomGaussianBlur(),
             T.RandomGaussianNoise(),
             T.RandomIlluminationVoodoo(),
@@ -213,7 +212,6 @@ def make_coco_transforms_cells(image_set):
             T.RandomGaussianBlur(),
             T.RandomGaussianNoise(),
             T.RandomIlluminationVoodoo(),
-            # T.RandomHorizontalFlip(),
         ]
     else:
         ValueError(f'unknown {image_set}')

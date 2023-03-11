@@ -17,9 +17,6 @@ import torch
 
 from . import transforms as T
 from .coco import CocoDetection, make_coco_transforms_cells
-# from .coco import build as build_coco
-from .crowdhuman import build_crowdhuman
-
 
 class MOT(CocoDetection):
 
@@ -146,7 +143,7 @@ class WeightedConcatDataset(torch.utils.data.ConcatDataset):
 
 def build_cells(image_set,args):
 
-    root = Path(args.output_dir.parents[1] / 'data' / 'cells' / 'new_dataset')
+    root = Path(args.output_dir.parents[1] / 'data' / args.dataset)
 
     assert root.exists()
 
