@@ -9,7 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '230203_prev_prev_track_final_two_stage_dn_enc_dn_track_dab_mask'
+folder = '230223_2D_track_two_stage_dn_track_dn_object_dab_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -17,7 +17,8 @@ with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
 with open(datapath / folder / 'metrics_val.pkl', 'rb') as f:
     metrics_val = pickle.load(f)
 
-losses = [key for key in metrics_train.keys() if 'loss' in key and not bool(re.search('\d',key))]
+losses = [key for key in metrics_train.keys() if 'loss' in key and not bool(re.search('\d',key)) and not np.isnan(metrics_train[key][0,0])
+]
 metrics = [key for key in metrics_train.keys() if 'acc' in key]
 epochs = metrics_train['loss'].shape[0]
 epochs_val = metrics_val['loss'].shape[0]
@@ -138,6 +139,11 @@ def plot_aux_losses(losses,metrics_train,metrics_val,groups):
 
 plot_aux_losses(losses,metrics_train,metrics_val,groups=groups)
 metrics.remove('post_division_track_acc')
+
+if 'object_detection_only' in folder:
+    metrics.remove('overall_track_acc')
+    metrics.remove('divisions_track_acc')
+    metrics.remove('new_cells_track_acc')
 
 # Plot acc
 fig,ax = plt.subplots(1,2,figsize=(10,5))
