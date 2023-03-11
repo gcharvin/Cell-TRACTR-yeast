@@ -231,7 +231,7 @@ def create_anno(mask,cell,image_id,track_id,annotation_id,category_id):
     return annotation
 
 
-def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id):
+def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id,counter):
 
     prev_gt,cur_gt = gts
     prev_annotations,cur_annotations = annotations_old
@@ -313,8 +313,16 @@ def compile_annotations(gts,annotations_old,annotation_ids_old,track_id,image_id
 
     return updated_annotations, track_id, updated_annotation_ids
 
-# datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/new_dataset')
-datapath = Path('/projectnb/dunlop/ooconnor/16bit/cell-trackformer/data/cells')
+mothermachine = True
+
+if mothermachine:
+    min_area = 50
+    dataset = 'moma'
+else:
+    min_area = 10
+    dataset = '2D'
+
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data') / dataset
 
 anno_folder = 'annotations'
 (datapath / anno_folder).mkdir(exist_ok=True)
@@ -325,13 +333,7 @@ for folder in folders:
 
 category_id = 1
 no_cell = 0
-mothermachine = False
 target_size = (256,256)
-
-if mothermachine:
-    min_area = 50
-else:
-    min_area = 10
 
 img_fps = list((datapath / 'raw_data' / 'img').glob("*.png"))[:]
 
@@ -462,160 +464,167 @@ for idx,dataset_fns in enumerate([train_fns,val_fns]):
     if mothermachine:
         shifts = [0]
     else:
-        shifts = [[-10,-10],[-10,0],[0,-10],[0,0],[10,0],[0,10],[10,10]]
-        shifts = [[0,0]]
+        shifts = [0,50,100]
 
     for counter,fn in enumerate(tqdm(dataset_fns)):
 
         for shift in shifts:
-            if not mothermachine:
-                prev_inputs = cv2.imread(str(datapath / 'raw_data' / 'inputs' / fn),cv2.IMREAD_ANYDEPTH)
-                img_reader.get_slices((prev_inputs > 0) * 1, shift)
-
-            prev_img = img_reader.read_image(datapath / 'raw_data' / 'previmg' / fn)
-            cur_img = img_reader.read_image(datapath / 'raw_data' / 'img' / fn)
-
-            prev_gt, cur_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn)
-
-            framenb = re.findall('\d+',fn)[-1]
-            pad = len(framenb)
-            framenb_plus1 = f'{int(framenb)+1:0{pad}d}'
-            framenb_minus1 = f'{int(framenb)-1:0{pad}d}'
-
-            fn_plus1 = fn.replace(framenb,framenb_plus1)
-            fn_minus1 = fn.replace(framenb,framenb_minus1)
-
-            prev_prev_img = img_reader.read_image(datapath / 'raw_data' / 'previmg' / fn_minus1)
-            fut_img = img_reader.read_image(datapath / 'raw_data' / 'img' / fn_plus1)
-
-            prev_prev_gt, prev_cur_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn_minus1)
-            fut_prev_gt, fut_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn_plus1)
-
-            if not ((fut_prev_gt > 0) == (cur_gt > 0)).all() or not ((prev_cur_gt > 0) == (prev_gt > 0)).all():
-                continue
-
-            cellnbs = np.unique(prev_gt)[1:]
-
-            assert ((prev_gt > 0) == (prev_cur_gt > 0)).all()
-
-            for cellnb in cellnbs:
-                delete = True
-                mask = prev_gt == cellnb
-                if mask.sum() > min_area:
-                    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                    for contour in contours:
-                        if contour.size >= 6:
-                            delete = False
-                            break
-
-                if delete:
-                    prev_cur_cellnb = prev_cur_gt[prev_gt == cellnb]
-                    if len(np.unique(prev_cur_cellnb)) > 1:
-                        raise Exception
-                    else:
-                        prev_cur_cellnb = prev_cur_cellnb[0]                
-                    prev_cur_gt[prev_cur_gt == prev_cur_cellnb] = 0
-                    prev_gt[prev_gt == cellnb] = 0
-
-
-            cellnbs = np.unique(fut_prev_gt)[1:]
-
-            assert ((fut_prev_gt > 0) == (cur_gt > 0)).all()
-
-            for cellnb in cellnbs:
-                delete = True
-                mask = fut_prev_gt == cellnb
-                if mask.sum() > min_area:
-                    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                    for contour in contours:
-                        if contour.size >= 6:
-                            delete = False
-                            break
-
-                if delete:
-                    cur_cellnb = cur_gt[fut_prev_gt == cellnb]
-                    if len(np.unique(cur_cellnb)) > 1:
-                        raise Exception
-                    else:
-                        cur_cellnb = cur_cellnb[0]
-                    cur_gt[cur_gt == cur_cellnb] = 0
-                    fut_prev_gt[fut_prev_gt == cellnb] = 0
-
-            cellnbs = np.unique(prev_prev_gt)[1:]
-
-            for cellnb in cellnbs:
-                delete = True
-                mask = prev_prev_gt == cellnb
-                if mask.sum() > min_area:
-                    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                    for contour in contours:
-                        if contour.size >= 6:
-                            delete = False
-                            break
-
-                if delete:
-                    prev_prev_gt[prev_prev_gt == cellnb] = 0
-
-
-            fut_gt_label = label(fut_gt > 0)
-            cellnbs = np.unique(fut_gt_label)[1:]
-
-            for cellnb in cellnbs:
-                delete = True
-                mask = fut_gt_label == cellnb
-                if mask.sum() > min_area:
-                    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-                    for contour in contours:
-                        if contour.size >= 6:
-                            delete = False
-                            break
-
-                if delete:
-                    fut_gt[fut_gt_label == cellnb] = 0
-
-            gts = [[prev_prev_gt,prev_cur_gt],[prev_gt,cur_gt],[fut_prev_gt,fut_gt]]
-
-            for k in range(len(gts)):
-                updated_annotations,track_id, updated_annotation_ids = compile_annotations(gts[k],annotations[k],annotation_ids[k],track_id,image_id)
-                annotations[k] = updated_annotations
-                annotation_ids[k] = updated_annotation_ids
-
-            if not mothermachine:
-                fn_updated = Path(fn).stem + f'_shift_{shift[0]:02d}_{shift[1]:02d}' + Path(fn).suffix
+            if shift == 0:
+                num_shifts = [[shift,shift]]
             else:
-                fn_updated = fn
+                num_shifts = [[-shift,-shift],[shift,shift],[-shift,shift],[shift,-shift],[-shift,0],[0,-shift],[shift,0],[0,shift]]
 
-            image = {
-                'license': 1,
-                'file_name': fn_updated,
-                'height': prev_gt.shape[0],
-                'width': prev_gt.shape[1],
-                'id': image_id,
-                'frame_id': 0,
-                'seq_length': 1,
-                }    
+            for shift_frame in num_shifts:
+                if not mothermachine:
+                    prev_inputs = cv2.imread(str(datapath / 'raw_data' / 'inputs' / fn),cv2.IMREAD_ANYDEPTH)
+                    img_reader.get_slices((prev_inputs > 0) * 1, shift_frame)
 
-            images.append(image)
+                prev_img = img_reader.read_image(datapath / 'raw_data' / 'previmg' / fn)
+                cur_img = img_reader.read_image(datapath / 'raw_data' / 'img' / fn)
 
-            image_id += 1
+                prev_gt, cur_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn)
 
-            cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_img' / fn_updated),prev_prev_img)
-            cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_gt' / fn_updated),prev_prev_gt)
+                framenb = re.findall('\d+',fn)[-1]
+                pad = len(framenb)
+                framenb_plus1 = f'{int(framenb)+1:0{pad}d}'
+                framenb_minus1 = f'{int(framenb)-1:0{pad}d}'
 
-            cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_img' / fn_updated),prev_img)        
-            cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_gt' / fn_updated),prev_cur_gt)
+                fn_plus1 = fn.replace(framenb,framenb_plus1)
+                fn_minus1 = fn.replace(framenb,framenb_minus1)
 
-            cv2.imwrite(str(datapath / folders[idx] / 'prev_img' / fn_updated),prev_img)
-            cv2.imwrite(str(datapath / folders[idx] / 'prev_gt' / fn_updated),prev_gt)
+                prev_prev_img = img_reader.read_image(datapath / 'raw_data' / 'previmg' / fn_minus1)
+                fut_img = img_reader.read_image(datapath / 'raw_data' / 'img' / fn_plus1)
 
-            cv2.imwrite(str(datapath / folders[idx] / 'cur_img' / fn_updated),cur_img)
-            cv2.imwrite(str(datapath / folders[idx] / 'cur_gt' / fn_updated),cur_gt)
-            
-            cv2.imwrite(str(datapath / folders[idx] / 'fut_img' / fn_updated),fut_img)
-            cv2.imwrite(str(datapath / folders[idx] / 'fut_gt' / fn_updated),fut_gt)
+                prev_prev_gt, prev_cur_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn_minus1)
+                fut_prev_gt, fut_gt = img_reader.read_gt(datapath / 'raw_data' / 'inputs' / fn_plus1)
 
-            cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_img' / fn_updated),cur_img)
-            cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_gt' / fn_updated),fut_prev_gt)
+                if not ((fut_prev_gt > 0) == (cur_gt > 0)).all() or not ((prev_cur_gt > 0) == (prev_gt > 0)).all():
+                    continue
+
+                prev_label = label(prev_gt)
+                cellnbs = np.unique(prev_label)[1:]
+
+                assert ((prev_gt > 0) == (prev_cur_gt > 0)).all()
+
+                for cellnb in cellnbs:
+                    delete = True
+                    mask = prev_label == cellnb
+                    if mask.sum() > min_area:
+                        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            if contour.size >= 6:
+                                delete = False
+                                break
+
+                    if delete:
+                        prev_cur_cellnb = prev_cur_gt[prev_label == cellnb]
+                        if len(np.unique(prev_cur_cellnb)) > 1:
+                            raise Exception
+                        else:
+                            prev_cur_cellnb = prev_cur_cellnb[0]                
+                        prev_cur_gt[prev_cur_gt == prev_cur_cellnb] = 0
+                        prev_gt[prev_label == cellnb] = 0
+
+                fut_prev_label = label(fut_prev_gt)
+                cellnbs = np.unique(fut_prev_label)[1:]
+
+                assert ((fut_prev_gt > 0) == (cur_gt > 0)).all()
+
+                for cellnb in cellnbs:
+                    delete = True
+                    mask = fut_prev_label == cellnb
+                    if mask.sum() > min_area:
+                        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            if contour.size >= 6:
+                                delete = False
+                                break
+
+                    if delete:
+                        cur_cellnb = cur_gt[fut_prev_label == cellnb]
+                        if len(np.unique(cur_cellnb)) > 1:
+                            raise Exception
+                        else:
+                            cur_cellnb = cur_cellnb[0]
+                        cur_gt[cur_gt == cur_cellnb] = 0
+                        fut_prev_gt[fut_prev_label == cellnb] = 0
+
+                prev_prev_label = label(prev_prev_gt > 0)
+                cellnbs = np.unique(prev_prev_label)[1:]
+
+                for cellnb in cellnbs:
+                    delete = True
+                    mask = prev_prev_label == cellnb
+                    if mask.sum() > min_area:
+                        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            if contour.size >= 6:
+                                delete = False
+                                break
+
+                    if delete:
+                        prev_prev_gt[prev_prev_label == cellnb] = 0
+
+
+                fut_gt_label = label(fut_gt > 0)
+                cellnbs = np.unique(fut_gt_label)[1:]
+
+                for cellnb in cellnbs:
+                    delete = True
+                    mask = fut_gt_label == cellnb
+                    if mask.sum() > min_area:
+                        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                        for contour in contours:
+                            if contour.size >= 6:
+                                delete = False
+                                break
+
+                    if delete:
+                        fut_gt[fut_gt_label == cellnb] = 0
+
+                gts = [[prev_prev_gt,prev_cur_gt],[prev_gt,cur_gt],[fut_prev_gt,fut_gt]]
+
+                for k in range(len(gts)):
+                    updated_annotations,track_id, updated_annotation_ids = compile_annotations(gts[k],annotations[k],annotation_ids[k],track_id,image_id,counter)
+                    annotations[k] = updated_annotations
+                    annotation_ids[k] = updated_annotation_ids
+
+                if not mothermachine:
+                    fn_updated = Path(fn).stem + f'_shift_{shift:03d}_{shift_frame[0]}_{shift_frame[1]}' + Path(fn).suffix
+                else:
+                    fn_updated = fn
+
+                image = {
+                    'license': 1,
+                    'file_name': fn_updated,
+                    'height': prev_gt.shape[0],
+                    'width': prev_gt.shape[1],
+                    'id': image_id,
+                    'frame_id': 0,
+                    'seq_length': 1,
+                    }    
+
+                images.append(image)
+
+                image_id += 1
+
+                cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_img' / fn_updated),prev_prev_img)
+                cv2.imwrite(str(datapath / folders[idx] / 'prev_prev_gt' / fn_updated),prev_prev_gt)
+
+                cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_img' / fn_updated),prev_img)        
+                cv2.imwrite(str(datapath / folders[idx] / 'prev_cur_gt' / fn_updated),prev_cur_gt)
+
+                cv2.imwrite(str(datapath / folders[idx] / 'prev_img' / fn_updated),prev_img)
+                cv2.imwrite(str(datapath / folders[idx] / 'prev_gt' / fn_updated),prev_gt)
+
+                cv2.imwrite(str(datapath / folders[idx] / 'cur_img' / fn_updated),cur_img)
+                cv2.imwrite(str(datapath / folders[idx] / 'cur_gt' / fn_updated),cur_gt)
+                
+                cv2.imwrite(str(datapath / folders[idx] / 'fut_img' / fn_updated),fut_img)
+                cv2.imwrite(str(datapath / folders[idx] / 'fut_gt' / fn_updated),fut_gt)
+
+                cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_img' / fn_updated),cur_img)
+                cv2.imwrite(str(datapath / folders[idx] / 'fut_prev_gt' / fn_updated),fut_prev_gt)
         
     json_folders = ['prev_prev','prev_cur','prev','cur','fut_prev','fut']
 
