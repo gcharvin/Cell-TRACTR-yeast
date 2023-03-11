@@ -53,8 +53,8 @@ class box_cxcy_to_xyxy():
 
         return boxes
 
-def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filename,train,meta_data=None):
-    
+def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filename,folder,args,meta_data=None):
+
     print_gt = True
     filename = Path(filename)
     height = samples.shape[-2]
@@ -63,14 +63,13 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
     spacer = 10
     threshold = 0.5 
     mask_threshold = 0.5
-    folder = 'train_outputs' if train else 'eval_outputs'
     blank = None
     fontscale = 0.4
     alpha = 0.3
     pred_masks = 'pred_masks' in outputs
     box_converter = box_cxcy_to_xyxy(height,width)
     batch_enc_frames = []
-    enc_colors = [tuple((255*np.random.random(3))) for _ in range(400)]
+    colors = [tuple((255*np.random.random(3))) for _ in range(600)]
     
     if meta_data is not None:
         meta_data_keys = list(meta_data.keys())
@@ -83,7 +82,6 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             if meta_data_key == 'dn_track':
                 # dn_track = np.zeros((height,(width*7 + spacer)*bs,3))
                 for i in range(bs):
-                    colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
                     img = samples[i].permute(1,2,0)                
                     
@@ -193,15 +191,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                                 color=colors[where[idx]] if TP_mask[where[idx]] else (0,0,0),
                                 thickness = 1)            
 
-                            img_pred_track = cv2.putText(
-                                img_pred_track,
-                                text = f'{pred_logits[idx,0]:.2f}', 
-                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                                fontScale = fontscale,
-                                color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
-                                thickness=1,
-                            )
+                            if args.moma:
+                                img_pred_track = cv2.putText(
+                                    img_pred_track,
+                                    text = f'{pred_logits[idx,0]:.2f}', 
+                                    org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                    fontScale = fontscale,
+                                    color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
+                                    thickness=1,
+                                )
 
                             if 'pred_masks' in targets_TM[i]:
                                 mask = cv2.resize(pred_masks[idx,0],(width,height))
@@ -218,15 +217,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                                     color=colors[where[idx]] if TP_mask[where[idx]] else (0,0,0),
                                     thickness = 1)  
 
-                                img_pred_track = cv2.putText(
-                                    img_pred_track,
-                                    text = f'{pred_logits[idx,1]:.2f}', 
-                                    org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                                    fontScale = fontscale,
-                                    color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
-                                    thickness=1,
-                                )
+                                if args.moma:
+                                    img_pred_track = cv2.putText(
+                                        img_pred_track,
+                                        text = f'{pred_logits[idx,1]:.2f}', 
+                                        org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                        fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                        fontScale = fontscale,
+                                        color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
+                                        thickness=1,
+                                    )
 
                                 if 'pred_masks' in targets_TM[i]:
                                     mask = cv2.resize(pred_masks[idx,1],(width,height))
@@ -258,30 +258,30 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                                 mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                                 img_pred_object[mask>0] = img_pred_object[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
                             
-                    if outputs_TM['pred_logits'][i].shape[0] == targets_TM[i]['track_queries_mask'].sum():
-                        img_pred = np.concatenate((img_pred_track,img_all_pred),axis=1)
+                    if args.moma:
+                        if outputs_TM['pred_logits'][i].shape[0] == targets_TM[i]['track_queries_mask'].sum():
+                            img_pred = np.concatenate((img_pred_track,img_all_pred),axis=1)
+                        else:
+                            img_pred = np.concatenate((img_pred_track,img_pred_object,img_all_pred),axis=1)
                     else:
-                        img_pred = np.concatenate((img_pred_track,img_pred_object,img_all_pred),axis=1)
+                        img_pred = np.concatenate((img_pred_track,img),axis=1)
 
                     if i == 0:
-                        dn_track = np.concatenate((previmg,previmg_noised,img_gt,img_noised_gt,img_pred,np.zeros_like(previmg)),axis=1)
+                        if args.moma:
+                            dn_track = np.concatenate((previmg,previmg_noised,img_gt,img_noised_gt,img_pred,np.zeros((previmg.shape[0],20,3),dtype=previmg.dtype)),axis=1)
+                        else:
+                            dn_track = np.concatenate((previmg_noised,img_pred,np.zeros((previmg.shape[0],20,3),dtype=previmg.dtype)),axis=1)
                     else:
-                        dn_track = np.concatenate((dn_track,previmg,previmg_noised,img_gt,img_noised_gt,img_pred),axis=1)
-
-                    # dn_track[:,(width*7+spacer)*i + width*0:(width*7+spacer)*i + width*1] = previmg
-                    # dn_track[:,(width*7+spacer)*i + width*1:(width*7+spacer)*i + width*2] = previmg_noised
-                    # dn_track[:,(width*7+spacer)*i + width*2:(width*7+spacer)*i + width*3] = img_gt
-                    # dn_track[:,(width*7+spacer)*i + width*3:(width*7+spacer)*i + width*4] = img_noised_gt
-                    # dn_track[:,(width*7+spacer)*i + width*4:(width*7+spacer)*i + width*5] = img_pred_track
-                    # dn_track[:,(width*7+spacer)*i + width*5:(width*7+spacer)*i + width*6] = img_pred_object
-                    # dn_track[:,(width*7+spacer)*i + width*6:(width*7+spacer)*i + width*7] = img_all_pred
+                        if args.moma:
+                            dn_track = np.concatenate((dn_track,previmg,previmg_noised,img_gt,img_noised_gt,img_pred),axis=1)
+                        else:
+                            dn_track = np.concatenate((dn_track,previmg,previmg_noised,img_pred),axis=1)
 
                 cv2.imwrite(str(savepath / folder / 'dn_track' / filename),dn_track)
 
             elif meta_data_key == 'dn_enc':
                 dn_encs = []
                 for i in range(bs):
-                    colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
                     img = samples[i].permute(1,2,0)                
                     
@@ -448,7 +448,6 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             elif meta_data_key == 'dn_object':
                 dn_object = np.zeros((height,(width*5 + spacer)*bs,3))
                 for i in range(bs):
-                    colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
                     # img = samples.tensors[i].permute(1,2,0)                
                     img = samples[i].permute(1,2,0)                
@@ -502,15 +501,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                             color=colors[idx] if TP_mask[idx] else (0,0,0),
                             thickness = 1)  
                         
-                        img_pred_all = cv2.putText(
-                            img_pred_all,
-                            text = f'{pred_logits[idx,0]:.2f}', 
-                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                            fontScale = fontscale,
-                            color = colors[idx] if TP_mask[idx] else (128,128,128),
-                            thickness=1,
-                        )
+                        if args.moma:
+                            img_pred_all = cv2.putText(
+                                img_pred_all,
+                                text = f'{pred_logits[idx,0]:.2f}', 
+                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                fontScale = fontscale,
+                                color = colors[idx] if TP_mask[idx] else (128,128,128),
+                                thickness=1,
+                            )
 
                     keep = pred_logits[:,0] > threshold
                     where = np.where(pred_logits[:,0] > threshold)[0]
@@ -526,15 +526,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                             color=colors[where[idx]] if TP_mask[where[idx]] else (0,0,0),
                             thickness = 1)            
 
-                        img_pred = cv2.putText(
-                            img_pred,
-                            text = f'{pred_logits[idx,0]:.2f}', 
-                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                            fontScale = fontscale,
-                            color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
-                            thickness=1,
-                        )
+                        if args.moma:
+                            img_pred = cv2.putText(
+                                img_pred,
+                                text = f'{pred_logits[idx,0]:.2f}', 
+                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                fontScale = fontscale,
+                                color = colors[where[idx]] if TP_mask[where[idx]] else (128,128,128),
+                                thickness=1,
+                            )
 
                     dn_object[:,(width*5+spacer)*i + width*0:(width*5+spacer)*i + width*1] = img
                     dn_object[:,(width*5+spacer)*i + width*1:(width*5+spacer)*i + width*2] = img_gt
@@ -550,14 +551,11 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
         if i > 0:
             blank = np.concatenate((blank,np.zeros((blank.shape[0],15,3))),axis=1)
 
-        colors = [tuple((255*np.random.random(3))) for _ in range(400)]
-
         previmg = targets[i]['prev_image'].permute(1,2,0)
         previmg = previmg.detach().cpu().numpy().copy()
         previmg = np.repeat(np.mean(previmg,axis=-1)[:,:,np.newaxis],3,axis=-1)
         previmg = (255*(previmg - np.min(previmg)) / np.ptp(previmg)).astype(np.uint8)
         previmg_copy = previmg.copy()
-        previmg_masks = previmg.copy()
         previmg_track_only = previmg.copy()
         previmg_object_only = previmg.copy()
         
@@ -566,22 +564,10 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             prev_classes = prev_outputs['pred_logits'][i].sigmoid().detach().cpu().numpy()
 
             prev_keep = prev_classes[:,0] > threshold
-            prev_bbs = prev_bbs[prev_keep,]
+            prev_bbs = prev_bbs[prev_keep]
             prev_classes = prev_classes[prev_keep]
 
             keep_ind = prev_keep.nonzero()[0]
-
-            if 'pred_masks' in prev_outputs:
-                prev_masks = prev_outputs['pred_masks'][i].detach().cpu().sigmoid().numpy()[prev_keep]
-
-                if sum(prev_keep) > 0:
-                    masks_filt = np.zeros((prev_masks.shape))
-                    argmax = np.argmax(prev_masks,axis=0)
-                    for m in range(prev_masks.shape[0]):
-                        masks_filt[m,argmax==m] = prev_masks[m,argmax==m]
-                    masks_filt = masks_filt > mask_threshold
-                    prev_masks = (masks_filt*255).astype(np.uint8)
-
 
             if sum(prev_keep) > 0:
                 prev_bbs = box_converter.convert(prev_bbs)
@@ -596,15 +582,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                         color=(255,0,0),
                         thickness = 1)
 
-                    previmg_track_only = cv2.putText(
-                        previmg_track_only,
-                        text = f'{prev_classes[idx,0]:.2f}', 
-                        org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                        fontScale = 0.4,
-                        color = (128,128,128),
-                        thickness=1,
-                    )
+                    if args.moma:
+                        previmg_track_only = cv2.putText(
+                            previmg_track_only,
+                            text = f'{prev_classes[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = 0.4,
+                            color = (128,128,128),
+                            thickness=1,
+                        )
 
                     if prev_classes[idx,1] > 0.5:
                         bounding_box = bbox[4:]
@@ -615,15 +602,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                             color = (0,0,255),
                             thickness = 1)
 
-                        previmg_track_only = cv2.putText(
-                            previmg_track_only,
-                            text = f'{prev_classes[idx,1]:.2f}', 
-                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                            fontScale = fontscale,
-                            color = (128,128,128),
-                            thickness=1,
-                        )
+                        if args.moma:
+                            previmg_track_only = cv2.putText(
+                                previmg_track_only,
+                                text = f'{prev_classes[idx,1]:.2f}', 
+                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                fontScale = fontscale,
+                                color = (128,128,128),
+                                thickness=1,
+                            )
                 else:
                     bounding_box = bbox[:4]
                     previmg_object_only = cv2.rectangle(
@@ -633,15 +621,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                         color=(0,0,0),
                         thickness = 1)
 
-                    previmg_object_only = cv2.putText(
-                        previmg_object_only,
-                        text = f'{prev_classes[idx,0]:.2f}', 
-                        org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                        fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                        fontScale = 0.4,
-                        color = (128,128,128),
-                        thickness=1,
-                    )
+                    if args.moma:
+                        previmg_object_only = cv2.putText(
+                            previmg_object_only,
+                            text = f'{prev_classes[idx,0]:.2f}', 
+                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                            fontScale = 0.4,
+                            color = (128,128,128),
+                            thickness=1,
+                        )
 
                     if prev_classes[idx,1] > 0.5:
                         bounding_box = bbox[4:]
@@ -652,23 +641,16 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                             color = (128,128,128),
                             thickness = 1)
 
-                        previmg_object_only = cv2.putText(
-                            previmg_object_only,
-                            text = f'{prev_classes[idx,1]:.2f}', 
-                            org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                            fontScale = fontscale,
-                            color = (0,0,0),
-                            thickness=1,
-                        )
-
-                if 'pred_masks' in prev_outputs:
-
-                    prev_mask = cv2.resize(prev_masks[idx],(width,height)) 
-                    prev_mask = np.repeat(prev_mask[:,:,None],3,axis=-1)
-                    prev_mask[prev_mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
-                    previmg_masks[prev_mask>0] = previmg_masks[prev_mask>0]*(1-alpha) + prev_mask[prev_mask>0]*(alpha)
-
+                        if args.moma:
+                            previmg_object_only = cv2.putText(
+                                previmg_object_only,
+                                text = f'{prev_classes[idx,1]:.2f}', 
+                                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                                fontScale = fontscale,
+                                color = (0,0,0),
+                                thickness=1,
+                            )
 
             track_query_boxes = targets[i]['track_query_boxes'].detach().cpu()
 
@@ -681,6 +663,15 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
             previmg_keep_queries = previmg_copy.copy()
 
+            if not args.moma:
+                for idx,bounding_box in enumerate(prev_bbs):
+                    previmg_keep_queries = cv2.rectangle(
+                        previmg_keep_queries,
+                        (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
+                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
+                        color=(0,0,0),
+                        thickness = 1 )
+
             for idx,bounding_box in enumerate(track_query_boxes):
                 previmg_keep_queries = cv2.rectangle(
                     previmg_keep_queries,
@@ -689,22 +680,31 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     color=colors[idx],
                     thickness = 1 if targets[i]['track_queries_TP_mask'][targets[i]['track_queries_mask']][idx] else 1)
 
-            if blank is None:
-                blank = previmg_copy
-            else:
-                blank = np.concatenate((blank,previmg_copy),axis=1)
 
-            if prev_outputs['pred_logits'][i].shape[0] == (~targets[i]['track_queries_mask']).sum():
-                blank = np.concatenate((blank,previmg_masks,previmg_object_only,previmg_keep_queries),axis=1)
+            if args.moma:
+                if blank is None:
+                    blank = previmg_keep_queries
+                else:
+                    blank = np.concatenate((blank,previmg_keep_queries),axis=1)
+
+                if prev_outputs['pred_logits'][i].shape[0] == (~targets[i]['track_queries_mask']).sum():
+                    blank = np.concatenate((blank,previmg_object_only,previmg_keep_queries),axis=1)
+                else:
+                    blank = np.concatenate((blank,previmg_track_only,previmg_object_only,previmg_keep_queries),axis=1)
             else:
-                blank = np.concatenate((blank,previmg_masks,previmg_track_only,previmg_object_only,previmg_keep_queries),axis=1)
+                if blank is None:
+                    blank = np.concatenate((previmg_copy,previmg_keep_queries),axis=1)
+                else:
+                    blank = np.concatenate((blank,previmg_copy,previmg_keep_queries),axis=1)
+                        
+
 
         if prev_outputs is not None and 'enc_outputs' in prev_outputs:
             enc_outputs = prev_outputs['enc_outputs']
             enc_pred_logits = enc_outputs['pred_logits'].cpu()
             enc_pred_boxes = enc_outputs['pred_boxes'].cpu()
 
-            logits_topk, ind_topk = torch.topk(enc_pred_logits[i,:,0].sigmoid(),30)
+            logits_topk, ind_topk = torch.topk(enc_pred_logits[i,:,0].sigmoid(),args.num_queries)
             boxes_topk = enc_pred_boxes[i,ind_topk]
 
             boxes_topk = box_converter.convert(boxes_topk.numpy())
@@ -725,7 +725,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     enc_frame,
                     (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                     (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                    color=enc_colors[idx],
+                    color=colors[idx],
                     thickness = 1)
                 enc_frames.append(enc_frame)
 
@@ -754,7 +754,9 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
 
         if prev_outputs is not None:
             track_keep = keep[:track_query_boxes.shape[0]]
-            colors = [colors[idx] for idx in range(len(track_keep)) if track_keep[idx]] 
+            colors_select = [colors[idx] for idx in range(len(track_keep)) if track_keep[idx]] 
+        else:
+            colors_select = colors
 
         if sum(keep) > 0:
             bbs = box_converter.convert(bbs)
@@ -771,23 +773,24 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                 img,
                 (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                 (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                color=colors[idx] if idx < len(colors) else (0,0,0),
+                color=colors_select[idx] if idx < len(colors_select) else (0,0,0),
                 thickness = 1)
 
-            img = cv2.putText(
-                img,
-                text = f'{classes[idx,0]:.2f}', 
-                org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = fontscale,
-                color = colors[idx] if idx < len(colors) else (128,128,128),
-                thickness=1,
-            )
+            if args.moma:
+                img = cv2.putText(
+                    img,
+                    text = f'{classes[idx,0]:.2f}', 
+                    org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                    fontScale = fontscale,
+                    color = colors_select[idx] if idx < len(colors_select) else (128,128,128),
+                    thickness=1,
+                )
 
             if 'pred_masks' in outputs:
                 mask = cv2.resize(masks[idx,0],(width,height)) 
                 mask = np.repeat(mask[...,None],3,axis=-1)
-                mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
+                mask[mask[...,0]>0] = colors_select[idx] if idx < len(colors_select) else (128,128,128)
                 img_masks[mask>0] = img_masks[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
 
@@ -797,23 +800,24 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     img,
                     (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                     (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                    color=colors[idx] if idx < len(colors) else (0,0,0),
+                    color=colors_select[idx] if idx < len(colors_select) else (0,0,0),
                     thickness = 1)
 
-                img = cv2.putText(
-                    img,
-                    text = f'{classes[idx,1]:.2f}', 
-                    org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
-                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                    fontScale = fontscale,
-                    color = colors[idx] if idx < len(colors) else (128,128,128),
-                    thickness=1,
-                )
+                if args.moma:
+                    img = cv2.putText(
+                        img,
+                        text = f'{classes[idx,1]:.2f}', 
+                        org=(int(bounding_box[0]) - 5, int(bounding_box[1] + bounding_box[3] // 4 + int(fontscale*30))), 
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                        fontScale = fontscale,
+                        color = colors_select[idx] if idx < len(colors_select) else (128,128,128),
+                        thickness=1,
+                    )
 
                 if 'pred_masks' in outputs:
                     mask = cv2.resize(masks[idx,1],(width,height))
                     mask = np.repeat(mask[...,None],3,axis=-1)
-                    mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
+                    mask[mask[...,0]>0] = colors_select[idx] if idx < len(colors_select) else (128,128,128)
                     img_masks[mask>0] = img_masks[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
                     
         if 'enc_outputs' in outputs:
@@ -821,7 +825,7 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             enc_pred_logits = enc_outputs['pred_logits'].detach().cpu()
             enc_pred_boxes = enc_outputs['pred_boxes'].detach().cpu()
 
-            logits_topk, ind_topk = torch.topk(enc_pred_logits[i,:,0].sigmoid(),30)
+            logits_topk, ind_topk = torch.topk(enc_pred_logits[i,:,0].sigmoid(),args.num_queries)
             boxes_topk = enc_pred_boxes[i,ind_topk]
 
             boxes_topk = box_converter.convert(boxes_topk.numpy())
@@ -860,14 +864,14 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                     enc_frame,
                     (int(np.clip(bounding_box[0],0,width)), int(np.clip(bounding_box[1],0,height))),
                     (int(np.clip(bounding_box[0] + bounding_box[2],0,width)), int(np.clip(bounding_box[1] + bounding_box[3],0,height))),
-                    color=enc_colors[idx],
+                    color=colors[idx],
                     thickness = 1)
 
                     if 'pred_masks' in enc_outputs and b > 0:
                         mask = masks_list[b][idx,0]
                         mask = cv2.resize(mask,(width,height))
                         mask = np.repeat(mask[...,None],3,axis=-1)
-                        mask[mask[...,0]>0] = enc_colors[idx] if idx < len(colors) else (128,128,128)
+                        mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                         enc_frame[mask>0] = enc_frame[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
                 enc_frames.append(enc_frame)
@@ -882,17 +886,14 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
             batch_enc_frames.append(enc_frames)
 
         if blank is None:
-            blank = np.concatenate((img_masks,img),axis=1)
+            blank = np.concatenate((img_masks,img, img_copy),axis=1)
         else:
-            blank = np.concatenate((blank,img_masks,img),axis=1)
-
-        blank = np.concatenate((blank,img_copy),axis=1)
+            blank = np.concatenate((blank,img_masks,img, img_copy),axis=1)
 
         if print_gt:
-
+    
             target = targets[i]
             target_og = targets_og[i]
-            colors = [tuple((255*np.random.random(3))) for _ in range(400)]
 
             if prev_outputs is not None:
                 # If just object detection, then just current frame is used so two frames back gives us no valuable information
@@ -939,8 +940,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                             mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                             prev_prev_img_gt[mask>0] = prev_prev_img_gt[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
-                blank = np.concatenate((blank,prev_prev_img_gt_copy,prev_prev_img_gt),axis=1)
-            
+                if args.moma:
+                    blank = np.concatenate((blank,prev_prev_img_gt_copy,prev_prev_img_gt),axis=1)
 
             previmg_gt = previmg_copy.copy()
 
@@ -1018,7 +1019,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                         mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                         previmg_gt_og[mask>0] = previmg_gt_og[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
-            blank = np.concatenate((blank,previmg_gt,previmg_gt_og),axis=1) 
+            if args.moma:
+                blank = np.concatenate((blank,previmg_gt,previmg_gt_og),axis=1) 
 
             img_gt = img_copy.copy()
 
@@ -1094,7 +1096,10 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                         mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                         img_gt_og[mask>0] = img_gt_og[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
-            blank = np.concatenate((blank,img_gt,img_gt_og),axis=1)
+            if args.moma:
+                blank = np.concatenate((blank,img_gt,img_gt_og),axis=1)
+            else:
+                blank = np.concatenate((blank,img_gt),axis=1)
 
             fut_img_gt = target['fut_image'].permute(1,2,0).cpu().numpy()
             fut_img_gt = np.repeat(np.mean(fut_img_gt,axis=-1)[:,:,np.newaxis],3,axis=-1)
@@ -1137,7 +1142,8 @@ def plot_results(outputs,prev_outputs,targets,samples,targets_og,savepath,filena
                         mask[mask[...,0]>0] = colors[idx] if idx < len(colors) else (128,128,128)
                         fut_img_gt[mask>0] = fut_img_gt[mask>0]*(1-alpha) + mask[mask>0]*(alpha)
 
-            blank = np.concatenate((blank,fut_img_gt,fut_img_gt_copy),axis=1)
+            if args.moma:
+                blank = np.concatenate((blank,fut_img_gt,fut_img_gt_copy),axis=1)
 
 
     cv2.imwrite(str(savepath / folder / 'standard' / filename),blank)
@@ -1869,7 +1875,7 @@ def display_loss(metrics_dict:dict,i,i_total,epoch,dataset):
             display_loss[key] = f'{np.nanmean(metrics_dict[key][-1]):.4f}'
 
     pad = int(math.log10(i_total))+1
-    print(f'{dataset}  Epoch: {epoch} ({i:0{pad}}/{i_total})',display_loss)
+    print(f'{dataset}  Epoch: {epoch} ({i:0{pad}}/{i_total-1})',display_loss)
 
 
 def save_metrics_pkl(metrics_dict,output_dir,dataset,epoch):
@@ -2201,7 +2207,7 @@ def divide_mask(mask,fut_mask):
 
     return div_mask
 
-def calc_iou(box_1,box_2,return_flip=False):
+def calc_iou(box_1,box_2):
 
     if (box_1[-1] == 0 and box_2[-1] == 0) or (box_1.shape[0] == 4 and box_2.shape[0] == 4):
         iou = box_ops.generalized_box_iou(
@@ -2240,10 +2246,9 @@ def calc_iou(box_1,box_2,return_flip=False):
         iou_flip = (iou_1_flip + iou_2_flip) / 2
 
         iou = max(iou,iou_flip)
-        flip = iou_flip == iou
 
-        if return_flip:
-            return iou, flip
+    else:
+        iou = 0
 
     return iou
 
@@ -2427,13 +2432,9 @@ def update_early_or_late_track_divisions(
                     if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
                         div_box = divide_box(box,fut_box)
 
-                        iou_div, flip = calc_iou(div_box,pred_box,return_flip=True)
+                        iou_div = calc_iou(div_box,pred_box)
                         pred_box[4:] = 0
                         iou = calc_iou(box,pred_box)
-
-                        # We flip target div boxes even though the matcher should be able to handle this 
-                        if flip:
-                            div_box = torch.cat((div_box[4:],div_box[:4]))
 
                         if iou_div - iou > 0 and iou_div > 0.5:
                             target['boxes'][target['track_query_match_ids'][p]] = div_box
