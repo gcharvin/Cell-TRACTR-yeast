@@ -19,10 +19,16 @@ from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
 from trackformer.datasets import build_dataset
 
+moma = True
+
+if moma:
+    yaml_file = ''
+else:
+    yaml_file = '_2D'
 
 ex = sacred.Experiment('train')
 # ex.add_config('../cfgs/train.yaml')
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train.yaml')
+ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train' + yaml_file + '.yaml')
 ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
 
 def train(args: Namespace) -> None:
@@ -38,25 +44,42 @@ def train(args: Namespace) -> None:
     args.save_model_interval = False
     args.eval_only = True
     args.resume = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname / 'checkpoint.pth'
-    
-    datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/cells/predictions/2022-04-24_TrainingSet8/img')
-    fps = sorted(list((datapath).glob('*.png')))
+    args.moma = moma 
+
+    track = True
+    display_masks = False
+
+    args.eval_ctc = False
+
+    display_worst = False
+    args.use_prev_prev_frame = True
+
+    run_movie = True
+    use_NMS = True
+
+    if moma:
+        if args.eval_ctc:
+            datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/moma/test/ctc_data')
+            args.output_dir = args.output_dir / 'test'
+            args.output_dir.mkdir(exist_ok=True)
+            track = True
+            run_movie = True
+            display_worst = False
+        else:
+            datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/moma/test/raw_data/img')
+            fps = sorted(list((datapath).glob('*.png')))
+    else:
+        raise NotImplementedError
     
     args.batch_size = 1
-    args.init_enc_queries_embeddings = False
-
-    display_worst = True
-    run_movie = True
-    track = True
-    display_masks = True
-    use_NMS = False
-    args.use_prev_prev_frame = True
 
     print(args)
 
     args.output_dir.mkdir(exist_ok=True)
-    (args.output_dir / 'eval_outputs').mkdir(exist_ok=True)
-    (args.output_dir / 'train_outputs').mkdir(exist_ok=True)
+
+    if display_worst:
+        (args.output_dir / 'val_outputs').mkdir(exist_ok=True)
+        (args.output_dir / 'train_outputs').mkdir(exist_ok=True)
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -64,10 +87,6 @@ def train(args: Namespace) -> None:
     if not args.deformable:
         assert args.num_feature_levels == 1
         
-    if args.tracking:
-        if args.tracking_eval:
-            assert 'mot' in args.dataset or 'cells' in args.dataset
-
     output_dir = Path(args.output_dir)
     if args.output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -87,7 +106,6 @@ def train(args: Namespace) -> None:
 
     np.random.seed(seed)
     random.seed(seed)
-
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
@@ -174,13 +192,26 @@ def train(args: Namespace) -> None:
 
     if run_movie:
         model.evaluate_dataset_with_no_data_aug = False
-        Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
-        Pipeline.forward()
+        if args.eval_ctc:
+            folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if 'GT' not in folderpath.name]
+            for folderpath in folderpaths:
+                fps = sorted(list(folderpath.glob("*.tif")))
+
+                output_dir = args.output_dir / folderpath.name
+                output_dir.mkdir(exist_ok=True)
+                
+                Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
+                Pipeline.forward()
+
+        else:
+            
+            Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
+            Pipeline.forward()
     
     if display_worst:
 
         model.evaluate_dataset_with_no_data_aug = True
-        args.evaluate_dataset_with_no_data_aug = True
+        args.evaluate_dataset_with_no_data_aug = False
 
         datasets_train = build_dataset(split='train', args=args)
         datasets_val = build_dataset(split='val', args=args)
@@ -213,7 +244,7 @@ def train(args: Namespace) -> None:
             data_loaders_train.append(data_loader_train)
             data_loaders_val.append(data_loader_val)
 
-        print_worst(model,criterion,data_loaders_train,data_loaders_val,device,output_dir,args,track)
+        print_worst(model,criterion,data_loaders_train,data_loaders_val,device,args,track)
 
 
 

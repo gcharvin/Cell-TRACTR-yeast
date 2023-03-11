@@ -13,6 +13,7 @@ import torch
 import cv2
 from tqdm import tqdm
 from .util import misc as utils
+from .util import box_ops
 from .datasets.transforms import Normalize,ToTensor,Compose
 
 
@@ -33,16 +34,19 @@ def calc_loss_for_training_methods(training_method:str,
 
     targets_TM = [target[training_method] for target in targets]
 
-    if epoch > args.epoch_to_start_using_flexible_divisions:
-        targets_TM = utils.update_early_or_late_track_divisions(outputs_TM,targets_TM)
-
-    loss_dict_TM = criterion(outputs_TM, targets_TM)
+    loss_dict_TM = criterion(outputs_TM, targets_TM, epoch)
 
     return outputs_TM, loss_dict_TM, groups
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loaders: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, args, num_plots=10, interval = 50):
+def train_one_epoch(model: torch.nn.Module, 
+                    criterion: torch.nn.Module,
+                    data_loaders: Iterable, 
+                    optimizer: torch.optim.Optimizer,
+                    epoch: int, 
+                    args, 
+                    num_plots: int = 10, 
+                    interval: int = 50):
+
     dataset = 'train'
     model.train()
     criterion.train()
@@ -100,8 +104,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             assert target['image_id'] == prev_prev_targets[t]['image_id']
             assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
 
-        samples = samples.to(device)
-        targets = [utils.nested_dict_to_device(t, device) for t in targets]
+        samples = samples.to(args.device)
+        targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
 
         outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold,epoch=epoch)
 
@@ -120,10 +124,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         outputs = utils.split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
 
-        if epoch > args.epoch_to_start_using_flexible_divisions:
-            targets = utils.update_early_or_late_track_divisions(outputs,targets)
-
-        loss_dict = criterion(outputs, targets)
+        loss_dict = criterion(outputs, targets, epoch)
         weight_dict = criterion.weight_dict
 
         loss_dict_keys = list(loss_dict.keys())
@@ -155,7 +156,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         # Compute the segmentation and tracking metrics
         cls_threshold = 0.5
-        iou_threshold = 0.75
+        if args.moma:
+            iou_threshold = 0.75
+        else:
+            iou_threshold = 0.5
         if 'track_query_match_ids' in targets[0]:
             acc_dict = utils.calc_track_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
         else:
@@ -171,20 +175,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
         if i in ids and (epoch % 5 == 0 or epoch == 1):
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, args.output_dir, train=True, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args,meta_data=meta_data)
 
-        if i > 0 and i % interval == 0:
+        if i > 0 and (i % interval == 0 or i == len(data_loaders[0]) - 1):
             utils.display_loss(metrics_dict,i,len(data_loaders[0]),epoch=epoch,dataset=dataset)
 
     utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset,epoch=epoch)  
 
-
-
-
-
 @torch.no_grad()
-def evaluate(model, criterion, data_loaders, device, output_dir: str, 
-             args, epoch: int = None, train=False, interval=50):
+def evaluate(model, criterion, data_loaders, args, epoch: int = None, interval=50):
+
     model.eval()
     criterion.eval()
     dataset = 'val'
@@ -244,8 +244,8 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
             assert prev_targets[t]['image_id'] == fut_prev_targets[t]['image_id']
         
 
-        samples = samples.to(device)
-        targets = [utils.nested_dict_to_device(t, device) for t in targets]
+        samples = samples.to(args.device)
+        targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
 
         outputs, targets, features, memory, hs, mask_features, prev_outputs = model(samples,targets,tm_threshold=tm_threshold,epoch=epoch)
 
@@ -264,10 +264,7 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         outputs = utils.split_outputs(outputs,groups[:2],new_outputs=None,update_masks=args.masks)
 
-        if epoch > args.epoch_to_start_using_flexible_divisions:
-            targets = utils.update_early_or_late_track_divisions(outputs,targets)
-
-        loss_dict = criterion(outputs, targets)
+        loss_dict = criterion(outputs, targets,epoch)
         weight_dict = criterion.weight_dict
 
         loss_dict_keys = list(loss_dict.keys())
@@ -283,7 +280,10 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         # Compute the segmentation and tracking metrics
         cls_threshold = 0.5
-        iou_threshold = 0.75
+        if args.moma:
+            iou_threshold = 0.75
+        else:
+            iou_threshold = 0.5
         if 'track_query_match_ids' in targets[0]:
             acc_dict = utils.calc_track_acc(outputs,targets,cls_thresh=cls_threshold,iou_thresh=iou_threshold)
         else:
@@ -291,10 +291,10 @@ def evaluate(model, criterion, data_loaders, device, output_dir: str,
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
-        if i in ids and (epoch % 5 == 0 or epoch == 1) and train:
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, savepath = output_dir, train=False, filename = f'Epoch{epoch:03d}_Step{i:06d}.png', meta_data=meta_data)
+        if i in ids and (epoch % 5 == 0 or epoch == 1):
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, savepath = args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args, meta_data=meta_data)
 
-        if i > 0 and i % interval == 0:
+        if i > 0 and (i % interval == 0  or i == len(data_loaders[0]) - 1):
             utils.display_loss(metrics_dict,i,len(data_loaders[0]),epoch=epoch,dataset=dataset)
 
     utils.save_metrics_pkl(metrics_dict,args.output_dir,dataset=dataset,epoch=epoch)  
@@ -309,16 +309,19 @@ class pipeline():
 
         self.use_NMS = use_NMS
         self.masks = display_masks and args.masks
-
-        self.predictions_folder = 'predictions' 
-        
-        if self.use_NMS:
-            self.predictions_folder += '_NMS'
-
-
-
+        self.eval_ctc = args.eval_ctc
         self.output_dir = output_dir
-        (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
+
+        if not self.eval_ctc:
+            self.predictions_folder = 'predictions_empty' 
+
+            if self.masks:
+                self.predictions_folder += '_mask'
+            
+            if self.use_NMS:
+                self.predictions_folder += '_NMS'
+
+            (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
 
         self.normalize = Compose([
             ToTensor(),
@@ -330,6 +333,7 @@ class pipeline():
         self.num_queries = args.num_queries
         self.device = device
         self.use_dab = args.use_dab
+        
 
         self.write_video = True
         self.track = track
@@ -340,18 +344,25 @@ class pipeline():
             self.colors = np.array([tuple((np.zeros(3))) for _ in range(1000)])
 
         if args.two_stage:
-            (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
+            if not args.eval_ctc:
+                (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
 
-        self.oq_div = True # Can object queries detect divisions
+        self.oq_div = False # Can object queries detect divisions
 
-        self.display_decoder_aux = True
+        if self.eval_ctc:
+            self.display_decoder_aux = False
+        else:
+            self.display_decoder_aux = False
 
         if self.display_decoder_aux:
             (self.output_dir / self.predictions_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
             (self.output_dir / self.predictions_folder / 'ref_pts_outputs').mkdir(exist_ok=True)
             self.num_decoder_frames = 1
 
-        self.display_object_query_boxes = True
+        if self.eval_ctc:
+            self.display_object_query_boxes = False
+        else:
+            self.display_object_query_boxes = False
 
         if self.display_object_query_boxes:
             self.query_box_locations = [np.zeros((1,4)) for i in range(args.num_queries)]
@@ -361,7 +372,7 @@ class pipeline():
 
         for fidx,fp in enumerate(fps):
             frame_nb = re.findall('\d+',fp.stem)[-1]
-            filename = fp.name.replace(frame_nb+'.png','')
+            filename = fp.name.replace(frame_nb+fp.suffix,'')
 
             if fidx == 0 or filename != old_filename:
                 self.videoname_list.append(filename)
@@ -376,7 +387,7 @@ class pipeline():
         max_len = max([len(fp_split) for fp_split in self.fps_split])
 
         self.color_stack = np.zeros((max_len,self.target_size[0],self.target_size[1]*len(self.videoname_list),3))
-
+            
     def update_query_box_locations(self,pred_boxes,keep,keep_div):
         # This is only used to display to reference points for object queries that are detected
         # Get x,y location of all detected object queries 
@@ -406,7 +417,7 @@ class pipeline():
             self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add daughter cellnb after mother cellnb
             self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:])) # order doesn't matter here since they are the same track indices
 
-            self.div_track[ind:ind+2] = div_ind # we add 1 because div_track is set as np.zeros so an ind of 0 would blend in with the starting point
+            self.div_track[ind:ind+2] = div_ind 
 
         self.new_cells = self.cells == 0
 
@@ -423,16 +434,16 @@ class pipeline():
         for unique_div in self.unique_divs:
             div_ids = (self.div_track == unique_div).nonzero()[0]
             boxes[div_ids[1],:4] = boxes[div_ids[0],4:]
-            # e.g. [15, 45, 16, 22, 14, 62, 15, 20]  -->  [15, 45, 16, 22, 14, 62, 15, 20]  -->  [15, 45, 16, 22]  --> fed to decoder
-            #      [15, 45, 16, 22, 14, 62, 15, 20]  -->  [14, 62, 15, 20, 14, 62, 15, 20]  -->  [14, 62, 15, 20]  --> fed to decoder
+            # e.g. [[15, 45, 16, 22, 14, 62, 15, 20]   -->  [[15, 45, 16, 22, 14, 62, 15, 20]   -->  [[15, 45, 16, 22]  --> fed to decoder
+            #       [15, 45, 16, 22, 14, 62, 15, 20]]  -->   [14, 62, 15, 20, 14, 62, 15, 20]]  -->   [14, 62, 15, 20]]  --> fed to decoder
 
             if masks is not None:
                 masks[div_ids[1],:1] = masks[div_ids[0],1:] 
 
         return boxes, masks
 
-    def NMS(self, pred_boxes, keep, keep_div):
-
+    def NMS(self, pred_boxes, keep, keep_div, pred_masks):
+        ''' Non-Max Suppresion'''
         keep, keep_div = torch.tensor(keep), torch.tensor(keep_div)
         ind_keep = torch.where(keep == True)[0]
         track_keep = [i_keep for i_keep in ind_keep if i_keep < len(keep) - self.num_queries]
@@ -452,6 +463,64 @@ class pipeline():
                     keep[ind] = False
                     break
 
+        track_ious = torch.triu(box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(track_boxes),box_ops.box_cxcywh_to_xyxy(track_boxes),return_iou_only=True),diagonal=1)
+
+        topk_nonself_matches = torch.where(track_ious > 0.5)
+
+        if len(topk_nonself_matches[0] > 0):
+            for midx in range(len(topk_nonself_matches[0])):
+                box_1_ind = topk_nonself_matches[0][midx]
+                box_2_ind = topk_nonself_matches[1][midx]
+
+                if box_1_ind < len(track_keep) and box_2_ind < len(keep):
+                    if pred_masks is not None: # here we pick the track query that has a matching mask; if mask is incorrect, then bbox is probably incorrect
+                        mask_1 = pred_masks[track_keep[box_1_ind],0]
+                        mask_2 = pred_masks[track_keep[box_2_ind],0]
+
+                        mask_1_where = torch.where(mask_1 > 0.5)
+                        min_y_1, max_y_1 = mask_1_where[0].min(), mask_1_where[0].max() 
+                        min_x_1, max_x_1  = mask_1_where[1].min(), mask_1_where[1].max()
+                        height_1 = max_y_1 - min_y_1
+                        width_1 = max_x_1 - min_x_1
+                        center_y_1 = height_1 / 2 + min_y_1
+                        center_x_1 = width_1 / 2 + min_x_1
+
+                        mask_1_box = torch.tensor([[center_x_1,center_y_1,width_1,height_1]],device=self.device)
+                        mask_1_box[:,::2] = mask_1_box[:,::2] / mask_1.shape[-1]
+                        mask_1_box[:,1::2] = mask_1_box[:,1::2] / mask_1.shape[-2]
+
+
+                        mask_2_where = torch.where(mask_2 > 0.5)
+                        min_y_2, max_y_2 = mask_2_where[0].min(), mask_2_where[0].max() 
+                        min_x_2, max_x_2  = mask_2_where[1].min(), mask_2_where[1].max()
+                        height_2 = max_y_2 - min_y_2
+                        width_2 = max_x_2 - min_x_2
+                        center_y_2 = height_2 / 2 + min_y_2
+                        center_x_2 = width_2 / 2 + min_x_2
+
+                        mask_2_box = torch.tensor([[center_x_2,center_y_2,width_2,height_2]],device=self.device)
+                        mask_2_box[:,::2] = mask_2_box[:,::2] / mask_2.shape[-1]
+                        mask_2_box[:,1::2] = mask_2_box[:,1::2] / mask_2.shape[-2]
+
+                        iou_1 = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(track_boxes[box_1_ind]),box_ops.box_cxcywh_to_xyxy(mask_1_box),return_iou_only=True)
+                        iou_2 = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(track_boxes[box_2_ind]),box_ops.box_cxcywh_to_xyxy(mask_2_box),return_iou_only=True)
+
+                        if iou_1 > iou_2:
+                            keep[track_keep[box_2_ind]] = False
+                            keep_div[track_keep[box_2_ind]] = False
+                        else:
+                            keep[track_keep[box_1_ind]] = False
+                            keep_div[track_keep[box_1_ind]] = False
+
+                    else: # without masks, it is impossible to tell which is correct
+                        keep[track_keep[box_2_ind]] = False
+                elif box_1_ind < len(track_keep) and box_2_ind >= len(keep): # track query and div overlap
+                    keep_div[track_div_keep[box_2_ind - len(keep)]] = False
+                elif box_2_ind < len(track_keep) and box_1_ind >= len(keep): # track query and div overlap
+                    keep_div[track_div_keep[box_1_ind - len(keep)]] = False
+                elif box_1_ind > len(track_keep) and box_1_ind > len(track_keep): # div query and div overlap
+                    keep_div[track_div_keep[box_2_ind - len(keep)]] = False
+
         return keep.numpy(), keep_div.numpy()
 
     def forward(self):
@@ -461,6 +530,9 @@ class pipeline():
             self.max_cellnb = 0
             targets = [{}]
             prev_features = None
+
+            if self.eval_ctc:
+                ctc_data = None
             
             if self.display_decoder_aux:
                 random_nbs = np.random.choice(len(fps_ROI),self.num_decoder_frames)
@@ -468,7 +540,10 @@ class pipeline():
 
             for i, fp in enumerate(tqdm(fps_ROI)):
 
-                img = PIL.Image.open(fp,mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB')
+                img = PIL.Image.open(fp,mode='r')
+                img_shape = img.size
+                img = img.resize((self.target_size[1],self.target_size[0])).convert('RGB')
+
                 previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for analysis later
 
                 samples = self.normalize(img)[0][None]
@@ -488,8 +563,13 @@ class pipeline():
                 keep_div = (pred_logits[:,1] > self.threshold)
                 keep_div[-self.num_queries:] = False # disregard any divisions predicted by object queries; model should have learned not to do this anyways
 
-                if self.use_NMS and len(keep) > self.num_queries and keep[-self.num_queries:].sum() > 0:
-                    keep, keep_div = self.NMS(pred_boxes, keep, keep_div)
+                if self.use_NMS and len(keep) > self.num_queries:
+                    if 'pred_masks' in outputs:
+                        pred_masks = outputs['pred_masks'][0].sigmoid().detach()
+                    else:
+                        pred_masks = None
+
+                    keep, keep_div = self.NMS(pred_boxes, keep, keep_div,pred_masks)
 
                 if i > 0:
                     prevcells = np.copy(self.cells)
@@ -505,8 +585,11 @@ class pipeline():
                     self.track_indices = keep.nonzero()[0] # Get query indices (object or track) where a cell was detected / tracked; this is used to create track queries for next  frame
                     self.div_indices = keep_div.nonzero()[0] # Get track query indices where a cell division was tracked; object queries should not be able to detect divisions
 
+                    for blah in self.div_indices:
+                        assert blah in self.track_indices
+
                     if pred_logits.shape[0] > self.num_queries: # If track queries are fed to the model
-                        tq_keep = pred_logits[:len(prevcells),0] > self.threshold
+                        tq_keep = keep[:len(prevcells)]
                         self.cells[:sum(tq_keep)] = prevcells[tq_keep]
                     else:
                         prevcells = None
@@ -531,11 +614,12 @@ class pipeline():
                         self.new_cells = None
 
                 else:
-                    self.track_indices
+                    self.track_indices = None
                     self.div_track = None
                     boxes = None
                     self.new_cells = None
                     prevcells = None
+                    masks = None
 
                 assert boxes.shape[0] == len(self.cells)
 
@@ -544,11 +628,87 @@ class pipeline():
                 else:
                     color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[:len(self.cells)],self.cells,self.div_track,None,self.track)
 
-                self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = color_frame         
+                self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = img#color_frame         
+
+                if self.eval_ctc:
+
+                    mask_threshold = 0.5
+
+                    if sum(keep) > 0:
+                        # Convert tensor to numpy and resize array to target size
+                        masks = masks.cpu().numpy()
+                        masks = np.transpose(masks,(1,2,0))
+                        masks = cv2.resize(masks,img_shape)
+                        masks = np.transpose(masks,(-1,0,1))
+
+                        masks_filt = np.zeros((masks.shape))
+                        argmax = np.argmax(masks,axis=0)
+                        
+                        for m in range(masks.shape[0]):
+                            masks_filt[m,argmax==m] = masks[m,argmax==m]
+                            
+                        masks_filt = masks_filt > mask_threshold
+
+                        mask = np.zeros(masks.shape[-2:],dtype=np.uint16)
+                        
+                        for m in range(masks.shape[0]):
+                            mask[masks_filt[m] > 0] = self.cells[m]
+
+                        # mask = cv2.resize(mask,self.target_size) 
+
+                        mask_cells = np.unique(mask)
+                        mask_cells = mask_cells[mask_cells != 0]
+
+                    if ctc_data is None:
+                        ctc_data = []
+                        for cell in self.cells:
+                            ctc_data.append(np.array([cell,i,i,0]))
+                        ctc_data = np.stack(ctc_data)
+                        ctc_cells = np.copy(self.cells)
+                    else:
+                        max_cellnb = ctc_data.shape[0]
+
+                        ctc_cells_new = np.copy(self.cells)
+                        mask_copy = np.copy(mask)
+
+                        for c,cell in enumerate(prevcells):
+                            if cell in self.cells:
+                                ctc_cell = ctc_cells[c]
+                                if self.div_track[self.cells == cell] != -1:
+                                    div_ind = self.div_track[self.cells == cell]
+                                    div_cells = self.cells[self.div_track == div_ind]
+                                    max_cellnb += 1
+                                    new_cell_1 = np.array([max_cellnb,i,i,ctc_cell])[None]
+                                    ctc_cells_new[self.cells == div_cells[0]] = max_cellnb 
+                                    mask[mask_copy == div_cells[0]] = max_cellnb
+                                    max_cellnb += 1
+                                    new_cell_2 = np.array([max_cellnb,i,i,ctc_cell])[None]
+                                    ctc_data = np.concatenate((ctc_data,new_cell_1,new_cell_2),axis=0)
+                                    ctc_cells_new[self.cells == div_cells[1]] = max_cellnb
+                                    mask[mask_copy == div_cells[1]] = max_cellnb
+                                        
+                                else:
+                                    ctc_data[ctc_cell-1,2] = i
+                                    ctc_cells_new[self.cells == cell] = ctc_cells[prevcells == cell]
+                                    mask[mask_copy == cell] = ctc_cell
+                        
+                        for c,cell in enumerate(self.cells):
+                            if cell not in prevcells and self.div_track[c] == -1:
+                                max_cellnb += 1
+                                new_cell = np.array([max_cellnb,i,i,0])
+                                ctc_data = np.concatenate((ctc_data,new_cell),axis=0)
+
+                                ctc_cells_new[self.cells == cell] = max_cellnb     
+                                mask[mask_copy == cell] = max_cellnb
+
+                        ctc_cells = ctc_cells_new
+
+                    cv2.imwrite(str(self.output_dir / f'mask{i:03d}.tif'),mask)
+                            
 
                 if self.display_decoder_aux and i in random_nbs:
 
-                    if 'enc_outputs' in outputs:
+                    if 'enc_outputs' in outputs and not self.eval_ctc:
                         enc_frame = np.array(img).copy()
                         enc_outputs = outputs['enc_outputs']
                         enc_pred_logits = enc_outputs['pred_logits']
@@ -728,13 +888,20 @@ class pipeline():
 
                     cv2.imwrite(str(self.output_dir / self.predictions_folder / 'ref_pts_outputs' / (f'{method}_ref_pts_{fp.name}')),ref_frames)
                     
+        if self.eval_ctc:
+            np.savetxt(self.output_dir / 'res_track.txt',ctc_data,fmt='%d')
 
         if self.write_video:
             crf = 20
             verbose = 1
             method = 'track' if self.track else 'object_detection'
             name_mask = 'mask_' if self.masks else ''
-            filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
+
+            if self.eval_ctc:
+                filename = self.output_dir / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
+            else:
+                filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')                
+
             print(filename)
             height, width, _ = self.color_stack[0].shape
             if height % 2 == 1:
@@ -784,7 +951,7 @@ class pipeline():
             where_boxes = np.where(np.array(max_area) > 0)[0]
 
             for j,ind in enumerate(where_boxes):
-                img_empty = cv2.imread(str(self.output_dir.parents[1] / 'empty_chamber' / 'img.png'))
+                img_empty = cv2.imread(str(self.output_dir.parents[1] / 'examples' / 'empty_chamber.png'))
                 img_empty = cv2.resize(img_empty,(self.target_size[1]*scale,self.target_size[0]*scale))
             
                 for box in self.query_box_locations[ind][1:]:
@@ -800,7 +967,7 @@ class pipeline():
 
 
 @torch.no_grad()
-def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, output_dir, args, track=True):
+def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, args, track=True):
     model.eval()
     model._tracking = True
     criterion.eval()
@@ -810,23 +977,31 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
         tm_threshold = 0
 
         if args.use_prev_prev_frame:
-            save_folder += '_prev_prev_frame_fix' 
+            save_folder += '_prev_prev' 
+
+        if not args.evaluate_dataset_with_no_data_aug:
+            save_folder += '_data_aug'
     else:
         save_folder = 'save_worst_predcitions_object_det'
         tm_threshold = 1
 
-    (output_dir / save_folder).mkdir(exist_ok=True)
-    (output_dir / save_folder / 'train_outputs').mkdir(exist_ok=True)
-    (output_dir / save_folder / 'eval_outputs').mkdir(exist_ok=True)
+        if not args.evaluate_dataset_with_no_data_aug:
+            save_folder += '_data_aug'
 
-    (output_dir / save_folder / 'train_outputs' / 'standard').mkdir(exist_ok=True)
-    (output_dir / save_folder / 'eval_outputs' / 'standard').mkdir(exist_ok=True)
+    (args.output_dir / save_folder).mkdir(exist_ok=True)
+    (args.output_dir / save_folder / 'train_outputs').mkdir(exist_ok=True)
+    (args.output_dir / save_folder / 'val_outputs').mkdir(exist_ok=True)
 
-    (output_dir / save_folder / 'train_outputs' / 'enc_outputs').mkdir(exist_ok=True)
-    (output_dir / save_folder / 'eval_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+    (args.output_dir / save_folder / 'train_outputs' / 'standard').mkdir(exist_ok=True)
+    (args.output_dir / save_folder / 'val_outputs' / 'standard').mkdir(exist_ok=True)
 
+    (args.output_dir / save_folder / 'train_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+    (args.output_dir / save_folder / 'val_outputs' / 'enc_outputs').mkdir(exist_ok=True)
+
+    datasets = ['train','val']
 
     for didx, data_loaders in enumerate([data_loaders_train,data_loaders_val]):
+        dataset = datasets[didx]
         store_loss = torch.zeros((len(data_loaders[0])))
         for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(tqdm(zip(*data_loaders))):
 
@@ -881,10 +1056,13 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             store_loss[idx] = losses.item()
 
+            acc_dict = utils.calc_bbox_acc(outputs,targets,cls_thresh=0.5,iou_thresh=0.5)
+
+            print(f"{idx}  det: {acc_dict['bbox_det_acc'][0,0,0]/acc_dict['bbox_det_acc'][0,0,1]:.2f}  seg: {acc_dict['mask_det_acc'][0,0,0]/acc_dict['mask_det_acc'][0,0,1]:.2f}")
 
         worst_ind = torch.argsort(store_loss)[-50:]
 
-        for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(zip(*data_loaders)):
+        for idx,((prev_prev_samples,prev_prev_targets), (prev_cur_samples,prev_cur_targets), (prev_samples,prev_targets), (cur_samples,cur_targets), (fut_prev_samples,fut_prev_targets), (fut_samples,fut_targets)) in enumerate(tqdm(zip(*data_loaders))):
             
             if idx not in worst_ind:
                 continue
@@ -942,8 +1120,7 @@ def print_worst(model, criterion, data_loaders_train, data_loaders_val, device, 
             if not np.round(losses.item(),3) == np.round(store_loss[idx],3):
                 print(idx, np.round(losses.item(),3),np.round(store_loss[idx],3))
 
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, args.output_dir / save_folder, train=True if didx == 0 else False, filename = f'Loss_{store_loss[idx]:06.2f}_ind{idx}_.png')
-
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, targets_og, args.output_dir / save_folder, folder = dataset + '_outputs', filename = f'Loss_{store_loss[idx]:06.2f}_ind{idx}_.png', args=args)
 
 
         
