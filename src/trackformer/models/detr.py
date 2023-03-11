@@ -13,7 +13,7 @@ from ..util import box_ops
 from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
                          interpolate, is_dist_avail_and_initialized, MLP,combine_div_masks,divide_mask,
                          nested_tensor_from_tensor_list, sigmoid_focal_loss,threshold_indices,
-                        combine_div_boxes,calc_iou,divide_box,)
+                        combine_div_boxes,calc_iou,divide_box,update_early_or_late_track_divisions,)
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection. """
@@ -144,7 +144,7 @@ class SetCriterion(nn.Module):
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 focal_loss, focal_alpha, focal_gamma, tracking, track_query_false_positive_eos_weight,args):
+                 focal_loss, focal_alpha, focal_gamma, tracking,args):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -168,7 +168,6 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
         self.tracking = tracking
-        self.track_query_false_positive_eos_weight = track_query_false_positive_eos_weight
         self.device = args.device
         self.args = args
 
@@ -199,7 +198,7 @@ class SetCriterion(nn.Module):
                                   weight=self.empty_weight,
                                   reduction='none')
 
-        if self.tracking and self.track_query_false_positive_eos_weight:
+        if self.tracking:
             for i, target in enumerate(targets):
                 if 'track_query_boxes' in target and track:
                     # remove no-object weighting for false track_queries
@@ -409,7 +408,7 @@ class SetCriterion(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_boxes, track_div, two_stage, **kwargs)
 
 
-    def forward(self, outputs, targets, return_bbox_track_acc=True):
+    def forward(self, outputs, targets, epoch=None):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -417,11 +416,13 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied,
                       see each loss' doc
         """
+
+        if epoch is not None and epoch > self.args.epoch_to_start_using_flexible_divisions:
+            targets = update_early_or_late_track_divisions(outputs,targets)
+
         B,N,_ = outputs['pred_logits'].shape
         #### this outputs_without_aux should be replaced with outputs; need to double check
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
-
-        assert N < (self.args.num_queries + 15), f'Number of predictions ({N}) should not exceed {self.args.num_queries + 15}'
 
         indices = self.matcher(outputs_without_aux, targets)
         indices, targets = threshold_indices(indices,targets,max_ind=N)
@@ -538,76 +539,76 @@ class SetCriterion(nn.Module):
                                 
                                 target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
 
-            test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
-            
-            if test_early_div: # quick check to see if any cells divided in the future frame
+                test_early_div = (target['fut_target']['boxes'][:,-1] > 0).any()
                 
-                pred_boxes = outputs['pred_boxes'].detach()
-                ind_tgt_clone = ind_tgt.clone()
-                ind_out_clone = ind_out.clone()
-                boxes_clone = target['boxes'].clone()
-                masks_clone = target['masks'].clone()
-                for idx in range(len(ind_tgt)):
-                    if (~target['track_queries_mask'])[ind_out_clone[idx]] and target['object_detection_div_mask'][ind_tgt_clone[idx]] == 0.: # check that we are looking at non-tracked cells
+                if test_early_div: # quick check to see if any cells divided in the future frame
+                    
+                    pred_boxes = outputs['pred_boxes'].detach()
+                    ind_tgt_clone = ind_tgt.clone()
+                    ind_out_clone = ind_out.clone()
+                    boxes_clone = target['boxes'].clone()
+                    masks_clone = target['masks'].clone()
+                    for idx in range(len(ind_tgt)):
+                        if (~target['track_queries_mask'])[ind_out_clone[idx]] and target['object_detection_div_mask'][ind_tgt_clone[idx]] == 0.: # check that we are looking at non-tracked cells
 
-                        box = boxes_clone[ind_tgt_clone[idx]]
+                            box = boxes_clone[ind_tgt_clone[idx]]
 
-                        fut_prev_boxes = target['fut_prev_target']['boxes']
-                        box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
-                        fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
+                            fut_prev_boxes = target['fut_prev_target']['boxes']
+                            box_ind_match_id = box[:4].eq(fut_prev_boxes[:,:4]).all(axis=-1).nonzero()[0][0]
+                            fut_prev_track_id = target['fut_prev_target']['track_ids'][box_ind_match_id]
 
-                        #### TODO maybe add feature to allow division possible
-                        if fut_prev_track_id not in target['fut_target']['track_ids']:
-                            continue  # Cell leaves chamber in future frame
+                            #### TODO maybe add feature to allow division possible
+                            if fut_prev_track_id not in target['fut_target']['track_ids']:
+                                continue  # Cell leaves chamber in future frame
 
-                        fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
-                        fut_box = target['fut_target']['boxes'][fut_box_ind]
+                            fut_box_ind = (target['fut_target']['track_ids'] == fut_prev_track_id).nonzero()[0][0]
+                            fut_box = target['fut_target']['boxes'][fut_box_ind]
 
-                        if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
+                            if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
 
-                            div_box = divide_box(box,fut_box)
+                                div_box = divide_box(box,fut_box)
 
-                            unused_object_query_indices = torch.tensor([ind_out[idx]] + [oq_id for oq_id in torch.arange(N-len(target['track_queries_mask']),N) if (oq_id not in ind_out and outputs['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
-                
-                            if len(unused_object_query_indices) > 1:
+                                unused_object_query_indices = torch.tensor([ind_out[idx]] + [oq_id for oq_id in torch.arange(N-len(target['track_queries_mask']),N) if (oq_id not in ind_out and outputs['pred_logits'][i,oq_id,0].sigmoid().detach() > 0.5)])
+                    
+                                if len(unused_object_query_indices) > 1:
 
-                                unused_pred_boxes = pred_boxes[i,unused_object_query_indices]
+                                    unused_pred_boxes = pred_boxes[i,unused_object_query_indices]
 
-                                iou_div_all = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(unused_pred_boxes[:,:4]),box_ops.box_cxcywh_to_xyxy(torch.cat((div_box[None,:4],div_box[None,4:]),axis=0)),return_iou_only=True)
+                                    iou_div_all = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(unused_pred_boxes[:,:4]),box_ops.box_cxcywh_to_xyxy(torch.cat((div_box[None,:4],div_box[None,4:]),axis=0)),return_iou_only=True)
 
-                                match_ind = torch.argmax(iou_div_all,axis=0).to('cpu')
+                                    match_ind = torch.argmax(iou_div_all,axis=0).to('cpu')
 
-                                if len(torch.unique(match_ind)) == 2:
-                                    selected_pred_boxes = unused_pred_boxes[match_ind,:4]
-                                    iou_div = calc_iou(div_box, torch.cat((selected_pred_boxes[0],selected_pred_boxes[1])))
+                                    if len(torch.unique(match_ind)) == 2:
+                                        selected_pred_boxes = unused_pred_boxes[match_ind,:4]
+                                        iou_div = calc_iou(div_box, torch.cat((selected_pred_boxes[0],selected_pred_boxes[1])))
 
-                                    iou = calc_iou(box,torch.cat((pred_boxes[i,ind_out[idx],:4],torch.zeros_like(pred_boxes[i,ind_out[idx],:4]))))
+                                        iou = calc_iou(box,torch.cat((pred_boxes[i,ind_out[idx],:4],torch.zeros_like(pred_boxes[i,ind_out[idx],:4]))))
 
-                                    assert iou_div <= 1 and iou_div >= 0 and iou <= 1 and iou >= 0
+                                        assert iou_div <= 1 and iou_div >= 0 and iou <= 1 and iou >= 0
 
-                                    if iou_div - iou > 0 and iou_div > 0.5:
-                                        target['boxes'][ind_tgt_clone[idx]] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
-                                        target['boxes'] = torch.cat((target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
+                                        if iou_div - iou > 0 and iou_div > 0.5:
+                                            target['boxes'][ind_tgt_clone[idx]] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
+                                            target['boxes'] = torch.cat((target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
 
-                                        target['labels'][ind_tgt_clone[idx]] = torch.tensor([0,1]).to(self.device)
-                                        target['labels'] = torch.cat((target['labels'],torch.tensor([0,1])[None,].to(self.device)))
+                                            target['labels'][ind_tgt_clone[idx]] = torch.tensor([0,1]).to(self.device)
+                                            target['labels'] = torch.cat((target['labels'],torch.tensor([0,1])[None,].to(self.device)))
 
-                                        if 'masks' in target:
-                                            mask = masks_clone[ind_tgt_clone[idx]]
-                                            fut_mask = target['fut_target']['masks'][fut_box_ind]
-                                            div_mask = divide_mask(mask,fut_mask)
+                                            if 'masks' in target:
+                                                mask = masks_clone[ind_tgt_clone[idx]]
+                                                fut_mask = target['fut_target']['masks'][fut_box_ind]
+                                                div_mask = divide_mask(mask,fut_mask)
 
-                                            target['masks'][ind_tgt_clone[idx]] = torch.cat((div_mask[:1],torch.zeros_like(div_mask[:1])))
-                                            target['masks'] = torch.cat((target['masks'],torch.cat((div_mask[1:],torch.zeros_like(div_mask[:1])))[None]))
+                                                target['masks'][ind_tgt_clone[idx]] = torch.cat((div_mask[:1],torch.zeros_like(div_mask[:1])))
+                                                target['masks'] = torch.cat((target['masks'],torch.cat((div_mask[1:],torch.zeros_like(div_mask[:1])))[None]))
 
-                                        ind_out[ind_out == ind_out_clone[idx]] = torch.tensor([unused_object_query_indices[match_ind[0]]])
-                                        ind_out = torch.cat((ind_out,torch.tensor([unused_object_query_indices[match_ind[1]]])))
-                                        ind_tgt = torch.cat((ind_tgt,torch.tensor([target['boxes'].shape[0]-1])))                    
+                                            ind_out[ind_out == ind_out_clone[idx]] = torch.tensor([unused_object_query_indices[match_ind[0]]])
+                                            ind_out = torch.cat((ind_out,torch.tensor([unused_object_query_indices[match_ind[1]]])))
+                                            ind_tgt = torch.cat((ind_tgt,torch.tensor([target['boxes'].shape[0]-1])))                    
 
-                                        assert len(ind_out) == len(ind_tgt)
-                                        assert len(target['boxes']) == len(target['labels'])
+                                            assert len(ind_out) == len(ind_tgt)
+                                            assert len(target['boxes']) == len(target['labels'])
 
-                                        indices[i] = (ind_out,ind_tgt)
+                                            indices[i] = (ind_out,ind_tgt)
 
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
@@ -631,7 +632,6 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             if sum(sizes) != 0 or (sum(sizes) == 0 and loss == 'labels'): # If two empty chambers, only loss will be computed for labels as there is nothing to computer for the boxes / masks
-                assert N < (self.args.num_queries + 15)
                 losses.update(self.get_loss(loss, outputs_without_aux, targets, indices, num_boxes,track_div))
 
         # In case of auxiliary losses, we repeat this process with the
@@ -639,7 +639,6 @@ class SetCriterion(nn.Module):
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 B,N,_ = aux_outputs['pred_logits'].shape
-                assert N < (self.args.num_queries + 15), f'Number of predictions ({N}) should not exceed {self.args.num_queries + 15}'
                 
                 indices = self.matcher(aux_outputs, targets)
 

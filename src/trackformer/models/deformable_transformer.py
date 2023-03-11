@@ -356,7 +356,6 @@ class DeformableTransformer(nn.Module):
                 enc_thresh = 0.2
                 topk_cls_undetach = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
                 keep_enc_boxes = topk_cls_undetach[:,:,0].sigmoid() > enc_thresh
-                # max_boxes = max([target['boxes'].shape[0] for target in targets])
                 num_enc_boxes = max([target['boxes'].shape[0] + (target['boxes'][:,-1] > 0).sum() for target in targets])
                 total_boxes = sum([target['boxes'].shape[0] for target in targets])
                 if keep_enc_boxes.sum() > total_boxes - 2: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 

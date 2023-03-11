@@ -12,19 +12,7 @@ from .transformer import build_transformer
 
 
 def build_model(args):
-    if args.dataset == 'coco':
-        num_classes = 91
-    elif args.dataset == 'coco_panoptic':
-        num_classes = 250
-    elif args.dataset in ['coco_person', 'mot', 'mot_crowdhuman', 'crowdhuman', 'mot_coco_person']:
-        # num_classes = 91
-        num_classes = 20
-        # num_classes = 1
-    elif args.dataset == 'cells':
-        num_classes = 1
-    else:
-        raise NotImplementedError
-
+    num_classes = 1
     device = torch.device(args.device)
     backbone = build_backbone(args)
     matcher = build_matcher(args)
@@ -55,7 +43,8 @@ def build_model(args):
         'evaluate_dataset_with_no_data_aug': args.evaluate_dataset_with_no_data_aug,
         'epoch_to_start_using_flexible_divisions': args.epoch_to_start_using_flexible_divisions,
         'use_prev_prev_frame': args.use_prev_prev_frame,
-        'dn_track_add_object_queries': args.dn_track_add_object_queries}
+        'dn_track_add_object_queries': args.dn_track_add_object_queries,
+        'object_detection_only': args.object_detection_only}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,
@@ -154,7 +143,6 @@ def build_model(args):
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         tracking=args.tracking,
-        track_query_false_positive_eos_weight=args.track_query_false_positive_eos_weight,
         args=args,)
     criterion.to(device)
 
