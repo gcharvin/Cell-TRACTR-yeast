@@ -543,6 +543,9 @@ class Normalize:
             boxes = torch.cat((box_xyxy_to_cxcywh(boxes[:,:4]),box_xyxy_to_cxcywh(boxes[:,4:])),axis=1)
             boxes = boxes / torch.tensor([w, h, w, h, w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
+
+            if 'boxes_orig' in target:
+                target['boxes_orig'] = boxes.clone()
         return image, target
 
 

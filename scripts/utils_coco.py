@@ -5,7 +5,6 @@ from itertools import groupby
 from skimage.measure import label
 import random
 import re
-import tifffile
 
 random.seed(1)
 
@@ -78,18 +77,22 @@ def polygonFromMask(seg):
 
 
 class reader():
-    def __init__(self,mothermachine,target_size,min_area):
+    def __init__(self,dataset,target_size,min_area):
 
         self.target_size = target_size
         self.min_area = min_area
         self.dtype = {'uint8': 255,
                       'uint16': 65535}
 
-        if mothermachine:
+        if dataset == 'moma':
             self.crop = False
-        else:
+            self.resize = True
+        elif dataset == '2D':
             self.crop = True
-
+            self.resize = False
+        elif dataset == 'DIC-C2DH-HeLa':
+            self.crop = False
+            self.resize = False
 
 
     def get_slices(self,seg,shift):
@@ -151,7 +154,7 @@ class reader():
 
         return img
 
-    def read_gt(self,fp,counter,track_file):
+    def read_gt(self,fp):
 
         nb = re.findall('\d+',fp.stem)[-1]
         pad = len(nb)
@@ -174,8 +177,8 @@ class reader():
             if cur_gt.shape[1] < self.target_size[1]:
                 prev_gt = np.pad(prev_gt,((0,0),(0,self.target_size[1] - prev_gt.shape[1])))
                 cur_gt = np.pad(cur_gt,((0,0),(0,self.target_size[1] - cur_gt.shape[1])))
-        else:      
-            
+
+        elif self.resize:      
             gt_resized = np.zeros((self.target_size),dtype=np.uint16)
             cellnbs = np.unique(gt)
             cellnbs = cellnbs[cellnbs != 0]
@@ -185,7 +188,7 @@ class reader():
 
                 contours, _ = cv2.findContours(mask_cellnb_resized, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
                 
-                if (mask_cellnb_resized > 127).sum() > self.min_area and sum([contour.size >= 6 for contour in contours]) > 0:
+                if sum([contour.size >= 6 for contour in contours]) > 0:#(mask_cellnb_resized > 127).sum() > self.min_area
                     gt_resized[mask_cellnb_resized > 127] = cellnb
                 else:
                     raise NotImplementedError

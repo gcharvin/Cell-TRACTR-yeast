@@ -9,7 +9,7 @@ import pickle
 import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
-folder = '230223_2D_track_two_stage_dn_track_dn_object_dab_mask'
+folder = '230401_moma_track_two_stage_dn_enc_dn_track_dab_mask'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)
@@ -17,8 +17,7 @@ with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
 with open(datapath / folder / 'metrics_val.pkl', 'rb') as f:
     metrics_val = pickle.load(f)
 
-losses = [key for key in metrics_train.keys() if 'loss' in key and not bool(re.search('\d',key)) and not np.isnan(metrics_train[key][0,0])
-]
+losses = [key for key in metrics_train.keys() if 'loss' in key and not bool(re.search('\d',key)) and not np.isnan(metrics_train[key].all())]
 metrics = [key for key in metrics_train.keys() if 'acc' in key]
 epochs = metrics_train['loss'].shape[0]
 epochs_val = metrics_val['loss'].shape[0]
@@ -152,7 +151,7 @@ for midx,metric in enumerate(metrics):
 
     i = 0 if 'det_acc' in metric else 1
     
-    train_acc = np.nanmean(metrics_train[metric],axis=-2)
+    train_acc = np.nansum(metrics_train[metric],axis=-2)
     train_acc = train_acc[:,0] / train_acc[:,1]
     val_acc = np.nanmean(metrics_val[metric],axis=-2)
     val_acc = val_acc[:,0] / val_acc[:,1]

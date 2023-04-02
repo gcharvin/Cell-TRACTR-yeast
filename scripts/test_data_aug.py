@@ -103,12 +103,12 @@ np.random.seed(1)
 for i, (samples, targets) in enumerate(data_loader_train):
     tool = Tool(targets)
     
-    height = targets[0]['size'][0]
-    width = targets[0]['size'][1]
+    height = targets[0]['cur_target']['size'][0]
+    width = targets[0]['cur_target']['size'][1]
     
     for b in range(len(targets)):
-        previmg = targets[b]['prev_target']['image'].permute(1,2,0).numpy()
-        img = targets[b]['image'].permute(1,2,0).numpy()
+        previmg = targets[b]['prev_image'].permute(1,2,0).numpy()
+        img = targets[b]['cur_image'].permute(1,2,0).numpy()
 
         previmg = (previmg - np.min(previmg)) / np.ptp(previmg) * 255
         img = (img - np.min(img)) / np.ptp(img) * 255
@@ -116,7 +116,7 @@ for i, (samples, targets) in enumerate(data_loader_train):
         previmg_bbox, previmg_mask, previmg_bbox_seg = [previmg.copy() for _ in range(3)]
         img_bbox, img_mask, img_bbox_seg = [img.copy() for _ in range(3)]
         
-        track_ids_cur = targets[b]['track_ids'].numpy()
+        track_ids_cur = targets[b]['cur_target']['track_ids'].numpy()
         track_ids_prev = targets[b]['prev_target']['track_ids'].numpy()
         track_ids_both = [track_id_prev for track_id_prev in track_ids_prev if track_id_prev in track_ids_cur]
         
@@ -128,7 +128,7 @@ for i, (samples, targets) in enumerate(data_loader_train):
         prevseg_bw = np.zeros((img.shape[:2]),dtype=np.uint8)
         seg_bw = np.zeros((img.shape[:2]),dtype=np.uint8)
 
-        boxes = targets[b]['boxes']
+        boxes = targets[b]['cur_target']['boxes']
         prevboxes = targets[b]['prev_target']['boxes']
 
         boxes[:,::2] = boxes[:,::2] * width
@@ -150,13 +150,13 @@ for i, (samples, targets) in enumerate(data_loader_train):
 
             ind = np.where(track_ids_cur == track_id)[0][0]
             bounding_box = boxes[ind][:4]    
-            mask = targets[b]['masks'][ind,0]
+            mask = targets[b]['cur_target']['masks'][ind,0]
             img_bbox,img_mask,img_bbox_mask,seg = tool.forward(bounding_box,mask,img_bbox, img_mask, img_bbox_seg,color=colors[idx])
             seg_bw += seg
 
             if prevboxes[ind][-1] > 0:
                 boudning_boxes = boxes[ind][4:]
-                mask = targets[b]['masks'][ind,1]
+                mask = targets[b]['cur_target']['masks'][ind,1]
                 img_bbox,img_mask,img_bbox_mask,seg = tool.forward(bounding_box,mask,img_bbox, img_mask, img_bbox_seg,color=colors[idx])
                 seg_bw += seg
 
@@ -174,7 +174,7 @@ for i, (samples, targets) in enumerate(data_loader_train):
         for track_id in track_new:
             ind = np.where(track_ids_cur == track_id)[0][0]
             bounding_box = boxes[ind][:4]
-            mask = targets[b]['masks'][ind,0]
+            mask = targets[b]['cur_target']['masks'][ind,0]
             img_bbox,img_mask,img_bbox_mask,seg = tool.forward(bounding_box,mask,img_bbox, img_mask, img_bbox_seg,color=None)
             seg_bw += seg
 

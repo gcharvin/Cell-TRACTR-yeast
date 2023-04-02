@@ -20,25 +20,15 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
-moma = False
-
-if moma:
-    yaml_file = ''
-else:
-    yaml_file = '_2D'
+dataset = 'DIC-C2DH-HeLa' #['moma','2D',DIC-C2DH-HeLa]
 
 ex = sacred.Experiment('train')
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train' + yaml_file + '.yaml')
+ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset + '.yaml')
 ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
 
 def train(args: Namespace) -> None:
 
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}{"_moma" if moma else "_2D"}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
-    # args.resume = ('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/221208_dn_track_dab_no_mask/checkpoint.pth')
-    # args.resume_optim = False
-    # args.freeze_detr = True
-    # args.overwrite_lrs = True
-    args.moma = moma
+    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_{args.dataset}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
 
     if args.dn_track or args.dn_object or args.group_object:
         assert args.use_dab, f'DAB-DETR is needed to use denoised boxes for tracking / object detection. args.use_dab is currently set to {args.use_dab}'
@@ -143,39 +133,31 @@ def train(args: Namespace) -> None:
 
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, lr_drop, gamma=0.1)
 
-    datasets_train = build_dataset(split='train', args=args)
-    datasets_val = build_dataset(split='val', args=args)
+    dataset_train = build_dataset(split='train', args=args)
+    dataset_val = build_dataset(split='val', args=args)
 
-    data_loaders_train = []
-    data_loaders_val = []
+    if args.distributed:
+        sampler_train = utils.DistributedWeightedSampler(dataset_train)
+        sampler_val = DistributedSampler(dataset_val, shuffle=False)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    for dataset_train, dataset_val in zip(datasets_train,datasets_val):
-        gen = torch.Generator(device='cpu')
-        gen.manual_seed(1)
-        if args.distributed:
-            sampler_train = utils.DistributedWeightedSampler(dataset_train)
-            sampler_val = DistributedSampler(dataset_val, shuffle=False)
-        else:
-            sampler_train = torch.utils.data.RandomSampler(dataset_train,generator=gen)
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    batch_sampler_train = torch.utils.data.BatchSampler(
+        sampler_train, args.batch_size, drop_last=True)
 
-        batch_sampler_train = torch.utils.data.BatchSampler(
-            sampler_train, args.batch_size, drop_last=True)
+    data_loader_train = DataLoader(
+        dataset_train,
+        batch_sampler=batch_sampler_train,
+        collate_fn=utils.collate_fn,
+        num_workers=args.num_workers)
 
-        data_loader_train = DataLoader(
-            dataset_train,
-            batch_sampler=batch_sampler_train,
-            collate_fn=utils.collate_fn,
-            num_workers=args.num_workers)
-        data_loader_val = DataLoader(
-            dataset_val, args.batch_size,
-            sampler=sampler_val,
-            drop_last=False,
-            collate_fn=utils.collate_fn,
-            num_workers=args.num_workers)
-
-        data_loaders_train.append(data_loader_train)
-        data_loaders_val.append(data_loader_val)
+    data_loader_val = DataLoader(
+        dataset_val, args.batch_size,
+        sampler=sampler_val,
+        drop_last=False,
+        collate_fn=utils.collate_fn,
+        num_workers=args.num_workers)
 
     if args.resume:
         if args.resume.startswith('https'):
@@ -275,32 +257,17 @@ def train(args: Namespace) -> None:
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs + 1):
-        num_plots = 10 if epoch < args.epochs else 30
         # TRAIN
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_one_epoch(
-            model, criterion, data_loaders_train, optimizer, epoch, args, num_plots)
-
-        if args.eval_train:
-            random_transforms = data_loader_train.dataset._transforms
-
-            for data_loader_train in data_loaders_train:
-                data_loader_train.dataset._transforms = data_loaders_val[0].dataset._transforms
-
-            evaluate(
-                model, criterion, data_loaders_train, device,
-                args.output_dir, args, epoch)
-
-            for data_loader_train in data_loaders_train:
-                data_loader_train.dataset._transforms = random_transforms
+        train_one_epoch(model, criterion, data_loader_train, optimizer, epoch, args)
 
         lr_scheduler.step()
 
         checkpoint_paths = [args.output_dir / 'checkpoint.pth']
 
         evaluate(
-            model, criterion, data_loaders_val,
+            model, criterion, data_loader_val,
             args, epoch)
 
         # MODEL SAVING

@@ -11,7 +11,7 @@ batch_size: 2
 weight_decay: 0.0001
 epochs: 50
 lr_drop: 40
-epoch_to_start_using_flexible_divisions: 10
+epoch_to_start_using_flexible_divisions: 5
 use_prev_prev_frame: true
 # gradient clipping max norm
 clip_max_norm: 0.1
@@ -45,7 +45,7 @@ dropout: 0.1
 # Number of attention heads inside the transformer's attentions
 nheads: 8
 # Number of object queries
-num_queries: 30
+num_queries: 60
 pre_norm: false
 dec_n_points: 4
 enc_n_points: 4
@@ -117,17 +117,20 @@ giou_loss_coef: 2.0
 div_loss_coef: 2.0 
 track_div_loss_coef: 2.0
 object_queies_loss_coef: 1.0
-evaluate_dataset_with_no_data_aug: false
+no_data_aug: false
 # Relative classification weight of the no-object class
 eos_coef: 0.1
 focal_loss: true
 focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
-dataset: moma
+dataset: DIC-C2DH-HeLa
+# Number of plots
+num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
 output_dir: /projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results
+data_dir: /projectnb/dunlop/ooconnor/object_detection/data
 # device to use for training / testing
 device: cuda
 seed: 42
@@ -141,7 +144,7 @@ resume_vis: false
 start_epoch: 1
 eval_only: false
 eval_train: false
-num_workers: 2
+num_workers: 0
 val_interval: 5
 debug: false
 # epoch interval for model saving. if 0 only save last and best models
@@ -151,3 +154,7 @@ save_model_interval: false
 world_size: 1
 # url used to set up distributed training
 dist_url: env://
+cls_threshold: 0.5
+iou_threshold: 0.75
+# When save outputs from the model during training, display all available or minimize if images are large
+display_all: False

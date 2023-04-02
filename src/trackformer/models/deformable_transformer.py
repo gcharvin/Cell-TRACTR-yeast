@@ -222,7 +222,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, query_attn_mask=None, dn_enc=False,training_methods=[],add_object_queries_to_dn_track=False):
+    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, output_target=None, query_attn_mask=None, dn_enc=False,training_methods=[],add_object_queries_to_dn_track=False):
         assert self.two_stage or query_embed is not None
         if not self.two_stage:
             assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
@@ -323,7 +323,7 @@ class DeformableTransformer(nn.Module):
                 outputs_mask_all = self.forward_prediction_heads(output_memory,mask_features)
                 enc_outputs['pred_masks'] = torch.stack((outputs_mask_all,torch.zeros_like(outputs_mask_all)),axis=2)
             
-            enc_outputs['pred_logits'] = torch.cat((enc_outputs_class,torch.zeros_like(enc_outputs_class)),axis=-1)  # I use weight map to discard the second prediction
+            enc_outputs['pred_logits'] = torch.cat((enc_outputs_class,torch.zeros_like(enc_outputs_class)),axis=-1)  # I use weight map to discard the second prediction in loss function
             enc_outputs['pred_boxes'] = torch.cat((enc_outputs_coord_unact.sigmoid(),torch.zeros_like(enc_outputs_coord_unact)),axis=-1)
             
 
@@ -352,12 +352,13 @@ class DeformableTransformer(nn.Module):
                 tgt = torch.cat((tgt,query_embed[..., :self.d_model]),axis=1)
                 query_embed = None
 
-            if dn_enc:
+            if dn_enc: # Only use dn_enc when current frame is fed to model
+                assert output_target == 'cur_target'
                 enc_thresh = 0.2
                 topk_cls_undetach = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
                 keep_enc_boxes = topk_cls_undetach[:,:,0].sigmoid() > enc_thresh
-                num_enc_boxes = max([target['boxes'].shape[0] + (target['boxes'][:,-1] > 0).sum() for target in targets])
-                total_boxes = sum([target['boxes'].shape[0] for target in targets])
+                num_enc_boxes = max([target[output_target]['boxes'].shape[0] + (target[output_target]['boxes'][:,-1] > 0).sum() for target in targets])
+                total_boxes = sum([target[output_target]['boxes'].shape[0] for target in targets])
                 if keep_enc_boxes.sum() > total_boxes - 2: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 
                     num_enc_boxes = num_enc_boxes
                     topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], num_enc_boxes, dim=1)[1]
@@ -390,21 +391,21 @@ class DeformableTransformer(nn.Module):
 
                     for t,target in enumerate(targets):
                         target['dn_enc'] = {}
-                        target['dn_enc']['boxes'] = target['boxes'].clone()
+                        target['dn_enc']['boxes'] = target[output_target]['boxes_orig'].clone()
                         target['dn_enc']['enc_boxes_noised'] = reference_points_enc_noised[t]
                         target['dn_enc']['enc_boxes'] = reference_points_enc[t]
                         target['dn_enc']['enc_logits'] = topk_cls_undetach[:,:,0].sigmoid()[t]
-                        target['dn_enc']['labels'] = target['labels'].clone()
-                        target['dn_enc']['track_ids'] = target['track_ids'].clone()
+                        target['dn_enc']['labels'] = target[output_target]['labels_orig'].clone()
+                        target['dn_enc']['track_ids'] = target[output_target]['track_ids_orig'].clone()
                         target['dn_enc']['prev_target'] = target['prev_target'].copy()
                         target['dn_enc']['fut_target'] = target['fut_target'].copy()
-                        target['dn_enc']['fut_prev_target'] = target['fut_prev_target'].copy()
-                        target['dn_enc']['empty'] = target['empty']
+                        target['dn_enc']['empty'] = target[output_target]['empty']
                         target['dn_enc']['track_queries_mask'] = torch.zeros((reference_points_enc.shape[1])).bool().to(tgt.device)
                         target['dn_enc']['num_queries'] = reference_points_enc.shape[1]
+                        target['dn_enc']['framenb'] = target[output_target]['framenb']
 
-                        if 'masks' in targets[0]:
-                            target['dn_enc']['masks'] = target['masks'].clone()
+                        if 'masks' in target[output_target]:
+                            target['dn_enc']['masks'] = target[output_target]['masks_orig'].clone()
 
                     training_methods.append('dn_enc')
 
@@ -422,10 +423,10 @@ class DeformableTransformer(nn.Module):
             assert torch.sum(torch.isnan(reference_points)) == 0, 'Nan in reference points'
 
 
-        if targets is not None and 'track_query_hs_embeds' in targets[0]:
+        if targets is not None and 'track_query_hs_embeds' in targets[0][output_target]:
 
-            prev_hs_embed = torch.stack([t['track_query_hs_embeds'] for t in targets])
-            prev_boxes = torch.stack([t['track_query_boxes'] for t in targets])
+            prev_hs_embed = torch.stack([t[output_target]['track_query_hs_embeds'] for t in targets])
+            prev_boxes = torch.stack([t[output_target]['track_query_boxes'] for t in targets])
 
             if self.refine_track_queries:
                 prev_hs_embed += self.track_embedding.weight
@@ -444,13 +445,13 @@ class DeformableTransformer(nn.Module):
 
             if 'dn_track' in targets[0]:
                 
-                targets_dn_track = [target['dn_track'] for target in targets]
+                # targets_dn_track = [target['dn_track'] for target in targets]
 
-                num_dn_track = targets_dn_track[0]['boxes'].shape[0]
+                num_dn_track = targets[0]['dn_track']['num_queries']
                 assert num_dn_track > 0
 
-                prev_hs_embed_dn_track = torch.stack([t['track_query_hs_embeds'] for t in targets_dn_track])
-                prev_boxes_dn_track = torch.stack([t['track_query_boxes'] for t in targets_dn_track])
+                prev_hs_embed_dn_track = torch.stack([t['dn_track']['track_query_hs_embeds'] for t in targets])
+                prev_boxes_dn_track = torch.stack([t['dn_track']['track_query_boxes'] for t in targets])
 
                 assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
                 assert torch.sum(torch.isnan(prev_boxes_dn_track)) == 0, 'Nan in track boxes'
@@ -464,7 +465,7 @@ class DeformableTransformer(nn.Module):
                 if self.dn_track_add_object_queries and add_object_queries_to_dn_track:
                     prev_tgt_dn_track = torch.cat([prev_tgt_dn_track,tgt_oqs_clone], dim=1)
                     prev_boxes_dn_track = torch.cat([prev_boxes_dn_track[..., :reference_points.shape[-1]],boxes_oqs_clone], dim=1)
-                    num_dn_track += self.num_queries
+                    # num_dn_track += self.num_queries
 
                 tgt = torch.cat([tgt,prev_tgt_dn_track], dim=1)
                 reference_points = torch.cat([reference_points,prev_boxes_dn_track[..., :reference_points.shape[-1]]], dim=1)

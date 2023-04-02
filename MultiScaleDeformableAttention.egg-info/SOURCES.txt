@@ -8,3 +8,6 @@ MultiScaleDeformableAttention.egg-info/PKG-INFO
 MultiScaleDeformableAttention.egg-info/SOURCES.txt
 MultiScaleDeformableAttention.egg-info/dependency_links.txt
 MultiScaleDeformableAttention.egg-info/top_level.txt
+ctc_metrics/__init__.py
+ctc_metrics/calc_ctc_scores_script.py
+ctc_metrics/eval_ctc.py
