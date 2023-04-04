@@ -156,3 +156,4 @@ world_size: 1
 dist_url: env://
 cls_threshold: 0.5
 iou_threshold: 0.75
+display_all: True

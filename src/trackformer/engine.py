@@ -942,13 +942,14 @@ def print_worst(model, criterion, data_loader_train, data_loader_val, device, ar
             store_loss[idx] = losses.item()
 
             cur_targets = [target['cur_target'] for target in targets]
+            image_id = targets[0]['cur_target']['image_id']
 
             if track:
                 acc_dict = utils.calc_track_acc(outputs,cur_targets,args)
-                print(f"{idx}  track: {acc_dict['overall_track_acc'][0,0,0]/acc_dict['overall_track_acc'][0,0,1]:.2f}")
+                print(f"{image_id}  track: {acc_dict['overall_track_acc'][0,0,0]/acc_dict['overall_track_acc'][0,0,1]:.2f}")
             else:
                 acc_dict = utils.calc_bbox_acc(outputs,cur_targets,args)
-                print(f"{idx}  det: {acc_dict['bbox_det_acc'][0,0,0]/acc_dict['bbox_det_acc'][0,0,1]:.2f}  seg: {acc_dict['mask_det_acc'][0,0,0]/acc_dict['mask_det_acc'][0,0,1]:.2f}")
+                print(f"{image_id}  det: {acc_dict['bbox_det_acc'][0,0,0]/acc_dict['bbox_det_acc'][0,0,1]:.2f}  seg: {acc_dict['mask_det_acc'][0,0,0]/acc_dict['mask_det_acc'][0,0,1]:.2f}")
 
             
 
@@ -969,10 +970,12 @@ def print_worst(model, criterion, data_loader_train, data_loader_val, device, ar
 
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
+            image_id = targets[0]['cur_target']['image_id']
+
             if not np.round(losses.item(),3) == np.round(store_loss[idx],3):
                 print(idx, np.round(losses.item(),3),np.round(store_loss[idx],3))
 
-            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir / save_folder, folder = dataset + '_outputs', filename = f'Loss_{store_loss[idx]:06.2f}_ind{idx}_.png', args=args)
+            utils.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir / save_folder, folder = dataset + '_outputs', filename = f'Loss_{store_loss[idx]:06.2f}_image_id_{image_id}_.png', args=args)
 
 
         
