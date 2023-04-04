@@ -15,7 +15,7 @@ from tqdm import tqdm
 from .util import misc as utils
 from .util import box_ops
 from .datasets.transforms import Normalize,ToTensor,Compose
-
+import ffmpeg
 
 
 def calc_loss_for_training_methods(training_method:str,
@@ -234,13 +234,12 @@ class pipeline():
         self.output_dir = output_dir
 
         if not self.eval_ctc:
-            self.predictions_folder = 'predictions_empty' 
+            self.predictions_folder = 'predictions' 
+            (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
 
-            if self.masks:
-                self.predictions_folder += '_mask'
-            
-            if self.use_NMS:
-                self.predictions_folder += '_NMS'
+            self.predictions_folder += '/track' if track else '/object_detection'
+            self.predictions_folder += '_mask' if self.masks else ''
+            self.predictions_folder += '_NMS' if self.use_NMS else ''
 
             (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
 
@@ -256,7 +255,7 @@ class pipeline():
         self.use_dab = args.use_dab
         
 
-        self.write_video = False
+        self.write_video = True
         self.track = track
 
         if self.track:
@@ -273,7 +272,7 @@ class pipeline():
         if self.eval_ctc:
             self.display_decoder_aux = False
         else:
-            self.display_decoder_aux = False
+            self.display_decoder_aux = True
 
         if self.display_decoder_aux:
             (self.output_dir / self.predictions_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
@@ -562,7 +561,7 @@ class pipeline():
                 else:
                     color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[:len(self.cells)],self.cells,self.div_track,None,self.track)
 
-                self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = img#color_frame         
+                self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = color_frame         
 
                 if self.eval_ctc:
 
@@ -640,7 +639,7 @@ class pipeline():
 
                 if self.display_decoder_aux and i in random_nbs:
 
-                    if 'enc_outputs' in outputs and not self.eval_ctc:
+                    if 'enc_outputs' in outputs:
                         enc_frame = np.array(img).copy()
                         enc_outputs = outputs['enc_outputs']
                         enc_pred_logits = enc_outputs['pred_logits']
@@ -664,7 +663,7 @@ class pipeline():
                         
                         enc_frames = np.concatenate((enc_frames),axis=1)
 
-                        cv2.imwrite(str(self.output_dir / self.predictions_folder / 'enc_outputs' / (f'encoder_frame_{fp.name}')),enc_frames)
+                        cv2.imwrite(str(self.output_dir / self.predictions_folder / 'enc_outputs' / (f'encoder_frame_{fp.stem}.png')),enc_frames)
 
 
                     references = outputs['references'].detach()
@@ -677,7 +676,7 @@ class pipeline():
 
                     colors = self.colors[self.cells-1] if self.track else self.colors[:len(self.cells)] 
 
-                    cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells) if c not in self.cells]) if prevcells is not None else None
+                    cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells.astype(np.int64)) if c not in self.cells]) if prevcells is not None else None
 
                     if self.track:
                         previmg_copy = previmg.copy()
@@ -758,7 +757,7 @@ class pipeline():
                             decoder_frame = np.concatenate((decoder_frame,img_final_box,img_final_all_box),axis=1)
 
                     method = 'object_detection' if not self.track else 'track'
-                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'decoder_bbox_outputs' / (f'{method}_decoder_frame_{fp.name}')),decoder_frame)
+                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'decoder_bbox_outputs' / (f'{method}_decoder_frame_{fp.stem}.png')),decoder_frame)
 
                     img_ref_pts_init_object = np.copy(np.array(img))
                     img_ref_pts_init_track = np.copy(np.array(img))
@@ -818,22 +817,19 @@ class pipeline():
                     else:
                         ref_frames = np.concatenate((img,img_ref_pts_init_all,ref_frames,img_ref_pts_final_all),axis=1)
 
-                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'ref_pts_outputs' / (f'{method}_ref_pts_{fp.name}')),ref_frames)
+                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'ref_pts_outputs' / (f'{method}_ref_pts_{fp.stem}.png')),ref_frames)
                     
         if self.eval_ctc:
             np.savetxt(self.output_dir / 'res_track.txt',ctc_data,fmt='%d')
 
         if self.write_video:
-            import ffmpeg
             crf = 20
             verbose = 1
-            method = 'track' if self.track else 'object_detection'
-            name_mask = 'mask_' if self.masks else ''
 
             if self.eval_ctc:
-                filename = self.output_dir / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')
+                filename = self.output_dir / (f'{self.videoname_list[r]}_movie.mp4')
             else:
-                filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_{method}_{name_mask}video.mp4')                
+                filename = self.output_dir / self.predictions_folder / (f'movie.mp4')                
 
             print(filename)
             height, width, _ = self.color_stack[0].shape

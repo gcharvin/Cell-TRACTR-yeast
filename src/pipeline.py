@@ -20,12 +20,8 @@ from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
 from trackformer.datasets import build_dataset
 
-moma = True
 
-if moma:
-    dataset_name = 'moma'
-else:
-    dataset_name = '2D'
+dataset_name = 'moma' #['moma','2D','DIC-C2DH-HeLa']
 
 ex = sacred.Experiment('train')
 ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset_name + '.yaml')
@@ -44,12 +40,11 @@ def train(args: Namespace) -> None:
     args.save_model_interval = False
     args.eval_only = True
     args.resume = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname / 'checkpoint.pth'
-    args.moma = moma 
 
-    track = False
+    track = True
     display_masks = True
 
-    args.eval_ctc = True
+    args.eval_ctc = False
     args.no_data_aug = True
     display_worst = False
     args.use_prev_prev_frame = False
@@ -59,7 +54,7 @@ def train(args: Namespace) -> None:
 
     datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data') / dataset_name / 'test'
 
-    if moma:
+    if dataset_name == 'moma':
         if args.eval_ctc:
             
             args.output_dir = args.output_dir / 'test'

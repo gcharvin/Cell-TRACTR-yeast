@@ -20,7 +20,7 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
-dataset = 'DIC-C2DH-HeLa' #['moma','2D',DIC-C2DH-HeLa]
+dataset = 'DIC-C2DH-HeLa' #['moma','2D','DIC-C2DH-HeLa']
 
 ex = sacred.Experiment('train')
 ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset + '.yaml')
