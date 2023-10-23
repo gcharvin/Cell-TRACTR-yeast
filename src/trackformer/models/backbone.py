@@ -60,6 +60,7 @@ class BackboneBase(nn.Module):
     def __init__(self, backbone: nn.Module, train_backbone: bool,
                  return_interm_layers: bool):
         super().__init__()
+        
         for name, parameter in backbone.named_parameters():
             if (not train_backbone
                 or 'layer2' not in name
@@ -67,16 +68,28 @@ class BackboneBase(nn.Module):
                 and 'layer4' not in name):
                 parameter.requires_grad_(False)
         if return_interm_layers:
-            # return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
-            # self.strides = [4, 8, 16, 32]
-            # self.num_channels = [256, 512, 1024, 2048]
             return_layers = {"relu": "0", "layer1": "1", "layer2": "2", "layer3": "3", "layer4": "4"}
             self.strides = [2, 4, 8, 16, 32]
-            self.num_channels = [64, 256, 512, 1024, 2048]
+            if self.name == 'resnet50':
+                self.num_channels = [64, 256, 512, 1024, 2048]
+            elif self.name == 'resnet34':
+                self.num_channels = [64, 64, 128, 256, 512]
+            elif self.name == 'resnet18':
+                self.num_channels = [64, 64, 128, 256, 512]
+            else:
+                raise NotImplementedError
+
         else:
             return_layers = {'layer4': "0"}
             self.strides = [32]
-            self.num_channels = [2048]
+            if self.name == 'resnet50':
+                self.num_channels = [2048]
+            elif self.name == 'resnet34':
+                self.num_channels = [512]    
+            elif self.name == 'resnet18':
+                self.num_channels = [512]
+            else:
+                raise NotImplementedError
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
 
     def forward(self, tensor_list: NestedTensor):
@@ -97,9 +110,13 @@ class Backbone(BackboneBase):
                  return_interm_layers: bool,
                  dilation: bool):
         norm_layer = FrozenBatchNorm2d
-        backbone = getattr(torchvision.models, name)(
-            replace_stride_with_dilation=[False, False, dilation],
-            pretrained=is_main_process(), norm_layer=norm_layer)
+        self.name = name
+        if 'resnet' in name:
+            backbone = getattr(torchvision.models, name)(
+                replace_stride_with_dilation=[False, False, dilation],
+                weights='DEFAULT', norm_layer=norm_layer)
+        else:
+            raise NotImplementedError     
         super().__init__(backbone, train_backbone,
                          return_interm_layers)
         if dilation:

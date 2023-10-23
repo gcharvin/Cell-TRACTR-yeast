@@ -14,7 +14,6 @@ import torch.nn.functional as F
 import torch.utils.data
 import torchvision
 from pycocotools import mask as coco_mask
-
 from . import transforms as T
 
 
@@ -42,7 +41,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             counter = Counter(annos_image_ids)
             self.ids = [i for i in self.ids if counter[i] >= min_num_objects]
 
-    def _getitem_from_id(self, image_id, man_track, framenb, random_state=None):
+    def _getitem_from_id(self, image_id, framenb, random_state=None):
         # if random state is given we do the data augmentation with the state
         # and then apply the random jitter. this ensures that (simulated) adjacent
         # frames have independent jitter.
@@ -58,7 +57,11 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             'image_id': torch.tensor(self.ids[image_id]),
             'annotations': annotations,
             'framenb': torch.tensor(framenb),
-            }
+            'dataset_nb': torch.tensor(int(annotations[0]['dataset_name'])),
+        }
+
+        if 'ctc_counter' in annotations[0]:
+            target['ctc_counter'] = torch.tensor(annotations[0]['ctc_counter'])
 
         img, target = self.prepare(img, target)
 
@@ -66,11 +69,11 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             img, target = self._transforms(img, target)
 
         # ignore
-        ignore = target.pop("ignore").bool()
-        for field in self.fields:
-            if field in target:
-                target[f"{field}_ignore"] = target[field][ignore]
-                target[field] = target[field][~ignore]
+        # ignore = target.pop("ignore").bool()
+        # for field in self.fields:
+        #     if field in target:
+        #         target[f"{field}_ignore"] = target[field][ignore]
+        #         target[field] = target[field][~ignore]
 
         if random_state is not None:
             random.setstate(curr_random_state['random'])
@@ -90,13 +93,15 @@ def convert_coco_poly_to_mask(segmentations, height, width):
         if isinstance(polygons, dict):
             rles = {'size': polygons['size'],
                     'counts': polygons['counts'].encode(encoding='UTF-8')}
+            masks[pidx,0] = torch.from_numpy(coco_mask.decode(rles)[:,:,0])
         else:
+            assert len(polygons) == 1
             for polygon in polygons:
                 if len(polygon) == 0:
                     raise Exception('Data error; every segmentation should have one polygon')
                 rles = coco_mask.frPyObjects(polygon, height, width)
 
-        masks[pidx,0] = torch.from_numpy(coco_mask.decode(rles)[:,:,0])
+            masks[pidx,0] = torch.from_numpy(coco_mask.decode(rles)[:,:,0])
     return masks
 
 
@@ -115,23 +120,27 @@ class ConvertCocoPolysToMask(object):
 
         boxes = torch.as_tensor([obj["bbox"] for obj in anno], dtype=torch.float32)
 
-        # x,y,w,h --> x,y,x,y
-        boxes[:, 2:4] += boxes[:, :2]
-        boxes = torch.cat((boxes,torch.zeros_like(boxes)),axis=1)
-
-        if not self.overflow_boxes:
-            boxes[:, 0::2].clamp_(min=0, max=w)
-            boxes[:, 1::2].clamp_(min=0, max=h)
-
         if not empty:
-            assert ((boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])).all() == True, 'Boxes are not correct in coco.py script'
+            # x,y,w,h --> x,y,x,y
+            boxes[:, 2:4] += boxes[:, :2]
+            boxes = torch.cat((boxes,torch.zeros_like(boxes)),axis=1)
+
+            if not self.overflow_boxes:
+                boxes[:, 0::2].clamp_(min=0, max=w)
+                boxes[:, 1::2].clamp_(min=0, max=h)
+
+            if not empty:
+                assert ((boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])).all() == True, 'Boxes are not correct in coco.py script'
 
         target["boxes"] = boxes
         target["boxes_orig"] = boxes.clone()
 
         if self.return_masks:
-            segmentations = [[obj["segmentation"]] for obj in anno]
-            masks = convert_coco_poly_to_mask(segmentations, h, w)
+            if not empty:
+                segmentations = [[obj["segmentation"]] for obj in anno]
+                masks = convert_coco_poly_to_mask(segmentations, h, w)
+            else:
+                masks = torch.zeros_like(torchvision.transforms.ToTensor()(image)[0])
             target["masks"] = masks
             target["masks_orig"] = masks.clone()
 
@@ -140,7 +149,7 @@ class ConvertCocoPolysToMask(object):
         classes = torch.tensor([obj["category_id"] for obj in anno]) 
         area = torch.tensor([obj["area"] for obj in anno])
         iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
-        ignore = torch.tensor([obj["ignore"] if "ignore" in obj else 0 for obj in anno])
+        # ignore = torch.tensor([obj["ignore"] if "ignore" in obj else 0 for obj in anno])
 
         classes = torch.stack((classes,2 * torch.ones_like(classes)),axis=1)
 
@@ -152,7 +161,7 @@ class ConvertCocoPolysToMask(object):
         target["labels_orig"] = (classes - 1).clone()
         target["area"] = area
         target["iscrowd"] = iscrowd
-        target["ignore"] = ignore
+        # target["ignore"] = ignore
 
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["size"] = torch.as_tensor([int(h), int(w)])

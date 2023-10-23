@@ -13,8 +13,9 @@ import torch
 from torch import nn
 from torch.nn.init import constant_, normal_, xavier_uniform_
 import torch.nn.functional as F
+import fvcore.nn.weight_init as weight_init
 
-from ..util.misc import inverse_sigmoid,add_noise_to_boxes
+from ..util.misc import inverse_sigmoid,add_noise_to_boxes, mask_to_bbox, combine_boxes_parallel
 from ..util import box_ops
 from .ops.modules import MSDeformAttn
 from .transformer import _get_clones, _get_activation_fn
@@ -31,7 +32,8 @@ class DeformableTransformer(nn.Module):
                  refine_track_queries=False, refine_div_track_queries=False,
                  init_enc_queries_embeddings=False,device='cuda',masks=False,
                  dn_enc_l1=0, dn_enc_l2=0, mask_dim=288,init_boxes_from_masks=False,
-                 dn_track_add_object_queries=False,enc_masks=False):
+                 dn_track_add_object_queries=False,enc_masks=False,enc_FN=0,avg_attn_weight_maps=True,
+                 decoder_use_mask_as_ref=False,tgt_noise=1e-6,use_img_for_mask=False):
         super().__init__()
 
         self.d_model = d_model
@@ -44,7 +46,14 @@ class DeformableTransformer(nn.Module):
         self.use_dab = use_dab
         self.device = device
         self.masks = masks
-        self.enc_masks=enc_masks
+        self.enc_masks = enc_masks
+        self.enc_FN = enc_FN
+        self.avg_attn_weight_maps = avg_attn_weight_maps
+        self.decoder_use_mask_as_ref = decoder_use_mask_as_ref
+        self.tgt_noise = tgt_noise
+        self.use_img_for_mask = use_img_for_mask
+
+        # self.forward_prediction_heads = None
 
         self.refine_track_queries = refine_track_queries
         self.refine_div_track_queries = refine_div_track_queries
@@ -76,7 +85,7 @@ class DeformableTransformer(nn.Module):
 
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          num_feature_levels, nhead, dec_n_points)
+                                                          num_feature_levels, nhead, dec_n_points,avg_attn_weight_maps)
         self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec,
                                                     use_dab=use_dab, d_model=d_model, high_dim_query_update=high_dim_query_update, no_sine_embed=no_sine_embed)
 
@@ -100,23 +109,55 @@ class DeformableTransformer(nn.Module):
             assert not self.use_dab, "use_dab must be True"
 
         self.mask_dim = mask_dim
+        
+        mask_num_feature_levels = num_feature_levels
+
+        if self.use_img_for_mask:
+            mask_num_feature_levels += 1
 
         # use 1x1 conv instead
         self.mask_features = nn.Conv2d(
-            d_model,
+            d_model*mask_num_feature_levels,
             self.mask_dim,
             kernel_size=1,
             stride=1,
+            padding=0,
         )
+
+        if self.use_img_for_mask:
+            self.img_encoder = nn.Sequential(
+                nn.Conv2d(
+                3,
+                d_model,
+                kernel_size=3,
+                stride=1,
+                padding='same',
+                bias=True
+                ),
+                nn.GroupNorm(d_model // 9, d_model),
+                nn.ReLU(),
+                nn.Conv2d(
+                    d_model,
+                    d_model,
+                    kernel_size=3,
+                    stride=1,
+                    padding='same',
+                    bias=True
+                    ),
+                nn.ReLU(),
+                nn.GroupNorm(d_model // 9, d_model),
+                )
+
+        weight_init.c2_xavier_fill(self.mask_features)
 
         self.lateral_layers = []
         self.output_layers = []
 
-        for in_channels in feature_channels[:self.num_feature_levels//2][::-1]:
+        for in_channels in feature_channels[:self.num_feature_levels][::-1]:
 
             lateral_layer = nn.Sequential(
                 nn.Conv2d(in_channels, d_model, kernel_size=1, bias=True),
-                nn.GroupNorm(32, d_model),
+                nn.GroupNorm(d_model // 9, d_model),
             )
 
             output_layer = nn.Sequential(
@@ -129,8 +170,11 @@ class DeformableTransformer(nn.Module):
                     bias=True,
                 ),
                 nn.ReLU(),
-                nn.GroupNorm(32, d_model),
+                nn.GroupNorm(d_model // 9, d_model),
            )
+
+            weight_init.c2_xavier_fill(lateral_layer[0])
+            weight_init.c2_xavier_fill(output_layer[0])
 
             self.lateral_layers.append(lateral_layer)
             self.output_layers.append(output_layer)
@@ -138,10 +182,10 @@ class DeformableTransformer(nn.Module):
         self.lateral_layers = nn.ModuleList(self.lateral_layers).to(self.device)
         self.output_layers = nn.ModuleList(self.output_layers).to(self.device)
 
-        self.mask_embed = MLP(d_model, d_model, self.mask_dim, 3)
+        self.mask_enc_embed = MLP(d_model, d_model, self.mask_dim, 3)
 
         # init decoder
-        self.decoder_norm  = nn.LayerNorm(d_model)
+        self.decoder_enc_norm  = nn.LayerNorm(d_model)
 
         self._reset_parameters()
 
@@ -156,14 +200,6 @@ class DeformableTransformer(nn.Module):
             xavier_uniform_(self.reference_points.weight.data, gain=1.0)
             constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
-
-    def forward_prediction_heads(self, output, mask_features):
-        decoder_output = self.decoder_norm(output)
-        mask_embed = self.mask_embed(decoder_output)
-
-        outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,:self.mask_dim], mask_features)
-
-        return outputs_mask
 
     def get_proposal_pos_embed(self, proposals):
         # num_pos_feats = 128
@@ -222,7 +258,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, output_target=None, query_attn_mask=None, dn_enc=False,training_methods=[],add_object_queries_to_dn_track=False):
+    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, output_target=None, query_attn_mask=None, dn_enc=False,training_methods=[],add_object_queries_to_dn_track=False,track=True):
         assert self.two_stage or query_embed is not None
         if not self.two_stage:
             assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
@@ -240,7 +276,6 @@ class DeformableTransformer(nn.Module):
             mask = mask.flatten(1)
             pos_embed = pos_embed.flatten(2).transpose(1, 2)
             lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
-            # lvl_pos_embed = pos_embed + self.level_embed[lvl % self.num_feature_levels].view(1, 1, -1)
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
@@ -248,12 +283,11 @@ class DeformableTransformer(nn.Module):
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
-        level_start_index = torch.cat((spatial_shapes[:spatial_shapes.shape[0]//2].new_zeros((1, )), spatial_shapes[:spatial_shapes.shape[0]//2].prod(1).cumsum(0)[:-1]))
-        # level_start_index = torch.cat((spatial_shapes[:spatial_shapes.shape[0]].new_zeros((1, )), spatial_shapes[:spatial_shapes.shape[0]].prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
         # encoder
         if self.multi_frame_attention_separate_encoder:
+            level_start_index = torch.cat((spatial_shapes[:spatial_shapes.shape[0]//2].new_zeros((1, )), spatial_shapes[:spatial_shapes.shape[0]//2].prod(1).cumsum(0)[:-1]))
             prev_memory = self.encoder(
                 src_flatten[:, :src_flatten.shape[1] // 2],
                 spatial_shapes[:self.num_feature_levels // 2],
@@ -272,7 +306,8 @@ class DeformableTransformer(nn.Module):
                 )
             memory = torch.cat([memory, prev_memory], 1)
         else:
-            memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+            level_start_index = torch.cat((spatial_shapes[:spatial_shapes.shape[0]].new_zeros((1, )), spatial_shapes[:spatial_shapes.shape[0]].prod(1).cumsum(0)[:-1]))
+            memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, level_start_index, lvl_pos_embed_flatten, mask_flatten)
 
         # prepare input for decoder
         bs, _, c = memory.shape
@@ -280,55 +315,82 @@ class DeformableTransformer(nn.Module):
         # reformat memory to be used to generate mask_features
         memory_list = []
         j = 0
-        for i in range(len(spatial_shapes) // 2):
+        for i in range(self.num_feature_levels ):
             size = spatial_shapes[i,0] * spatial_shapes[i,1]
             memory_list.append(memory[:,j:j+size,:].transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
             j += size
 
+        memory_list = memory_list[::-1]
+
         # Get mask_features needed for segmentation
-        fpns = [features[i].tensors for i in range(self.num_feature_levels // 2)][::-1]
+        fpns = [features[i].tensors for i in range(self.num_feature_levels)][::-1]
+        mask_size = fpns[-1].shape[-2:]
+
+        mask_features = []
+
+        if self.use_img_for_mask:
+            images = self.samples.tensors.to(self.device)
+            images_enc = self.img_encoder(images)
+
+            mask_size = images.shape[-2:]
 
         for fidx, fpn in enumerate(fpns):
             
             cur_fpn = self.lateral_layers[fidx](fpn)
-            y = cur_fpn + F.interpolate(memory_list[0], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False)
+            y = cur_fpn + F.interpolate(memory_list[fidx], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False) # Mask DINO uses just the largest spatial shape output from encoder however we use all encoder outputs
             y = self.output_layers[fidx](y)
+            mask_features.append(F.interpolate(y, size=mask_size, mode="bilinear", align_corners=False))
 
-        mask_features = self.mask_features(y)
+        if self.use_img_for_mask:
+            mask_features.append(images_enc)
+
+        mask_features = torch.cat(mask_features,1)
+        self.all_mask_features = self.mask_features(mask_features)
 
         enc_outputs = {}
 
         if self.two_stage:
             
-            output_memory, output_proposals = self.gen_encoder_output_proposals(memory[:,:memory.shape[1]//2], mask_flatten[:,:mask_flatten.shape[1]//2], spatial_shapes[:spatial_shapes.shape[0]//2])
+            if self.multi_frame_attention_separate_encoder:
+                output_memory, output_proposals = self.gen_encoder_output_proposals(memory[:,:memory.shape[1]//2], mask_flatten[:,:mask_flatten.shape[1]//2], spatial_shapes[:spatial_shapes.shape[0]//2])
+            else:
+                output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
             # hack implementation for two-stage Deformable DETR
-            enc_outputs_class = self.enc_out_class_embed(output_memory)
-            enc_outputs_coord_unact = self.enc_out_bbox_embed(output_memory)[...,:output_proposals.shape[-1]] + output_proposals
+            enc_outputs_class = self.class_embed(output_memory)[...,:1]
+            enc_outputs_coord_unact = self.bbox_embed[-1](output_memory)[...,:output_proposals.shape[-1]] + output_proposals
 
             assert self.num_queries <= enc_outputs_class.shape[1]
             topk = self.num_queries
+
             # topk = min(self.two_stage_num_proposals,enc_outputs_class.shape[1])
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
             topk_coords_undetach = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
             topk_coords_detach = topk_coords_undetach.detach()
             reference_points = topk_coords_detach.sigmoid()
             init_reference_out = reference_points
+            topk_classes = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
 
-            
-            tgt_undetach = torch.gather(output_memory, 1,
-                            topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))  # unsigmoid
+            tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))  # unsigmoid
             
             if self.masks and self.enc_masks:
-                outputs_mask_all = self.forward_prediction_heads(output_memory,mask_features)
-                enc_outputs['pred_masks'] = torch.stack((outputs_mask_all,torch.zeros_like(outputs_mask_all)),axis=2)
-            
-            enc_outputs['pred_logits'] = torch.cat((enc_outputs_class,torch.zeros_like(enc_outputs_class)),axis=-1)  # I use weight map to discard the second prediction in loss function
-            enc_outputs['pred_boxes'] = torch.cat((enc_outputs_coord_unact.sigmoid(),torch.zeros_like(enc_outputs_coord_unact)),axis=-1)
-            
+                outputs_mask, outputs_class = self.forward_prediction_heads(tgt_undetach,-1)
+                enc_outputs['pred_masks'] = outputs_mask
+                enc_outputs['pred_logits'] = outputs_class
+            else:
+                topk_classes = topk_classes[...,:1]
+                enc_outputs['pred_logits'] = torch.cat((topk_classes,torch.zeros_like(topk_classes)),axis=-1)  # I use weight map to discard the second prediction in loss function
+         
+            enc_outputs['pred_boxes'] = torch.cat((topk_coords_undetach.sigmoid(),torch.zeros_like(topk_coords_undetach)),axis=-1)
+            enc_outputs['topk_proposals'] = topk_proposals
+
+            if self.multi_frame_attention_separate_encoder:
+                enc_outputs['spatial_shapes'] = spatial_shapes[:spatial_shapes.shape[0]//2]
+            else:
+                enc_outputs['spatial_shapes'] = spatial_shapes
 
             if self.init_enc_queries_embeddings:
-                tgt = self.enc_query_embeddings.weight.repeat(self.batch_size,self.num_queries,1)
+                tgt = self.enc_query_embeddings.weight.repeat(memory.shape[0],self.num_queries,1) # Don't use batch size here in case at end of epoch, only one sample is used
             else:
                 # gather tgt
                 tgt = tgt_undetach.detach()
@@ -338,80 +400,125 @@ class DeformableTransformer(nn.Module):
                 boxes_oqs_clone = reference_points.clone()
 
             if self.masks and self.init_boxes_from_masks:
-                outputs_mask = self.forward_prediction_heads(tgt_undetach,mask_features)
-                flaten_mask = outputs_mask.detach().flatten(0, 1)
+                flatten_mask = outputs_mask.detach().flatten(0, 1)[:,0]
                 h, w = outputs_mask.shape[-2:]
 
-                refpoint_embed = box_ops.masks_to_boxes(flaten_mask > 0).cuda()
-                refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],dtype=torch.float,device=self.device)
+                refpoint_embed = mask_to_bbox(flatten_mask > 0)
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
-                refpoint_embed = inverse_sigmoid(refpoint_embed)
+                enc_outputs['mask_enc_boxes'] = refpoint_embed.clone().cpu()
+                # refpoint_embed = inverse_sigmoid(refpoint_embed)
+
+                reference_points = refpoint_embed
+                init_reference_out = reference_points
+
+                if self.iterative_masks:
+                    init_masks = outputs_mask
+
+            if not self.iterative_masks:
+                init_masks = None
 
             if query_embed is not None: # used for dn_object or if you want to add extra object queries on top of two_stage
                 reference_points = torch.cat((reference_points,query_embed[..., self.d_model:].sigmoid()),axis=1)
                 tgt = torch.cat((tgt,query_embed[..., :self.d_model]),axis=1)
+
+                if self.iterative_masks:
+                    b,_,_,h,w = init_masks.shape
+                    init_masks = torch.cat((init_masks,torch.zeros((b,query_embed[..., self.d_model:].shape[1],2,h,w),device=tgt.device)),axis=1)
+
                 query_embed = None
 
-            if dn_enc: # Only use dn_enc when current frame is fed to model
+            if targets is not None and dn_enc and sum([t[output_target]['empty'] for t in targets]) == 0: # Only use dn_enc when current frame is fed to model
                 assert output_target == 'cur_target'
                 enc_thresh = 0.2
+
+                if torch.rand(1).item() < self.enc_FN:
+                    enc_FN = True
+                    random_number = torch.randint(low=1, high=3, size=(1,))[0]
+                    topk_dn_enc = topk + random_number
+                    assert enc_outputs_class.shape[1] > topk_dn_enc
+                else:
+                    enc_FN=False
+                    topk_dn_enc = topk
+                    random_number = 0
+
+                topk_proposals = torch.topk(enc_outputs_class[..., 0], topk_dn_enc, dim=1)[1][:,random_number:]
+
                 topk_cls_undetach = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
                 keep_enc_boxes = topk_cls_undetach[:,:,0].sigmoid() > enc_thresh
-                num_enc_boxes = max([target[output_target]['boxes'].shape[0] + (target[output_target]['boxes'][:,-1] > 0).sum() for target in targets])
-                total_boxes = sum([target[output_target]['boxes'].shape[0] for target in targets])
-                if keep_enc_boxes.sum() > total_boxes - 2: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 
-                    num_enc_boxes = num_enc_boxes
-                    topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], num_enc_boxes, dim=1)[1]
+                num_enc_boxes = 0
 
-                    tgt_enc = torch.gather(tgt,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,self.d_model))
-                    tgt = torch.cat((tgt,tgt_enc),axis=1)
+                for target in targets:
+                    num_enc_boxes = max(num_enc_boxes,target[output_target]['boxes'].shape[0] + (target[output_target]['boxes'][:,-1] > 0).sum())
 
-                    assert num_enc_boxes == tgt_enc.shape[1]
-                    assert tgt_enc.shape[1] >= num_enc_boxes
+                if num_enc_boxes > 0:
 
-                    reference_points_enc = torch.gather(reference_points,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4))
+                    total_boxes = sum([target[output_target]['boxes'].shape[0] - target[output_target]['empty'].int() for target in targets])
+                    if keep_enc_boxes.sum() > total_boxes - 2 or enc_FN: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 
 
-                    # denoise enc boxes
-                    l_1 = self.dn_enc_l1
-                    l_2 = self.dn_enc_l2
-                    reference_points_enc_noised = add_noise_to_boxes(reference_points_enc.clone(),l_1,l_2)
+                        if enc_FN:
+                            topk_dn_boxes = topk_proposals 
+                            num_enc_boxes = topk
+                            tgt_enc = torch.gather(output_memory, 1, topk_dn_boxes.unsqueeze(-1).repeat(1, 1, self.d_model)).detach()
+                            reference_points_enc = torch.gather(enc_outputs_coord_unact,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4)).detach().sigmoid()
+                        else:
+                            topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], num_enc_boxes, dim=1)[1]
+                            tgt_enc = torch.gather(tgt,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,self.d_model))
+                            reference_points_enc = torch.gather(reference_points,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4))
 
-                    reference_points = torch.cat((reference_points,reference_points_enc_noised),axis=1)
+                        tgt_enc += torch.normal(0,self.tgt_noise,size=tgt_enc.shape,device=self.device)
+                        tgt = torch.cat((tgt,tgt_enc),axis=1)
 
-                    assert len(tgt_enc) == len(reference_points_enc)
-                    assert len(tgt) == len(reference_points)
-                    assert query_attn_mask is not None
+                        assert num_enc_boxes == tgt_enc.shape[1]
+                        assert tgt_enc.shape[1] >= num_enc_boxes
 
-                    new_query_attn_mask = torch.zeros((query_attn_mask.shape[0] + tgt_enc.shape[1],query_attn_mask.shape[1] + tgt_enc.shape[1])).bool().to(tgt.device)
-                    new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
-                    query_attn_mask = new_query_attn_mask                          
 
-                    query_attn_mask[-num_enc_boxes:,:-num_enc_boxes] = True
-                    query_attn_mask[:-num_enc_boxes,-num_enc_boxes:] = True
+                        # denoise enc boxes
+                        l_1 = self.dn_enc_l1
+                        l_2 = self.dn_enc_l2
+                        reference_points_enc_noised = add_noise_to_boxes(reference_points_enc.clone(),l_1,l_2)
 
-                    for t,target in enumerate(targets):
-                        target['dn_enc'] = {}
-                        target['dn_enc']['boxes'] = target[output_target]['boxes_orig'].clone()
-                        target['dn_enc']['enc_boxes_noised'] = reference_points_enc_noised[t]
-                        target['dn_enc']['enc_boxes'] = reference_points_enc[t]
-                        target['dn_enc']['enc_logits'] = topk_cls_undetach[:,:,0].sigmoid()[t]
-                        target['dn_enc']['labels'] = target[output_target]['labels_orig'].clone()
-                        target['dn_enc']['track_ids'] = target[output_target]['track_ids_orig'].clone()
-                        target['dn_enc']['prev_target'] = target['prev_target'].copy()
-                        target['dn_enc']['fut_target'] = target['fut_target'].copy()
-                        target['dn_enc']['empty'] = target[output_target]['empty']
-                        target['dn_enc']['track_queries_mask'] = torch.zeros((reference_points_enc.shape[1])).bool().to(tgt.device)
-                        target['dn_enc']['num_queries'] = reference_points_enc.shape[1]
-                        target['dn_enc']['framenb'] = target[output_target]['framenb']
+                        reference_points = torch.cat((reference_points,reference_points_enc_noised),axis=1)
 
-                        if 'masks' in target[output_target]:
-                            target['dn_enc']['masks'] = target[output_target]['masks_orig'].clone()
+                        if self.iterative_masks:
+                            b,_,_,h,w = init_masks.shape
+                            init_masks = torch.cat((init_masks,torch.zeros((b,reference_points_enc_noised.shape[1],2,h,w),device=tgt.device)),axis=1)
 
-                    training_methods.append('dn_enc')
+                        assert len(tgt_enc) == len(reference_points_enc)
+                        assert len(tgt) == len(reference_points)
+                        assert query_attn_mask is not None
+
+                        new_query_attn_mask = torch.zeros((query_attn_mask.shape[0] + tgt_enc.shape[1],query_attn_mask.shape[1] + tgt_enc.shape[1])).bool().to(tgt.device)
+                        new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
+                        query_attn_mask = new_query_attn_mask                          
+
+                        query_attn_mask[-num_enc_boxes:,:-num_enc_boxes] = True
+                        query_attn_mask[:-num_enc_boxes,-num_enc_boxes:] = True
+
+                        for t,target in enumerate(targets):
+                            target['dn_enc'] = {}
+                            target['dn_enc']['boxes'] = target[output_target]['boxes_orig'].clone()
+                            target['dn_enc']['enc_boxes_noised'] = reference_points_enc_noised[t].detach()
+                            target['dn_enc']['enc_boxes'] = reference_points_enc[t].detach()
+                            target['dn_enc']['enc_logits'] = topk_cls_undetach[:,:,0].sigmoid()[t].detach()
+                            target['dn_enc']['labels'] = target[output_target]['labels_orig'].clone()
+                            target['dn_enc']['track_ids'] = target[output_target]['track_ids_orig'].clone()
+                            target['dn_enc']['prev_target'] = target['prev_target'].copy()
+                            target['dn_enc']['fut_target'] = target['fut_target'].copy()
+                            target['dn_enc']['empty'] = target[output_target]['empty']
+                            target['dn_enc']['track_queries_mask'] = torch.zeros((reference_points_enc.shape[1])).bool().to(tgt.device)
+                            target['dn_enc']['num_queries'] = reference_points_enc.shape[1]
+                            target['dn_enc']['framenb'] = target[output_target]['framenb']
+
+                            if 'masks' in target[output_target]:
+                                target['dn_enc']['masks'] = target[output_target]['masks_orig'].clone()
+
+                        training_methods.append('dn_enc')
 
         elif self.use_dab:
             reference_points = query_embed[..., self.d_model:].sigmoid() 
             tgt = query_embed[..., :self.d_model]
+            tgt_oqs_clone = tgt[:,-self.num_queries:].clone()
+            boxes_oqs_clone = reference_points[:,-self.num_queries:].clone()
             query_embed = None
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
@@ -443,6 +550,10 @@ class DeformableTransformer(nn.Module):
 
             reference_points = torch.cat([prev_boxes[..., :reference_points.shape[-1]], reference_points], dim=1)
 
+            if self.iterative_masks:
+                prev_masks = torch.stack([t[output_target]['track_query_masks'] for t in targets])
+                init_masks = torch.cat((init_masks,prev_masks),axis=1)
+
             if 'dn_track' in targets[0]:
                 
                 # targets_dn_track = [target['dn_track'] for target in targets]
@@ -470,31 +581,78 @@ class DeformableTransformer(nn.Module):
                 tgt = torch.cat([tgt,prev_tgt_dn_track], dim=1)
                 reference_points = torch.cat([reference_points,prev_boxes_dn_track[..., :reference_points.shape[-1]]], dim=1)
 
+                if self.iterative_masks:
+                    b,_,_,h,w = init_masks.shape
+                    init_masks = torch.cat((init_masks,torch.zeros((b,prev_boxes_dn_track.shape[1],2,h,w),device=tgt.device)),axis=1)
+
                 new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=tgt.device).bool()
 
                 assert query_attn_mask is not None
                 new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
 
                 new_query_attn_mask[:-num_dn_track,-num_dn_track:] = True
-                new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
+                # new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
+                new_query_attn_mask[-num_dn_track:,self.num_queries:-num_dn_track] = True
 
                 query_attn_mask = new_query_attn_mask
 
                 training_methods.append('dn_track')
 
+                if self.dn_track_group and 'dn_track_group' in targets[0]:
+
+                    num_dn_track_group = targets[0]['dn_track_group']['num_queries']
+                    assert num_dn_track_group > 0
+
+                    prev_hs_embed_dn_track_group = torch.stack([t['dn_track_group']['track_query_hs_embeds'] for t in targets])
+                    prev_boxes_dn_track_group = torch.stack([t['dn_track_group']['track_query_boxes'] for t in targets])
+
+                    assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
+                    assert torch.sum(torch.isnan(prev_boxes_dn_track_group)) == 0, 'Nan in track boxes'
+
+                    if not self.use_dab:
+                        prev_hs_embed_dn_track_group = torch.zeros_like(prev_hs_embed_dn_track_group)
+                        query_embed = torch.cat([query_embed,prev_boxes_dn_track_group], dim=1)
+
+                    prev_tgt_dn_track_group = prev_hs_embed_dn_track_group
+
+                    if self.dn_track_add_object_queries and add_object_queries_to_dn_track:
+                        prev_tgt_dn_track_group = torch.cat([prev_tgt_dn_track_group,tgt_oqs_clone], dim=1)
+                        prev_boxes_dn_track_group = torch.cat([prev_boxes_dn_track_group[..., :reference_points.shape[-1]],boxes_oqs_clone], dim=1)
+                        # num_dn_track_group += self.num_queries
+
+                    tgt = torch.cat([tgt,prev_tgt_dn_track_group], dim=1)
+                    reference_points = torch.cat([reference_points,prev_boxes_dn_track_group[..., :reference_points.shape[-1]]], dim=1)
+
+                    if self.iterative_masks:
+                        b,_,_,h,w = init_masks.shape
+                        init_masks = torch.cat((init_masks,torch.zeros((b,prev_boxes_dn_track_group.shape[1],2,h,w),device=tgt.device)),axis=1)
+
+                    new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=tgt.device).bool()
+
+                    assert query_attn_mask is not None
+                    new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
+
+                    new_query_attn_mask[:-num_dn_track_group,-num_dn_track_group:] = True
+                    # new_query_attn_mask[-num_dn_track_group:,:-num_dn_track_group] = True
+                    new_query_attn_mask[-num_dn_track_group:,self.num_queries:-num_dn_track_group] = True
+
+                    query_attn_mask = new_query_attn_mask
+
+                    training_methods.append('dn_track_group')
+
+
         init_reference_out = reference_points
 
         # decoder
-        hs, inter_references = self.decoder(
+        hs, inter_references, cls_outputs, mask_outputs = self.decoder(
             tgt, reference_points, memory, spatial_shapes,
-            valid_ratios, level_start_index, query_embed, mask_flatten, query_attn_mask)
+            valid_ratios, level_start_index, query_embed, mask_flatten, query_attn_mask,init_masks)
 
         assert torch.sum(torch.isnan(hs)) == 0, 'Nan in hs_embedding decoder outputs'
 
         inter_references_out = inter_references             
 
-        return hs, memory, init_reference_out, inter_references_out, enc_outputs, training_methods, mask_features
-
+        return hs, memory, init_reference_out, inter_references_out, enc_outputs, training_methods, init_masks, mask_outputs, cls_outputs
 
 class DeformableTransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -571,7 +729,7 @@ class DeformableTransformerEncoder(nn.Module):
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
-                 n_levels=4, n_heads=8, n_points=4):
+                 n_levels=4, n_heads=8, n_points=4,avg_attn_weight_maps=True):
         super().__init__()
 
         # cross attention
@@ -591,6 +749,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
+        
+        self.avg_attn_weight_maps = avg_attn_weight_maps
 
     @staticmethod
     def with_pos_embed(tensor, pos):
@@ -606,7 +766,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
 
-        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), attn_mask=query_attn_mask)[0].transpose(0, 1)
+        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), attn_mask=query_attn_mask, average_attn_weights=self.avg_attn_weight_maps)[0].transpose(0, 1)
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
@@ -633,6 +793,7 @@ class DeformableTransformerDecoder(nn.Module):
         # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
         self.bbox_embed = None
         self.class_embed = None
+        self.mask_embed = None
         self.use_div_ref_pts = False
 
         #### DAB-DETR
@@ -651,7 +812,7 @@ class DeformableTransformerDecoder(nn.Module):
         #### DAB-DETR
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_valid_ratios, src_level_start_index,
-                query_pos=None, src_padding_mask=None, query_attn_mask=None):
+                query_pos=None, src_padding_mask=None, query_attn_mask=None, iter_masks=None):
         output = tgt
 
         #### DAB-DETR
@@ -661,6 +822,9 @@ class DeformableTransformerDecoder(nn.Module):
 
         intermediate = []
         intermediate_reference_points = []
+        intermediate_masks = []
+        intermediate_cls = []
+
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
@@ -688,33 +852,79 @@ class DeformableTransformerDecoder(nn.Module):
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
-                if self.use_div_ref_pts:
-                    tmp = self.bbox_embed[lid](output)
-                    cls = self.class_embed[lid](output)
-                    box_1_ratio = torch.exp(cls[:,:,0]) / (torch.exp(cls[:,:,0]) + torch.exp(cls[:,:,1]))
-                    box_1_ratio = box_1_ratio[:,:,None].repeat(1,1,4)
-                    tmp = tmp[:,:,:4] * box_1_ratio + tmp[:,:,4:] * (1 - box_1_ratio)
+                if self.decoder_use_mask_as_ref:
+                    
+                    pred_masks, cls = self.forward_prediction_heads(output,lid)
+                    
+                    if self.iterative_masks:
+                        pred_masks += iter_masks
+                        iter_masks = pred_masks.detach()
+
+                    decoder_masks = pred_masks.sigmoid()
+                    decoder_masks = decoder_masks * cls[...,None,None].sigmoid()
+                        
+                    decoder_masks = decoder_masks.flatten(0, 1)
+
+                    boxes = mask_to_bbox(decoder_masks[:,0] > 0.5)
+                    div_boxes = mask_to_bbox(decoder_masks[:,1] > 0.5)
+
+                    combined_boxes = combine_boxes_parallel(boxes,div_boxes)
+
+                    boxes = boxes.reshape(pred_masks.shape[0], pred_masks.shape[1], 4)
+                    combined_boxes = combined_boxes.reshape(pred_masks.shape[0], pred_masks.shape[1], 4)
+
+                    boxes[cls[:,:,1] > 0] = combined_boxes[cls[:,:,1] > 0]
+
+                    new_reference_points = combined_boxes
+
+
+                    # decoder_masks = decoder_masks[:,:,0] + decoder_masks[:,:,1]
+                    # h, w = tmp.shape[-2:]
+                    # tmp = box_ops.masks_to_boxes(tmp > 0.5).cuda()
+                    # tmp = box_ops.box_xyxy_to_cxcywh(tmp) / torch.as_tensor([w, h, w, h],dtype=torch.float,device=self.device)
+                    # new_reference_points = tmp.reshape(decoder_masks.shape[0], decoder_masks.shape[1], 4)
+
                 else:
-                    tmp = self.bbox_embed[lid](output)[:,:,:4]  # I am using the first box as the basis for the reference points
-                if reference_points.shape[-1] == 4:
-                    new_reference_points = tmp + inverse_sigmoid(reference_points)
-                    assert torch.sum(torch.isnan(new_reference_points)) == 0, 'Reference points causing nan'
-                    new_reference_points = new_reference_points.sigmoid()
-                else:
-                    assert reference_points.shape[-1] == 2
-                    new_reference_points = tmp
-                    new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
-                    new_reference_points = new_reference_points.sigmoid()
+                    
+                    cls = self.class_embed(output)
+                    
+                    if self.use_div_ref_pts:
+                        tmp = self.bbox_embed[lid](output)
+                        box_1_ratio = torch.exp(cls[:,:,0]) / (torch.exp(cls[:,:,0]) + torch.exp(cls[:,:,1]))
+                        box_1_ratio = box_1_ratio[:,:,None].repeat(1,1,4)
+                        tmp = tmp[:,:,:4] * box_1_ratio + tmp[:,:,4:] * (1 - box_1_ratio)
+                    else:
+                        tmp = self.bbox_embed[lid](output)[:,:,:4]  # I am using the first box as the basis for the reference points
+                    if reference_points.shape[-1] == 4:
+                        new_reference_points = tmp + inverse_sigmoid(reference_points)
+                        assert torch.sum(torch.isnan(new_reference_points)) == 0, 'Reference points causing nan'
+                        new_reference_points = new_reference_points.sigmoid()
+                    else:
+                        assert reference_points.shape[-1] == 2
+                        new_reference_points = tmp
+                        new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
+                        new_reference_points = new_reference_points.sigmoid()
                 reference_points = new_reference_points.detach()
 
             if self.return_intermediate:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
 
-        if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+                if self.decoder_use_mask_as_ref:
+                    intermediate_masks.append(pred_masks)
+                    intermediate_cls.append(cls)
 
-        return output, reference_points
+        if self.decoder_use_mask_as_ref:
+            stack_masks = torch.stack(intermediate_masks)
+            stack_cls = torch.stack(intermediate_cls)
+        else:
+            stack_masks = None
+            stack_cls = None
+
+        if self.return_intermediate:
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), stack_cls, stack_masks
+
+        return output, reference_points, cls, pred_masks
 
 
 def build_deforamble_transformer(args):
@@ -750,6 +960,11 @@ def build_deforamble_transformer(args):
         masks=args.masks,
         dn_track_add_object_queries=args.dn_track_add_object_queries,
         enc_masks=args.enc_masks,
+        enc_FN =args.enc_FN,
+        avg_attn_weight_maps=args.avg_attn_weight_maps,
+        decoder_use_mask_as_ref=args.decoder_use_mask_as_ref,
+        tgt_noise=args.tgt_noise,
+        use_img_for_mask=args.use_img_for_mask,
         )
 
 class MLP(nn.Module):

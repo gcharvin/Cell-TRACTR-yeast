@@ -536,16 +536,18 @@ class Normalize:
         image = F.normalize(image, mean=self.mean, std=self.std)
         if target is None:
             return image, None
-        target = target.copy()
-        h, w = image.shape[-2:]
-        if "boxes" in target:
-            boxes = target["boxes"]
-            boxes = torch.cat((box_xyxy_to_cxcywh(boxes[:,:4]),box_xyxy_to_cxcywh(boxes[:,4:])),axis=1)
-            boxes = boxes / torch.tensor([w, h, w, h, w, h, w, h], dtype=torch.float32)
-            target["boxes"] = boxes
 
-            if 'boxes_orig' in target:
-                target['boxes_orig'] = boxes.clone()
+        if not target['empty']:
+            target = target.copy()
+            h, w = image.shape[-2:]
+            if "boxes" in target:
+                boxes = target["boxes"]
+                boxes = torch.cat((box_xyxy_to_cxcywh(boxes[:,:4]),box_xyxy_to_cxcywh(boxes[:,4:])),axis=1)
+                boxes = boxes / torch.tensor([w, h, w, h, w, h, w, h], dtype=torch.float32)
+                target["boxes"] = boxes
+
+                if 'boxes_orig' in target:
+                    target['boxes_orig'] = boxes.clone()
         return image, target
 
 

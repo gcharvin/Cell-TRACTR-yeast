@@ -71,6 +71,9 @@ class HungarianMatcher(nn.Module):
         """
         batch_size, num_queries = outputs["pred_logits"].shape[:2]
 
+        if sum([target[output_target]['empty'] for target in targets]) == batch_size:
+            return [(torch.tensor([]).long(),torch.tensor([]).long()) for _ in range(batch_size)], targets
+
         # We flatten to compute the cost matrices in a batch
         #
         # [batch_size * num_queries, num_classes]
@@ -100,8 +103,8 @@ class HungarianMatcher(nn.Module):
         out_bbox = out_bbox.flatten(0,1)
 
         # Also concat the target labels and boxes
-        tgt_ids = torch.cat([target[output_target]["labels"] for target in targets])
-        tgt_bbox = torch.cat([target[output_target]["boxes"] for target in targets])
+        tgt_ids = torch.cat([target[output_target]["labels"] for target in targets if not target[output_target]['empty']])
+        tgt_bbox = torch.cat([target[output_target]["boxes"] for target in targets if not target[output_target]['empty']])
 
         keep = tgt_ids[:,1] == 0
 
@@ -151,7 +154,7 @@ class HungarianMatcher(nn.Module):
                 out_mask = torch.cat((out_mask,out_div_mask),axis=1)
 
             out_mask = out_mask.flatten(0,1)  
-            tgt_mask = torch.cat([target[output_target]["masks"] for target in targets]).to(out_mask)
+            tgt_mask = torch.cat([target[output_target]["masks"] for target in targets if not target[output_target]['empty']]).to(out_mask)
             
             out_mask = F.interpolate(out_mask, size=tgt_mask.shape[-2:], mode="bilinear", align_corners=False)
 
@@ -190,7 +193,7 @@ class HungarianMatcher(nn.Module):
         # Final cost matrix
         cost_matrix = cost_matrix.view(batch_size, num_queries+num_tqs, -1).cpu()
 
-        sizes = [len(target[output_target]["boxes"]) for target in targets]
+        sizes = [len(target[output_target]["boxes"]) - target[output_target]['empty'].int() for target in targets]
 
         for i, target in enumerate(targets):
             if 'track_query_match_ids' not in target[output_target]:
@@ -228,13 +231,18 @@ class HungarianMatcher(nn.Module):
                         cost_matrix[i, j + num_queries] = np.inf
                         cost_matrix[i, j, track_query_id + sum(sizes[:i])] = -1
 
-        indices = [linear_sum_assignment(c[i])
-                   for i, c in enumerate(cost_matrix.split(sizes, -1))]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(cost_matrix.split(sizes, -1))]
 
         indices, targets = threshold_indices(indices,targets,output_target,max_ind=num_queries)
 
-        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-                for i, j in indices], targets
+        ind = []
+        for(i,j),target in zip(indices,targets):
+            if target[output_target]['empty']:
+                ind.append((torch.tensor([]).long(),torch.tensor([]).long()))
+            else:
+                ind.append((torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)))
+
+        return ind, targets
 
 
 def build_matcher(args):

@@ -9,10 +9,11 @@ overwrite_lrs: false
 overwrite_lr_scheduler: false
 batch_size: 1
 weight_decay: 0.0001
-epochs: 20
-lr_drop: 16
-epoch_to_start_using_flexible_divisions: 10
+epochs: 50
+lr_drop: 40
+epoch_to_start_using_flexible_divisions: 5
 use_prev_prev_frame: true
+target_size: (256,256)
 # gradient clipping max norm
 clip_max_norm: 0.1
 # Deformable DETR
@@ -24,7 +25,7 @@ freeze_detr: false
 load_mask_head_from_model: null
 # Backbone
 # Name of the convolutional backbone to use. ('resnet50', 'resnet101')
-backbone: resnet50
+backbone: resnet18
 # If true, we replace stride with dilation in the last convolutional block (DC5)
 dilation: false
 # Type of positional embedding to use on top of the image features. ('sine', 'learned')
@@ -33,9 +34,9 @@ position_embedding: sine
 num_feature_levels: 3
 # Transformer
 # Number of encoding layers in the transformer
-enc_layers: 6
+enc_layers: 3
 # Number of decoding layers in the transformer
-dec_layers: 6
+dec_layers: 3
 # Intermediate size of the feedforward layers in the transformer blocks
 dim_feedforward: 1024
 # Size of the embeddings (dimension of the transformer)
@@ -45,28 +46,32 @@ dropout: 0.1
 # Number of attention heads inside the transformer's attentions
 nheads: 8
 # Number of object queries
-num_queries: 600
+num_queries: 360
 pre_norm: false
 dec_n_points: 4
 enc_n_points: 4
 # DAB-DETR - denoising parameters
 use_dab: true
 dn_track: true
-dn_track_add_object_queries: true
+dn_track_add_object_queries: false
 dn_track_l1: 0.1
 dn_track_l2: 0.05
-dn_object: true
+dn_object: false
 dn_label: 0.3
 dn_object_l1: 0.2
 dn_object_l2: 0.1
 dn_enc: false
 dn_enc_l1: 0.2
 dn_enc_l2: 0.1
+enc_FN: 0.75
+dn_track_group: true
+tgt_noise: 0.00001
+share_bbox_layers: false
 # Embeddings to differentiate object vs track queries
 refine_track_queries: true
 refine_object_queries: true
 refine_div_track_queries: false
-use_div_ref_pts: true
+use_div_ref_pts: false
 init_enc_queries_embeddings: false
 init_boxes_from_masks: false
 # Tracking
@@ -74,23 +79,23 @@ tracking: true
 # In addition to detection also run tracking evaluation with default configuration from `cfgs/track.yaml`
 tracking_eval: true
 # Range of possible random previous frames
-track_prev_prev_frame: True
+track_prev_prev_frame: true
 track_backprop_prev_frame: False
 # only for vanilla DETR
 track_query_false_positive_eos_weight: true
 track_attention: false
-multi_frame_attention: true
-multi_frame_encoding: true
-multi_frame_attention_separate_encoder: true
-merge_frame_features: true
+multi_frame_attention: false
+multi_frame_encoding: false
+multi_frame_attention_separate_encoder: false
+merge_frame_features: false
 overflow_boxes: true
 # Segmentation
 masks: true
 mask_dim: 288
-enc_masks: false
+enc_masks: true
 # Matcher
 # Class coefficient in the matching cost
-set_cost_class: 2.0
+set_cost_class: 4.0
 # L1 box coefficient in the matching cost
 set_cost_bbox: 5.0
 # giou box coefficient in the matching cost
@@ -102,22 +107,29 @@ num_points: 10000
 # Loss
 # Disables auxiliary decoding losses (loss at each layer)
 aux_loss: true
-return_intermediate_masks: false
+CoMOT: true
+CoMOT_loss_ce: true
+use_img_for_mask: false
+init_boxes_from_masks: false
+decoder_use_mask_as_ref: false
+iterative_masks: false
+mult_enc_loss: false
+return_intermediate_masks: true
 group_object_coef: 1.0
 dn_object_coef: 1.0
 dn_track_coef: 1.0
-mask_loss_coef: 20.0
-mask_weight_cells_coef: 1.0 
-mask_weight_target_cell_coef: 2.0
-dice_loss_coef: 4.0
+pos_wei_loss_coef: 2.0
+mask_loss_coef: 5.0
+mask_weight_target_cell_coef: 5.0
+dice_loss_coef: 5.0
 loss_coef: 1.0 # This is just a formality
-cls_loss_coef: 1.0 
+cls_loss_coef: 4.0 
 bbox_loss_coef: 5.0
 giou_loss_coef: 2.0
 div_loss_coef: 2.0 
 track_div_loss_coef: 2.0
 object_queies_loss_coef: 1.0
-evaluate_dataset_with_no_data_aug: false
+no_data_aug: false
 # Relative classification weight of the no-object class
 eos_coef: 0.1
 focal_loss: true
@@ -125,9 +137,12 @@ focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
 dataset: 2D
+# Number of plots
+num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
 output_dir: /projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results
+data_dir: /projectnb/dunlop/ooconnor/object_detection/data
 # device to use for training / testing
 device: cuda
 seed: 42
@@ -135,13 +150,13 @@ seed: 42
 resume: ''
 resume_shift_neuron: False
 # resume optimization from checkpoint
-resume_optim: false
+resume_optim: true
 # resume Visdom visualization
 resume_vis: false
 start_epoch: 1
 eval_only: false
 eval_train: false
-num_workers: 2
+num_workers: 0
 val_interval: 5
 debug: false
 # epoch interval for model saving. if 0 only save last and best models
@@ -151,3 +166,8 @@ save_model_interval: false
 world_size: 1
 # url used to set up distributed training
 dist_url: env://
+cls_threshold: 0.5
+iou_threshold: 0.5
+display_all: false
+hooks: false
+avg_attn_weight_maps: true

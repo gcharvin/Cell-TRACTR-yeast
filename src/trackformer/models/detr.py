@@ -15,126 +15,126 @@ from ..util.misc import (NestedTensor, accuracy, dice_loss, get_world_size,
                          nested_tensor_from_tensor_list, sigmoid_focal_loss,threshold_indices,
                         combine_div_boxes,calc_iou,divide_box,update_early_or_late_track_divisions,update_object_detection)
 
-class DETR(nn.Module):
-    """ This is the DETR module that performs object detection. """
+# class DETR(nn.Module):
+#     """ This is the DETR module that performs object detection. """
 
-    def __init__(self, backbone, transformer, num_classes, num_queries, device, two_stage=False,
-                 aux_loss=False, overflow_boxes=False):
-        """ Initializes the model.
-        Parameters:
-            backbone: torch module of the backbone to be used. See backbone.py
-            transformer: torch module of the transformer architecture. See transformer.py
-            num_classes: number of object classes
-            num_queries: number of object queries, ie detection slot. This is the maximal
-                         number of objects DETR can detect in a single image. For COCO, we
-                         recommend 100 queries.
-            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-        """
-        super().__init__()
-        self.device = device
-        self.num_queries = num_queries
-        self.transformer = transformer
-        self.overflow_boxes = overflow_boxes
-        self.class_embed = nn.Linear(self.hidden_dim, num_classes + 2)
-        self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 8, 3)
-        if two_stage:
-            self.enc_class_embed = nn.Linear(self.hidden_dim, num_classes + 1)
-            self.enc_bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
+#     def __init__(self, backbone, transformer, num_classes, num_queries, device, two_stage=False,
+#                  aux_loss=False, overflow_boxes=False):
+#         """ Initializes the model.
+#         Parameters:
+#             backbone: torch module of the backbone to be used. See backbone.py
+#             transformer: torch module of the transformer architecture. See transformer.py
+#             num_classes: number of object classes
+#             num_queries: number of object queries, ie detection slot. This is the maximal
+#                          number of objects DETR can detect in a single image. For COCO, we
+#                          recommend 100 queries.
+#             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+#         """
+#         super().__init__()
+#         self.device = device
+#         self.num_queries = num_queries
+#         self.transformer = transformer
+#         self.overflow_boxes = overflow_boxes
+#         self.class_embed = nn.Linear(self.hidden_dim, num_classes + 2)
+#         self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 8, 3)
+#         if two_stage:
+#             self.enc_class_embed = nn.Linear(self.hidden_dim, num_classes + 1)
+#             self.enc_bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
+#         self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
 
-        # match interface with deformable DETR
-        self.input_proj = nn.Conv2d(backbone.num_channels[-1], self.hidden_dim, kernel_size=1)
+#         # match interface with deformable DETR
+#         self.input_proj = nn.Conv2d(backbone.num_channels[-1], self.hidden_dim, kernel_size=1)
 
-        self.backbone = backbone
-        self.aux_loss = aux_loss
+#         self.backbone = backbone
+#         self.aux_loss = aux_loss
 
-    @property
-    def hidden_dim(self):
-        """ Returns the hidden feature dimension size. """
-        return self.transformer.d_model
+    # @property
+    # def hidden_dim(self):
+    #     """ Returns the hidden feature dimension size. """
+    #     return self.transformer.d_model
 
-    @property
-    def fpn_channels(self):
-        """ Returns FPN channels. """
-        return self.backbone.num_channels[:4][::-1]
-        # return [1024, 512, 256]
+    # @property
+    # def fpn_channels(self):
+    #     """ Returns FPN channels. """
+    #     return self.backbone.num_channels[:4][::-1]
+    #     # return [1024, 512, 256]
 
-    def forward(self, samples: NestedTensor, targets: list = None):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W],
-                               containing 1 on padded pixels
+    # def forward(self, samples: NestedTensor, targets: list = None):
+    #     """ The forward expects a NestedTensor, which consists of:
+    #            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
+    #            - samples.mask: a binary mask of shape [batch_size x H x W],
+    #                            containing 1 on padded pixels
 
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x (num_classes + 1)]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center_x, center_y, height, width). These values are normalized
-                               in [0, 1], relative to the size of each individual image
-                               (disregarding possible padding). See PostProcess for information
-                               on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It
-                                is a list of dictionnaries containing the two above keys for
-                                each decoder layer.
-        """
-        if not isinstance(samples, NestedTensor):
-            samples = nested_tensor_from_tensor_list(samples)
-        features, pos = self.backbone(samples)
+    #         It returns a dict with the following elements:
+    #            - "pred_logits": the classification logits (including no-object) for all queries.
+    #                             Shape= [batch_size x num_queries x (num_classes + 1)]
+    #            - "pred_boxes": The normalized boxes coordinates for all queries, represented as
+    #                            (center_x, center_y, height, width). These values are normalized
+    #                            in [0, 1], relative to the size of each individual image
+    #                            (disregarding possible padding). See PostProcess for information
+    #                            on how to retrieve the unnormalized bounding box.
+    #            - "aux_outputs": Optional, only returned when auxilary losses are activated. It
+    #                             is a list of dictionnaries containing the two above keys for
+    #                             each decoder layer.
+    #     """
+    #     if not isinstance(samples, NestedTensor):
+    #         samples = nested_tensor_from_tensor_list(samples)
+    #     features, pos = self.backbone(samples)
 
-        src, mask = features[-1].decompose()
-        # src = self.input_proj[-1](src)
-        src = self.input_proj(src)
-        # pos = pos[-1]
-        pos = pos[-1][:,0] ## DETR does not use prev frame so I got rid of preivous frame pos info
+    #     src, mask = features[-1].decompose()
+    #     # src = self.input_proj[-1](src)
+    #     src = self.input_proj(src)
+    #     # pos = pos[-1]
+    #     pos = pos[-1][:,0] ## DETR does not use prev frame so I got rid of preivous frame pos info
 
-        batch_size, _, _, _ = src.shape
+    #     batch_size, _, _, _ = src.shape
 
-        query_embed = self.query_embed.weight
-        query_embed = query_embed.unsqueeze(1).repeat(1, batch_size, 1)
-        tgt = None
-        if targets is not None and 'track_query_hs_embeds' in targets[0]:
-            # [BATCH_SIZE, NUM_PROBS, 4]
-            track_query_hs_embeds = torch.stack([t['track_query_hs_embeds'] for t in targets])
+    #     query_embed = self.query_embed.weight
+    #     query_embed = query_embed.unsqueeze(1).repeat(1, batch_size, 1)
+    #     tgt = None
+    #     if targets is not None and 'track_query_hs_embeds' in targets[0]:
+    #         # [BATCH_SIZE, NUM_PROBS, 4]
+    #         track_query_hs_embeds = torch.stack([t['track_query_hs_embeds'] for t in targets])
 
-            num_track_queries = track_query_hs_embeds.shape[1]
+    #         num_track_queries = track_query_hs_embeds.shape[1]
 
-            track_query_embed = torch.zeros(
-                num_track_queries,
-                batch_size,
-                self.hidden_dim).to(query_embed.device)
-            query_embed = torch.cat([
-                track_query_embed,
-                query_embed], dim=0)
+    #         track_query_embed = torch.zeros(
+    #             num_track_queries,
+    #             batch_size,
+    #             self.hidden_dim).to(query_embed.device)
+    #         query_embed = torch.cat([
+    #             track_query_embed,
+    #             query_embed], dim=0)
 
-            tgt = torch.zeros_like(query_embed)
-            tgt[:num_track_queries] = track_query_hs_embeds.transpose(0, 1)
+    #         tgt = torch.zeros_like(query_embed)
+    #         tgt[:num_track_queries] = track_query_hs_embeds.transpose(0, 1)
 
-            for i, target in enumerate(targets):
-                target['track_query_hs_embeds'] = tgt[:, i]
+    #         for i, target in enumerate(targets):
+    #             target['track_query_hs_embeds'] = tgt[:, i]
 
-        assert mask is not None
-        hs, hs_without_norm, memory = self.transformer(
-            src, mask, query_embed, pos, tgt)
+    #     assert mask is not None
+    #     hs, hs_without_norm, memory = self.transformer(
+    #         src, mask, query_embed, pos, tgt)
 
-        outputs_class = self.class_embed(hs)
-        outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1],
-               'pred_boxes': outputs_coord[-1],
-               'hs_embed': hs_without_norm[-1]}
+    #     outputs_class = self.class_embed(hs)
+    #     outputs_coord = self.bbox_embed(hs).sigmoid()
+    #     out = {'pred_logits': outputs_class[-1],
+    #            'pred_boxes': outputs_coord[-1],
+    #            'hs_embed': hs_without_norm[-1]}
 
-        if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(
-                outputs_class, outputs_coord)
+    #     if self.aux_loss:
+    #         out['aux_outputs'] = self._set_aux_loss(
+    #             outputs_class, outputs_coord)
 
-        return out, targets, features, memory, hs
+    #     return out, targets, features, memory, hs
 
-    @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+    # @torch.jit.unused
+    # def _set_aux_loss(self, outputs_class, outputs_coord):
+    #     # this is a workaround to make torchscript happy, as torchscript
+    #     # doesn't support dictionary with non-homogeneous values, such
+    #     # as a dict having both a Tensor and a list.
+    #     return [{'pred_logits': a, 'pred_boxes': b}
+    #             for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -171,16 +171,7 @@ class SetCriterion(nn.Module):
         self.device = args.device
         self.args = args
 
-    # def update_target(self,target,index):
-
-    #     target['boxes'] = torch.cat((target['boxes'][:index],torch.cat((target['boxes'][index,:4],torch.zeros(4,).to(self.device)))[None],torch.cat((target['boxes'][index,4:],torch.zeros(4,).to(self.device)))[None],target['boxes'][index+1:]))
-    #     target['labels'] = torch.cat((target['labels'][:index],torch.cat((target['labels'][index,:1],torch.ones(1,).long().to(self.device)))[None],torch.cat((target['labels'][index,1:],torch.ones(1,).long().to(self.device)))[None],target['labels'][index+1:]))
-        
-    #     if 'masks' in target:
-    #         N,_,H,W = target['masks'].shape
-    #         target['masks'] = torch.cat((target['masks'][:index],torch.cat((target['masks'][index,:1],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],torch.cat((target['masks'][index,1:],torch.zeros((1,H,W)).to(self.device,dtype=torch.uint8)))[None],target['masks'][index+1:]))
-
-    def loss_labels_focal(self, outputs, targets, indices, num_boxes, two_stage=False):
+    def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -196,7 +187,16 @@ class SetCriterion(nn.Module):
         target_classes_onehot = ((target_classes == 0) * 1).float()
 
         weights = torch.ones((src_logits.shape)).to(self.device)
+
+        num_preds = src_logits.shape[1]
+
+        if 'CoMOT' in outputs and outputs['CoMOT_loss_ce']:
+            weights = torch.zeros((src_logits.shape)).to(self.device)
+            weights[idx] = 1.
+            num_preds = num_boxes
+
         weights[target_classes_onehot[:,:,1] == 1.] *= self.args.div_loss_coef
+        weights[target_classes_onehot == 1.] *= self.args.pos_wei_loss_coef
 
         if targets[0]['output_name'] == 'enc_outputs':
             weights[:,:,1] = 0
@@ -205,7 +205,11 @@ class SetCriterion(nn.Module):
             src_logits, target_classes_onehot, num_boxes, weights,
             alpha=self.focal_alpha, gamma=self.focal_gamma)
 
-        loss_ce *= src_logits.shape[1]
+        loss_ce *= num_preds
+
+        if targets[0]['output_name'] == 'enc_outputs' and self.args.mult_enc_loss:
+            loss_ce *= self.args.dec_layers
+
         losses = {'loss_ce': loss_ce}
 
         return losses
@@ -223,7 +227,7 @@ class SetCriterion(nn.Module):
 
         assert (sum(src_boxes < 0) == 0).all(), 'Pred boxes should have positive values only' 
 
-        target_boxes = [t['boxes'][i] for t, (_, i) in zip(targets, indices)]
+        target_boxes = [t['boxes'][i] for t, (_, i) in zip(targets, indices) if not t['empty']]
 
         target_boxes = torch.cat(target_boxes,dim=0)
 
@@ -254,6 +258,10 @@ class SetCriterion(nn.Module):
 
         losses['loss_giou'] = loss_giou.sum() / num_boxes
 
+        if targets[0]['output_name'] == 'enc_outputs' and self.args.mult_enc_loss:
+            losses['loss_bbox'] *= self.args.dec_layers
+            losses['loss_giou'] *= self.args.dec_layers
+
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
@@ -267,7 +275,7 @@ class SetCriterion(nn.Module):
 
         src_masks = outputs["pred_masks"]
 
-        target_masks = [t["masks"][i] for t, (_, i) in zip(targets, indices)]
+        target_masks = [t["masks"][i] for t, (_, i) in zip(targets, indices) if not t['empty']]
 
         target_masks = torch.cat(target_masks,axis=0).to(self.device)
         target_masks,_ = nested_tensor_from_tensor_list(target_masks).decompose()
@@ -301,9 +309,14 @@ class SetCriterion(nn.Module):
 
         losses = {
             "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes, weights_mask,
-             alpha=self.focal_alpha, gamma=self.focal_gamma),
+             alpha=self.focal_alpha, gamma=self.focal_gamma, mask=True),
             "loss_dice": dice_loss(src_masks.sigmoid()*weights_dice, target_masks, num_boxes)
         }
+
+        if targets[0]['output_name'] == 'enc_outputs' and self.args.mult_enc_loss:
+            losses['loss_mask'] *= self.args.dec_layers
+            losses['loss_dice'] *= self.args.dec_layers
+
         return losses
 
     def _get_src_permutation_idx(self, indices):
@@ -341,15 +354,16 @@ class SetCriterion(nn.Module):
         for target in targets:
             target[output_target]['output_name'] = output_target
 
-        if output_target == 'cur_target' and (epoch is None or epoch > self.args.epoch_to_start_using_flexible_divisions):
+        if  self.args.flex_div and output_target == 'cur_target' and (epoch is None or epoch > self.args.epoch_to_start_using_flexible_divisions):
             targets = update_early_or_late_track_divisions(outputs,targets, 'prev_target','cur_target','fut_target')
 
         #### this outputs_without_aux should be replaced with outputs; need to double check
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        # outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        outputs_without_aux = outputs
 
         indices, targets = self.matcher(outputs_without_aux, targets, output_target)
 
-        if output_target == 'cur_target':
+        if self.args.flex_div and output_target == 'cur_target':
             num_queries = self.args.num_queries
             targets, indices = update_object_detection(outputs_without_aux,targets,indices,num_queries,'prev_target','cur_target','fut_target')
 
@@ -357,7 +371,7 @@ class SetCriterion(nn.Module):
             target[output_target]['indices'] = indices[t]
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
-        num_boxes = sum(len(t[output_target]["labels"]) for t in targets) - sum(t[output_target]["empty"] for t in targets) # Empty chambers have an empty box and label as placeholder so we need to subtract it as a box
+        num_boxes = sum((1 - t[output_target]["labels"]).sum() for t in targets if not t[output_target]["empty"])
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=outputs['pred_logits'].device)
 
         if is_dist_avail_and_initialized():
@@ -378,9 +392,31 @@ class SetCriterion(nn.Module):
         # In case of auxiliary losses, we repeat this process with the
         # output of each intermediate layer.
         if 'aux_outputs' in outputs:
+
+            if self.args.CoMOT and output_target == 'cur_target' and targets[0]['track'] and outputs['pred_logits'].shape[1] > self.args.num_queries:
+                CoMOT = True
+            else:
+                CoMOT = False
+
+            if CoMOT:
+                for target in targets:
+                    target['CoMOT'] = {'output_name': 'CoMOT'}
+                    target['CoMOT']['labels'] = target[output_target]['labels_orig'].clone()
+                    target['CoMOT']['boxes'] = target[output_target]['boxes_orig'].clone()
+                    target['CoMOT']['track_ids'] = target[output_target]['track_ids_orig'].clone()
+                    target['CoMOT']['empty'] = target[output_target]['empty'].clone()
+
+                    if 'masks' in target[output_target]:
+                        target['CoMOT']['masks'] = target[output_target]['masks_orig'].clone()
+
+
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 if 'track_queries_TP_mask' in target['cur_target']:
                     assert target['cur_target']['track_queries_TP_mask'].sum() == len(target['cur_target']['track_query_match_ids'])
+
+                if CoMOT:
+                    aux_outputs['CoMOT_loss_ce'] = self.args.CoMOT_loss_ce
+                    aux_outputs['CoMOT'] = True
 
                 indices,targets = self.matcher(aux_outputs, targets, output_target)
                 targets_loss = [target[output_target] for target in targets]
@@ -396,31 +432,52 @@ class SetCriterion(nn.Module):
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
-        if 'enc_outputs' in outputs:
+                if CoMOT:
+
+                    aux_outputs_without_track = {}
+                    for key in ['pred_logits', 'pred_boxes']:
+                        aux_outputs_without_track[key] = aux_outputs[key][:,-self.args.num_queries:].clone()
+
+                    if 'pred_masks' in aux_outputs:
+                        aux_outputs_without_track['pred_masks'] = aux_outputs['pred_masks'][:,-self.args.num_queries:].clone()
+
+                    indices,targets = self.matcher(aux_outputs_without_track, targets, 'CoMOT')
+                    aux_outputs['CoMOT_indices'] = indices
+
+                    targets_loss = [target['CoMOT'] for target in targets]
+
+                    for loss in self.losses:
+                        if (loss == 'masks' and 'pred_masks' not in aux_outputs) or (sum(sizes) == 0 and loss != 'labels') or (loss == 'labels' and not self.args.CoMOT_loss_ce):
+                            # Intermediate masks losses are too costly to compute, we ignore them.
+                            continue
+
+                        l_dict = self.get_loss(loss, aux_outputs_without_track, targets_loss, indices, num_boxes)
+                        l_dict = {k + f'_{i}_CoMOT': v for k, v in l_dict.items()}
+                        losses.update(l_dict)
+
+        if 'enc_outputs' in outputs:# and sum(sizes) > 0:
             enc_outputs = outputs['enc_outputs']
             
-            for target in targets:
+            for t,target in enumerate(targets):
                 target['enc_outputs'] = {'output_name': 'enc_outputs'}
                 target['enc_outputs']['labels'] = target[output_target]['labels_orig'].clone()
                 target['enc_outputs']['boxes'] = target[output_target]['boxes_orig'].clone()
+                target['enc_outputs']['track_ids'] = target[output_target]['track_ids_orig'].clone()
                 target['enc_outputs']['empty'] = target[output_target]['empty'].clone()
 
                 if 'masks' in target[output_target]:
                     target['enc_outputs']['masks'] = target[output_target]['masks_orig'].clone()
 
-                # count = 0
-                # for b in range(len(target['enc_outputs']['boxes'])):
-                #     if target['enc_outputs']['boxes'][b + count,-1] > 0:
-                #         self.update_target(target['enc_outputs'],b+count)
-                #         count += 1
-
                 if not target['enc_outputs']['empty']:
                     assert (target['enc_outputs']['labels'][0:,0] == 0).all() and (target['enc_outputs']['labels'][0:,1] == 1).all()
                     assert (target['enc_outputs']['boxes'][:,-1] == 0).all()
+                    if 'masks' in target[output_target]:
+                        assert (target['enc_outputs']['masks'][:,-1] == 0).all()
 
-            num_boxes = sum(len(t['enc_outputs']["labels"]) for t in targets) - sum(t['enc_outputs']["empty"] for t in targets)
+            num_boxes = max(sum(len(t['enc_outputs']["labels"]) for t in targets) - sum(t['enc_outputs']["empty"] for t in targets),1)
 
             indices, targets = self.matcher(enc_outputs, targets,'enc_outputs')
+            outputs['enc_outputs']['indices'] = indices
             
             targets_loss = [target['enc_outputs'] for target in targets]
 

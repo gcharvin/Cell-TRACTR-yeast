@@ -55,24 +55,24 @@ class MOT(CocoDetection):
             'torch': torch.random.get_rng_state()}
 
         fn = self.coco.imgs[idx]['file_name']
-        dataset_nb = re.findall('\d+',fn)[0]
+        dataset_nb = re.findall('\d+',fn)[:-1]
 
         if idx < 2:
             idx = 2
 
         prev_prev_fn = self.coco.imgs[idx-2]['file_name']
-        prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[0]
+        prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[:-1]
         
         while prev_prev_dataset_nb != dataset_nb:
             idx += 1
             prev_prev_fn = self.coco.imgs[idx-2]['file_name']
-            prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[0]
+            prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[:-1]
             
         if idx == len(self.coco.imgs) -1:
             idx -= 1
 
         fut_fn = self.coco.imgs[idx+1]['file_name']
-        fut_dataset_nb = re.findall('\d+',fut_fn)[0]
+        fut_dataset_nb = re.findall('\d+',fut_fn)[:-1]
 
         if fut_dataset_nb != dataset_nb:
             idx -= 1
@@ -83,34 +83,64 @@ class MOT(CocoDetection):
         if self.load_all_txt_files:
             man_track = self.man_tracks[dataset_nb].copy()
         else:
-            man_track = np.loadtxt(self.root.parents[1] / 'man_track' / (dataset_nb + '.txt'),dtype=np.int16)
+            if len(dataset_nb) > 1:
+                man_track = np.loadtxt(self.root.parents[1] / 'man_track' / (f'{dataset_nb[0]}_{dataset_nb[1]}.txt'),dtype=np.int16)
+                if man_track.ndim == 1:
+                    man_track = man_track[None]
+            else:
+                man_track = np.loadtxt(self.root.parents[1] / 'man_track' / (dataset_nb[0] + '.txt'),dtype=np.int16)
 
-        target = {'man_track': torch.from_numpy(man_track),
-                  'dataset_nb': torch.tensor(int(dataset_nb))}
+        # We remove cells that disappear and reappear
+        divisions = np.unique(man_track[:,-1])
+        divisions = divisions[divisions != 0]
+        for div in divisions:
+            if (man_track[:,-1] == div).sum() == 1:
+                man_track[man_track[:,-1] == div,-1] = 0
 
-        img, cur_target = self._getitem_from_id(idx, man_track, framenb, random_state=random_state)
+        target = {'man_track': torch.from_numpy(man_track).long()}
+
+        if len(dataset_nb) > 1:
+            target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
+            target['split_nb'] = torch.tensor(int(dataset_nb[1]))
+        else:
+            target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
+
+        img, cur_target = self._getitem_from_id(idx, framenb, random_state=random_state)
         target['cur_image'] = img
         target['cur_target'] = cur_target
         
-        prev_img, prev_target = self._getitem_from_id(idx-1, man_track, framenb-1, random_state=random_state)
+        prev_img, prev_target = self._getitem_from_id(idx-1, framenb-1, random_state=random_state)
         target['prev_image'] = prev_img
         target['prev_target'] = prev_target
     
-        prev_prev_img, prev_prev_target = self._getitem_from_id(idx-2, man_track, framenb-2, random_state=random_state)
+        prev_prev_img, prev_prev_target = self._getitem_from_id(idx-2, framenb-2, random_state=random_state)
         target['prev_prev_image'] = prev_prev_img
         target['prev_prev_target'] = prev_prev_target
 
-        fut_img, fut_target = self._getitem_from_id(idx+1, man_track, framenb+1, random_state=random_state)
+        fut_img, fut_target = self._getitem_from_id(idx+1, framenb+1, random_state=random_state)
         target['fut_image'] = fut_img
         target['fut_target'] = fut_target
+        
+        # print(prev_prev_target['dataset_nb'],prev_target['dataset_nb'],cur_target['dataset_nb'],fut_target['dataset_nb'])
+
+        # if int(prev_prev_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     pass
+        # elif int(prev_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     pass
+        # elif int(cur_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     pass
+        # elif int(fut_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     asdf = 0
 
         target['target_og'] = {'man_track': torch.from_numpy(man_track)}
             
         for target_name in ['prev_prev_target','prev_target','cur_target','fut_target']:
             target['target_og'][target_name] = {}
             target['target_og'][target_name]['boxes'] = target[target_name]['boxes'].clone()
-            target['target_og'][target_name]['masks'] = target[target_name]['masks'].clone()
             target['target_og'][target_name]['track_ids'] = target[target_name]['track_ids'].clone()
+            
+            if 'masks' in target[target_name]:
+                target['target_og'][target_name]['masks'] = target[target_name]['masks'].clone()
 
         return img, target
 

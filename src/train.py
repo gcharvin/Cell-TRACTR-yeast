@@ -6,6 +6,7 @@ import time
 from argparse import Namespace
 from pathlib import Path
 from datetime import date
+import shutil
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
@@ -20,18 +21,43 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
-dataset = 'DIC-C2DH-HeLa' #['moma','2D','DIC-C2DH-HeLa']
+dataset = 'moma' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
+# dataset = '2D' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
 
 ex = sacred.Experiment('train')
 ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset + '.yaml')
-ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
 
 def train(args: Namespace) -> None:
 
-    args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_{args.dataset}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc else ""}{"_dn_track" if args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}_{"mask" if args.masks else "no_mask"}')
-
-    if args.dn_track or args.dn_object or args.group_object:
+    if args.resume:
+        args.output_dir = Path(args.resume).parent
+    else:
+        args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_{dataset}{"" if args.flex_div else "_no"}_flex_div{"_CoMOT" if args.CoMOT else ""}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc and args.two_stage else ""}{"_dn_track" if args.dn_track else ""}{"_dn_track_group" if args.dn_track_group and args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}{"_intermediate" if args.masks and args.return_intermediate_masks else ""}{"_mask" if args.masks else "_no_mask"}_{args.enc_layers}_enc_{args.dec_layers}_dec_layers')
+        args.output_dir.mkdir(exist_ok=True)
+    
+    if args.dn_track or args.dn_object:
         assert args.use_dab, f'DAB-DETR is needed to use denoised boxes for tracking / object detection. args.use_dab is currently set to {args.use_dab}'
+
+    utils.init_distributed_mode(args)
+    print("git:\n  {}\n".format(utils.get_sha()))
+
+    if args.CoMOT:
+        assert not args.share_bbox_layers, 'Are you sure you want to share layers when using CoMOT'
+
+    if args.debug:
+        # args.tracking_eval = False
+        args.num_workers = 0
+
+    if not args.deformable:
+        assert args.num_feature_levels == 1
+
+    if args.output_dir:
+        args.output_dir = str(args.output_dir)
+        yaml.dump(
+            vars(args),
+            open(Path(args.output_dir) / 'config.yaml', 'w'), allow_unicode=True)
+
+    args.output_dir = Path(args.output_dir)
 
     print(args)
 
@@ -49,32 +75,25 @@ def train(args: Namespace) -> None:
         (args.output_dir / val_output_folder / 'enc_outputs').mkdir(exist_ok=True)
         (args.output_dir / train_output_folder / 'enc_outputs').mkdir(exist_ok=True)
 
+        if args.dn_enc:
+            (args.output_dir / val_output_folder / 'dn_enc').mkdir(exist_ok=True)
+            (args.output_dir / train_output_folder / 'dn_enc').mkdir(exist_ok=True) 
+
     if args.dn_track and not args.object_detection_only:
         (args.output_dir / val_output_folder / 'dn_track').mkdir(exist_ok=True)
         (args.output_dir / train_output_folder / 'dn_track').mkdir(exist_ok=True)     
+
+    if args.dn_track and args.dn_track_group and not args.object_detection_only:
+        (args.output_dir / val_output_folder / 'dn_track_group').mkdir(exist_ok=True)
+        (args.output_dir / train_output_folder / 'dn_track_group').mkdir(exist_ok=True)  
 
     if args.dn_object:
         (args.output_dir / val_output_folder / 'dn_object').mkdir(exist_ok=True)
         (args.output_dir / train_output_folder / 'dn_object').mkdir(exist_ok=True)   
 
-    if args.dn_enc:
-        (args.output_dir / val_output_folder / 'dn_enc').mkdir(exist_ok=True)
-        (args.output_dir / train_output_folder / 'dn_enc').mkdir(exist_ok=True) 
-
-    utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
-
-    if args.debug:
-        # args.tracking_eval = False
-        args.num_workers = 0
-
-    if not args.deformable:
-        assert args.num_feature_levels == 1
-
-    if args.output_dir:
-        yaml.dump(
-            vars(args),
-            open(args.output_dir / 'config.yaml', 'w'), allow_unicode=True)
+    if args.CoMOT:
+        (args.output_dir / val_output_folder / 'CoMOT').mkdir(exist_ok=True)
+        (args.output_dir / train_output_folder / 'CoMOT').mkdir(exist_ok=True)  
 
     device = torch.device(args.device)
 
@@ -127,9 +146,9 @@ def train(args: Namespace) -> None:
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
-
+    
     args_drop_num = args.epochs // args.lr_drop
-    lr_drop = [args.lr_drop * i for i in range(1,args_drop_num+1)]
+    lr_drop = [args.lr_drop * i for i in range(1,args_drop_num+1)] 
 
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, lr_drop, gamma=0.1)
 
@@ -247,47 +266,68 @@ def train(args: Namespace) -> None:
                 args.start_epoch = checkpoint['epoch'] + 1
                 print(f"RESUME EPOCH: {args.start_epoch}")
 
+            for file_name in ['metrics_train.pkl','metrics_val.pkl','training_time.txt']:
+                if not (args.output_dir / file_name).exists():
+                    shutil.copyfile(Path(args.resume).parent / file_name, args.output_dir / file_name)
+
 
     if args.eval_only:
         evaluate(
             model, criterion, data_loader_val, device,
             args.output_dir, args, 0)
         return
+    
+    val_loss = np.inf
 
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs + 1):
+        start_epoch = time.time()
         # TRAIN
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_one_epoch(model, criterion, data_loader_train, optimizer, epoch, args)
+        train_metrics = train_one_epoch(model, criterion, data_loader_train, optimizer, epoch, args)
 
         lr_scheduler.step()
 
         checkpoint_paths = [args.output_dir / 'checkpoint.pth']
 
-        evaluate(
-            model, criterion, data_loader_val,
-            args, epoch)
+        val_metrics = evaluate(model, criterion, data_loader_val,args, epoch)
+
+        utils.save_metrics_pkl(train_metrics,args.output_dir,'train',epoch=epoch)  
+        utils.save_metrics_pkl(val_metrics,args.output_dir,'val',epoch=epoch)  
 
         # MODEL SAVING
-        if args.output_dir:
-            if args.save_model_interval and not epoch % args.save_model_interval:
-                checkpoint_paths.append(args.output_dir / f"checkpoint_epoch_{epoch}.pth")
+        new_val_loss = val_metrics['loss'][-1].mean()
 
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+        if new_val_loss < val_loss:
+            val_loss = new_val_loss
+            if args.output_dir:
+                if args.save_model_interval and not epoch % args.save_model_interval:
+                    checkpoint_paths.append(str(args.output_dir / f"checkpoint_epoch_{epoch}.pth"))
+
+                for checkpoint_path in checkpoint_paths:
+                    args.output_dir = str(args.output_dir)
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }, str(checkpoint_path))
+                    args.output_dir = Path(args.output_dir)
+
+        total_epoch_time = time.time() - start_epoch
+        print(f'Epoch took {str(datetime.timedelta(seconds=int(total_epoch_time)))}')
+        with open(str(args.output_dir / "training_time.txt"), "a") as f:
+            f.write(f"Epoch {epoch}: {str(datetime.timedelta(seconds=int(total_epoch_time)))}\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+    with open(str(args.output_dir / "training_time.txt"), "a") as f:
+        f.write(f"Total time: {total_time_str}\n")
 
 @ex.main
 def load_config(_config, _run):
