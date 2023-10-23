@@ -564,10 +564,10 @@ def plot_results(outputs,prev_outputs,targets,samples,savepath,filename,folder,a
 
                 track_query_ids = target['prev_target']['track_ids'][prev_indices_FN[1]].cpu().numpy()
 
-                if len(track_ids) > 0:
-                    track_ids = np.concatenate((track_ids,np.array([max_track_id+idx for idx in range(track_query_boxes.shape[0]-len(track_ids))]).astype(int)))
+                if len(track_query_ids) > 0:
+                    track_query_ids = np.concatenate((track_query_ids,np.array([max_track_id+idx for idx in range(track_query_boxes.shape[0]-len(track_query_ids))]).astype(int)))
                 else:
-                    track_ids = np.array([max_track_id+idx for idx in range(track_query_boxes.shape[0]-len(track_ids))])
+                    track_query_ids = np.array([max_track_id+idx for idx in range(track_query_boxes.shape[0]-len(track_query_ids))])
 
                 for idx,track_query_box in enumerate(track_query_boxes):
 
