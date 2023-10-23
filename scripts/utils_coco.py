@@ -5,9 +5,8 @@ from itertools import groupby
 from skimage.measure import label
 import random
 import re
-import tifffile
 
-random.seed(1)
+random.seed(24)
 
 def train_val_split(files,split=0.8):
 
@@ -24,6 +23,10 @@ def create_folders(datapath,folders):
     # Create annotations folder
     (datapath / 'annotations').mkdir(exist_ok=True)
     (datapath / 'man_track').mkdir(exist_ok=True)
+
+    man_track_paths = (datapath / 'man_track').glob('*.txt')
+    for man_track_path in man_track_paths:
+        man_track_path.unlink()
 
     # Create train and val folder to store images and ground truths
     for folder in folders:
@@ -78,19 +81,40 @@ def polygonFromMask(seg):
 
 
 class reader():
-    def __init__(self,mothermachine,target_size,min_area):
+    def __init__(self,dataset,target_size,min_area):
 
         self.target_size = target_size
         self.min_area = min_area
         self.dtype = {'uint8': 255,
                       'uint16': 65535}
 
-        if mothermachine:
+        if dataset == 'moma':
             self.crop = False
-        else:
+            self.resize = True
+            self.rescale = False
+            self.remove_min = False
+        elif dataset == '2D' or dataset == '2D_512x512':
             self.crop = True
+            self.resize = False
+            self.rescale = False
+            self.remove_min = False
+        else:
+            self.crop = False
+            self.resize = True
+            self.rescale = False
+            self.remove_min = True
 
-
+        self.max_num_of_cells = 0
+    
+    def load_track_file(self,track_file):
+        self.track_file_orig = track_file
+        
+    def reset_track_file(self):
+        self.track_file = self.track_file_orig.copy()
+        self.crop_track_file = np.zeros_like(self.track_file)
+        self.removed_cellnbs = []
+        self.swap_cellnbs = {}
+        self.max_cellnb = self.track_file[-1,0]
 
     def get_slices(self,seg,shift):
     
@@ -128,12 +152,15 @@ class reader():
         self.y = [y0,y1]
         self.x = [x0,x1]
 
-
-
     def read_image(self,fp):
 
         img = cv2.imread(str(fp),cv2.IMREAD_ANYDEPTH)
-        img = img / self.dtype[str(img.dtype)]
+
+        if self.rescale:
+            img = ((img - np.min(img)) / np.ptp(img))
+            img.shape == self.target_size
+        else:
+            img = img / np.max(img)
 
         if self.crop:
             img = img[self.y[0]:self.y[1],self.x[0]:self.x[1]]
@@ -144,38 +171,285 @@ class reader():
             if img.shape[1] < self.target_size[1]:
                 img = np.pad(img,((0,0),(0,self.target_size[1] - img.shape[1])))
                 
-        else:
+        elif self.resize:
             img = cv2.resize(img,(self.target_size[1],self.target_size[0]))
 
         img = (255 * img).astype(np.uint8)
 
         return img
 
-    def read_gt(self,fp,counter,track_file):
+    def get_swapped_cellnb(self,gt,cellnb):
+        if isinstance(self.swap_cellnbs[cellnb],list):
+            mask = ((gt == cellnb)*255).astype(np.uint8)
+
+            mask_label = label(mask)
+            mask_cellnbs = np.unique(mask_label)
+            mask_cellnbs = mask_cellnbs[mask_cellnbs!=0]  
+
+            for mask_cellnb in mask_cellnbs:
+                if (mask_label == mask_cellnb).sum() < self.min_area:
+                    mask_cellnbs = mask_cellnbs[mask_cellnbs != mask_cellnb]          
+
+            if len(mask_cellnbs) == 1:
+                cell_1_area = (self.prev_gt == self.swap_cellnbs[cellnb][0]).sum() 
+                cell_2_area = (self.prev_gt == self.swap_cellnbs[cellnb][1]).sum()
+
+                if cell_1_area > cell_2_area:
+                    new_cellnb = self.swap_cellnbs[cellnb][0]
+                else:
+                    new_cellnb = self.swap_cellnbs[cellnb][1]
+            else:
+                assert len(mask_cellnbs) == 2
+                cellnb_1, cellnb_2 = self.swap_cellnbs[cellnb]
+
+                if cellnb_1 in self.prev_gt and cellnb_1 in self.prev_gt:
+
+                    y_1,x_1 = np.where(self.prev_gt == cellnb_1)
+                    y_2,x_2 = np.where(self.prev_gt == cellnb_2)
+
+                    y_1_prev,x_1_prev = int(np.mean(y_1)), int(np.mean(x_1))
+                    y_2_prev,x_2_prev = int(np.mean(y_2)), int(np.mean(x_2))
+
+                    y_1,x_1 = np.where(mask_label == mask_cellnbs[0])
+                    y_2,x_2 = np.where(mask_label == mask_cellnbs[1])
+
+                    y_1_cur,x_1_cur = int(np.mean(y_1)), int(np.mean(x_1))
+                    y_2_cur,x_2_cur = int(np.mean(y_2)), int(np.mean(x_2))
+
+                    dist_1_1_2_2 = np.power(y_1_prev - y_1_cur,2) + np.power(x_1_prev - x_1_cur,2) + np.power(y_2_prev - y_2_cur,2) + np.power(x_2_prev - x_2_cur,2) 
+                    dist_1_2_1_2 = np.power(y_1_prev - y_2_cur,2) + np.power(x_1_prev - x_2_cur,2) + np.power(y_2_prev - y_1_cur,2) + np.power(x_2_prev - x_1_cur,2) 
+                    
+                    if dist_1_1_2_2 < dist_1_2_1_2:
+                        cellnb_1, cellnb_2 = cellnb_2, cellnb_1
+
+                    self.crop_track_file[cellnb_1-1,2] = self.framenb 
+                    self.crop_track_file[cellnb_2-1,2] = self.framenb
+
+                    gt[mask_label == mask_cellnbs[0]] = cellnb_1
+                    gt[mask_label == mask_cellnbs[1]] = cellnb_2
+
+                    return None
+
+                else:
+                    adfasd= 0
+        else:
+            new_cellnb = self.swap_cellnbs[cellnb]
+
+        return new_cellnb
+
+    def read_gt(self,fp,counter=None):
 
         nb = re.findall('\d+',fp.stem)[-1]
+        framenb = int(nb)
+        self.framenb = framenb
         pad = len(nb)
-        data_set_nb = fp.parts[-2]
-        gt_fp = fp.parents[1] / (data_set_nb + '_GT') / 'TRA' / (f'man_track{int(nb):0{pad}}{fp.suffix}')
+        dataset_nb = fp.parts[-2]
+        gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{int(nb):0{pad}}{fp.suffix}')
 
         # Read inputs and outputs
-        # gt = tifffile.imread(gt_fp).astype(np.uint16)
         gt = cv2.imread(str(gt_fp),cv2.IMREAD_UNCHANGED).astype(np.uint16)
+
+        skip = []
 
         # Crop or resize inputs and outputs to target_size
         if self.crop:
-            prev_gt = prev_gt[self.y[0]:self.y[1],self.x[0]:self.x[1]]
-            cur_gt = cur_gt[self.y[0]:self.y[1],self.x[0]:self.x[1]]
+            gt = gt[self.y[0]:self.y[1],self.x[0]:self.x[1]]
 
-            if prev_gt.shape[0] < self.target_size[0]:
-                prev_gt = np.pad(prev_gt,((0,self.target_size[0] - prev_gt.shape[0]),(0,0)))
-                cur_gt = np.pad(cur_gt,((0,self.target_size[0] - cur_gt.shape[0]),(0,0)))
+            if gt.shape[0] < self.target_size[0]:
+                gt = np.pad(gt,((0,self.target_size[0] - gt.shape[0]),(0,0)))
 
-            if cur_gt.shape[1] < self.target_size[1]:
-                prev_gt = np.pad(prev_gt,((0,0),(0,self.target_size[1] - prev_gt.shape[1])))
-                cur_gt = np.pad(cur_gt,((0,0),(0,self.target_size[1] - cur_gt.shape[1])))
-        else:      
-            
+            if gt.shape[1] < self.target_size[1]:
+                gt = np.pad(gt,((0,0),(0,self.target_size[1] - gt.shape[1])))
+
+            cellnbs = np.unique(gt)
+            cellnbs = cellnbs[cellnbs != 0]
+
+            self.max_num_of_cells = max(self.max_num_of_cells,len(cellnbs))
+
+            for cellnb in cellnbs:
+
+                if cellnb in skip:
+                    continue
+
+                if cellnb in self.swap_cellnbs.keys():
+
+                    new_cellnb = self.get_swapped_cellnb(gt,cellnb)
+
+                    while new_cellnb in self.swap_cellnbs:
+                        new_cellnb = self.get_swapped_cellnb(gt,new_cellnb)
+
+                    if new_cellnb is None:
+                        continue
+
+                    gt[gt == cellnb] = new_cellnb
+                    old_cellnb = cellnb
+                    cellnb = new_cellnb
+                else:
+                    old_cellnb = cellnb
+
+                mask = ((gt == cellnb)*255).astype(np.uint8)
+
+                mask_label = label(mask)
+                mask_cellnbs = np.unique(mask_label)
+                mask_cellnbs = mask_cellnbs[mask_cellnbs!=0]
+
+                for mask_cellnb in mask_cellnbs:
+
+                    mask_sc = ((mask_label == mask_cellnb)*255).astype(np.uint8)
+                    contours, _ = cv2.findContours(mask_sc, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    if sum([contour.size >= 6 for contour in contours]) == 0 or (mask_sc > 127).sum() < self.min_area:
+                        gt[mask_sc.astype(bool)] = 0
+                        mask_label[mask_sc.astype(bool)] = 0
+
+                mask_cellnbs = np.unique(mask_label)
+                mask_cellnbs = mask_cellnbs[mask_cellnbs != 0]
+
+                if len(mask_cellnbs) == 1:
+                    if cellnb in self.crop_track_file[:,0]:
+                        if self.crop_track_file[cellnb-1,2] == framenb - 1: 
+                            self.crop_track_file[cellnb-1,2] = framenb
+                        else:
+                            new_cellnb = self.crop_track_file.shape[0]+1
+                            self.crop_track_file = np.concatenate((self.crop_track_file,np.array([[new_cellnb,framenb,framenb,0]])),axis=0)
+                            gt[mask_label == mask_cellnbs[0]] = new_cellnb
+                            assert cellnb not in self.swap_cellnbs
+                            self.swap_cellnbs[cellnb] = new_cellnb
+                    else:
+                        
+                        if counter > 0 and self.track_file[old_cellnb-1,-1] != 0 and self.track_file[self.track_file[old_cellnb-1,-1]-1,2] == framenb-1:
+                            mother_cellnb = self.track_file[cellnb-1,-1]
+                            other_cellnb = self.track_file[(self.track_file[:,-1] == mother_cellnb) * (self.track_file[:,0] != cellnb),0][0]
+
+                            if other_cellnb in gt and (gt == other_cellnb).sum() > self.min_area:
+                                if mother_cellnb in self.swap_cellnbs:
+                                    if isinstance(self.swap_cellnbs[mother_cellnb],list):
+                                        cellnb_1, cellnb_2 = self.swap_cellnbs[mother_cellnb]
+                                        y_1,x_1 = np.where(self.prev_gt == cellnb_1)
+                                        y_2,x_2 = np.where(self.prev_gt == cellnb_2)
+
+                                        y_1_prev,x_1_prev = int(np.mean(y_1)), int(np.mean(x_1))
+                                        y_2_prev,x_2_prev = int(np.mean(y_2)), int(np.mean(x_2))
+
+                                        y_1,x_1 = np.where(gt == cellnb)
+                                        y_2,x_2 = np.where(gt == other_cellnb)
+
+                                        y_1_cur,x_1_cur = int(np.mean(y_1)), int(np.mean(x_1))
+                                        y_2_cur,x_2_cur = int(np.mean(y_2)), int(np.mean(x_2))
+
+                                        dist_1_1_2_2 = np.power(y_1_prev - y_1_cur,2) + np.power(x_1_prev - x_1_cur,2) + np.power(y_2_prev - y_2_cur,2) + np.power(x_2_prev - x_2_cur,2) 
+                                        dist_1_2_1_2 = np.power(y_1_prev - y_2_cur,2) + np.power(x_1_prev - x_2_cur,2) + np.power(y_2_prev - y_1_cur,2) + np.power(x_2_prev - x_1_cur,2) 
+                                        
+                                        if dist_1_1_2_2 < dist_1_2_1_2:
+                                            cellnb_1, cellnb_2 = cellnb_2, cellnb_1
+
+                                        self.crop_track_file[cellnb_1-1,2] = framenb 
+                                        self.crop_track_file[other_cellnb-1,2] = framenb
+
+                                        del self.swap_cellnbs[mother_cellnb]
+                                        self.swap_cellnbs[cellnb] = cellnb_1
+                                        self.swap_cellnbs[other_cellnb] = cellnb_2
+
+                                        gt[gt == cellnb] = cellnb_1
+                                        gt[gt == other_cellnb] = cellnb_2
+
+                                    else:
+                                        new_mother_cellnb = self.swap_cellnbs[mother_cellnb]
+
+                                        if self.crop_track_file[new_mother_cellnb-1,2] != framenb-1:
+                                            new_mother_cellnb = 0
+
+                                        self.crop_track_file[cellnb-1] = np.array([cellnb,framenb,framenb,new_mother_cellnb])
+                                        self.crop_track_file[other_cellnb-1] = np.array([other_cellnb,framenb,framenb,new_mother_cellnb])
+
+
+                                elif self.crop_track_file[mother_cellnb-1,2] == framenb-1:
+                                    assert self.crop_track_file[mother_cellnb-1,2] == framenb-1
+
+                                    self.crop_track_file[cellnb-1] = np.array([cellnb,framenb,framenb,mother_cellnb])
+                                    self.crop_track_file[other_cellnb-1] = np.array([other_cellnb,framenb,framenb,mother_cellnb])
+
+                                else:
+                                    self.crop_track_file[cellnb-1] = np.array([cellnb,framenb,framenb,0])
+                                    self.crop_track_file[other_cellnb-1] = np.array([other_cellnb,framenb,framenb,0])                                    
+
+                                skip.append(other_cellnb)
+
+                            else:
+                                if self.crop_track_file[mother_cellnb-1,2] != framenb-1:
+                                    self.crop_track_file[cellnb-1] = np.array([cellnb,framenb,framenb,0])
+                                else:
+                                    self.crop_track_file[mother_cellnb-1,2] = framenb
+                                    assert cellnb not in self.swap_cellnbs
+                                    self.swap_cellnbs[cellnb] = mother_cellnb
+                                    gt[gt == cellnb] = mother_cellnb
+                        else:
+                            self.crop_track_file[cellnb-1] = np.array([cellnb,framenb,framenb,0])
+
+
+                elif len(mask_cellnbs) > 1:
+                    if len(mask_cellnbs) > 2:
+                        mask_areas = np.array([(mask_label == mask_cellnb).sum() for mask_cellnb in mask_cellnbs])
+                        keep_masks = []
+                        for mask_area in mask_areas:
+                            keep_masks.append((mask_area > mask_areas[mask_areas != mask_area]).sum() > len(mask_cellnbs)-3)
+
+                        mask_cellnbs = mask_cellnbs[keep_masks]
+                        for mask_cellnb in mask_cellnbs:
+                            if (mask_label == mask_cellnb).sum() < self.min_area:
+                                mask_cellnbs = mask_cellnbs[mask_cellnbs != mask_cellnb] 
+
+                    if self.crop_track_file[cellnb-1,2] == framenb-1 and self.crop_track_file[old_cellnb-1,2] == framenb-1: # cell was in previous frame
+                        mother_cellnb = cellnb
+                    else:
+                        mother_cellnb = 0
+                    cellnb_1 = self.crop_track_file.shape[0]+1
+                    cellnb_2 = self.crop_track_file.shape[0]+2
+                    self.crop_track_file = np.concatenate((self.crop_track_file,np.array([[cellnb_1,framenb,framenb,mother_cellnb]])),axis=0)
+                    self.crop_track_file = np.concatenate((self.crop_track_file,np.array([[cellnb_2,framenb,framenb,mother_cellnb]])),axis=0)
+                    gt[mask_label == mask_cellnbs[0]] = cellnb_1
+                    gt[mask_label == mask_cellnbs[1]] = cellnb_2
+
+                    assert cellnb not in self.swap_cellnbs
+                    self.swap_cellnbs[cellnb] = [cellnb_1,cellnb_2]
+
+
+                else:
+                    pass
+
+
+                # if len(mask_cellnbs) != 1:
+                #     if self.temp_track_file[cellnb-1,1] == framenb and self.temp_track_file[cellnb-1,-1] != 0:
+                #         mother_cellnb = self.temp_track_file[cellnb-1,-1]
+                #         other_cellnb = self.temp_track_file[(self.temp_track_file[:,-1] == mother_cellnb) * (self.temp_track_file[:,0] != cellnb),0][0]
+
+                #         if other_cellnb in gt or (other_cellnb in self.swap_cellnbs.keys() and self.swap_cellnbs[other_cellnb] in gt):
+                #             self.temp_track_file[mother_cellnb-1,2] = self.temp_track_file[other_cellnb-1,2]
+                #             self.temp_track_file[self.temp_track_file[:,-1] == other_cellnb,-1] = mother_cellnb 
+
+                #         self.temp_track_file[other_cellnb-1] = -1                      
+                #         self.removed_cellnbs.append(other_cellnb)
+
+                #         self.temp_track_file[cellnb-1] = -1
+                #         self.removed_cellnbs.append(cellnb)
+
+                #     elif self.temp_track_file[cellnb-1,2] > framenb and self.temp_track_file[cellnb-1,1] == framenb:
+                #         self.temp_track_file[cellnb-1,1] = framenb + 1
+
+                #     elif self.temp_track_file[cellnb-1,1] < framenb:
+                #         last_framenb = self.temp_track_file[cellnb-1,2]
+                #         self.temp_track_file[cellnb-1,2] = framenb 
+
+                #         new_row = np.array([[self.temp_track_file.shape[0],framenb + 1, last_framenb,0]])
+                #         self.temp_track_file = np.concatenate((self.temp_track_file,new_row),axis=0)
+                #         self.swap_cellnbs[cellnb] = self.temp_track_file[-1,0]
+
+                #     else:
+                #         self.temp_track_file[cellnb-1] = -1
+                #         self.removed_cellnbs.append(cellnb)
+
+
+        elif self.resize:      
             gt_resized = np.zeros((self.target_size),dtype=np.uint16)
             cellnbs = np.unique(gt)
             cellnbs = cellnbs[cellnbs != 0]
@@ -185,18 +459,95 @@ class reader():
 
                 contours, _ = cv2.findContours(mask_cellnb_resized, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
                 
-                if (mask_cellnb_resized > 127).sum() > self.min_area and sum([contour.size >= 6 for contour in contours]) > 0:
+                if (sum([contour.size >= 6 for contour in contours]) > 0 and (mask_cellnb_resized > 127).sum() >= self.min_area):
                     gt_resized[mask_cellnb_resized > 127] = cellnb
                 else:
-                    raise NotImplementedError
+                    if not self.remove_min:
+                        gt_resized[mask_cellnb_resized > 127] = cellnb
 
                     #TODO need to remove cell from man_track.txt if it's too small in terms of area or contour.size
 
             gt = gt_resized
 
-        return gt
+        else:
+            cellnbs = np.unique(gt)
+            cellnbs = cellnbs[cellnbs != 0]
+            for cellnb in cellnbs:
+                mask_cellnb = ((gt == cellnb)*255).astype(np.uint8)
 
-def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
+                contours, _ = cv2.findContours(mask_cellnb, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if sum([contour.size >= 6 for contour in contours]) == 0 or (mask_cellnb > 127).sum() < self.min_area:
+                    gt[mask_cellnb.astype(bool)] = 0
+
+        self.prev_gt = gt
+
+        return gt
+    
+
+    def clean_track_file(self,savepath,dataset_name,fps,CTC_coco_folder,f,ctc_counter,ann_length,annotations):
+        if 0 in self.crop_track_file[:,0]:
+
+            removed_ind = np.where(self.crop_track_file[:,0] == 0)[0]
+
+            og_num = self.crop_track_file[self.crop_track_file[:,0] != 0,0]
+
+            for ind in removed_ind:
+
+                if (self.crop_track_file[ind:,0] < 1).all():
+                    continue
+
+                next_cellnb = self.crop_track_file[ind:,0][self.crop_track_file[ind:,0] > 0].min()
+                self.crop_track_file[ind:,0] -= 1
+                self.crop_track_file[self.crop_track_file[:,-1] >= next_cellnb,-1] -= 1
+                self.crop_track_file[self.crop_track_file < 0] = 0
+
+            self.crop_track_file = np.delete(self.crop_track_file,removed_ind,axis=0)
+
+            annotation_copy = annotations[ann_length:].copy()
+            cellnbs = self.crop_track_file[:,0]
+
+            for a,ann in enumerate(annotation_copy):
+                if isinstance(ann['track_id'],np.uint16) and ann['track_id'] in og_num:
+                    annotations[ann_length+a]['track_id'] = cellnbs[og_num == ann['track_id']][0]
+
+            for counter,fp in enumerate(fps):
+
+                framenb = int(re.findall('\d+',fp.name)[-1])
+
+                gt_fp = savepath / 'gt' / f'CTC_{dataset_name}_split_{f:02d}_frame_{framenb:03d}.tif'#_{counter:03d}.tif'
+                # gt_fp = savepath / 'gt' / f'{dataset_name}_{f}_{counter:03d}_{fp.name}'
+                TRA_fp = savepath.parent / CTC_coco_folder / f'{ctc_counter:03d}_GT' / 'TRA' / fp.name
+                SEG_fp = savepath.parent / CTC_coco_folder / f'{ctc_counter:03d}_GT' / 'SEG' / fp.name
+
+                assert TRA_fp.exists() and SEG_fp.exists() and gt_fp.exists()
+
+                outputs = cv2.imread(str(gt_fp), cv2.IMREAD_ANYDEPTH)
+                cellnbs = np.unique(outputs)
+                cellnbs = cellnbs[cellnbs != 0]
+
+                for cellnb in cellnbs:
+                    outputs[outputs == cellnb] = self.crop_track_file[og_num == cellnb,0]
+
+                cv2.imwrite(str(gt_fp),outputs)
+                cv2.imwrite(str(TRA_fp),outputs)
+                cv2.imwrite(str(SEG_fp),outputs)
+
+        assert self.crop_track_file.shape[0] == self.crop_track_file[-1,0]
+
+        mother_ids = np.unique(self.crop_track_file[:,-1])
+        mother_ids = mother_ids[mother_ids != 0]
+
+        for mother_id in mother_ids:
+            assert (self.crop_track_file[:,-1] == mother_id).sum() == 2
+            assert self.crop_track_file[mother_id-1,2] == self.crop_track_file[self.crop_track_file[:,-1] == mother_id,1][0] -1
+            assert self.crop_track_file[mother_id-1,2] == self.crop_track_file[self.crop_track_file[:,-1] == mother_id,1][0] -1
+
+        assert (self.crop_track_file[:,2] >= self.crop_track_file[:,1]).all()
+
+        return annotations
+
+def create_anno(mask,cellnb,image_id,annotation_id,dataset_name,ctc_counter=None):
    
     mask_sc = mask == cellnb 
 
@@ -205,7 +556,11 @@ def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
 
     if len(mask_sc_ids) > 0:
 
-        mask_sc = mask_sc_label == mask_sc_ids[0]
+        mask_sc_area = [(mask_sc_label==mask_sc_id).sum() for mask_sc_id in mask_sc_ids]
+        mask_sc_ind = np.argmax(np.array(mask_sc_area))
+        mask_sc_id = mask_sc_ids[mask_sc_ind]
+
+        mask_sc = mask_sc_label == mask_sc_id
 
         area = float((mask_sc > 0.0).sum())
         seg = polygonFromMask(mask_sc)
@@ -222,7 +577,7 @@ def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
     else: #empty frame
         area = 0
         seg = []
-        bbox = (0,0,0,0)
+        bbox = []
         empty = True
 
         assert cellnb == -1
@@ -234,11 +589,16 @@ def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
         'segmentation': seg,
         'area': area,
         'category_id': 1,
-        'track_id': cellnb,
+        'track_id': cellnb if cellnb > 0 else [],
         'dataset_name': dataset_name,
         'ignore': 0,
         'iscrowd': 0,
         'empty': empty,
     }
 
+    if ctc_counter:
+        annotation['ctc_counter'] = ctc_counter
+
     return annotation
+
+

@@ -3,19 +3,25 @@ from pathlib import Path
 import json
 import numpy as np                                 
 from tqdm import tqdm
-import re 
 import utils_coco as utils
+import re
 
-mothermachine = True
+dataset = 'moma' # ['moma',''2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
 
-if mothermachine:
+if dataset == 'moma':
     min_area = 30
-    dataset = 'moma'
     target_size = (256,32)
-else:
+elif dataset == '2D':
     min_area = 10
-    dataset = '2D'
     target_size = (256,256)
+elif dataset == 'DIC-C2DH-HeLa':
+    min_area = 30
+    target_size = (512,512)
+elif dataset == 'Fluo-N2DH-SIM+':
+    min_area = 30
+    target_size = (512,512)
+else:
+    raise NotImplementedError
 
 licenses = [{'id': 1,'name': 'MIT license', 'url':'add later'}]
 categories = [{'id': 1, 'name': 'cell'}]
@@ -31,10 +37,23 @@ datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data') / dataset
 folders = ['train','val']
 utils.create_folders(datapath,folders)
 
-img_reader = utils.reader(mothermachine=mothermachine, target_size=target_size, min_area=min_area)
+img_reader = utils.reader(dataset=dataset, target_size=target_size, min_area=min_area)
 
-ctc_folders = [x for x in (datapath / 'CTC').iterdir() if x.is_dir() and 'GT' not in str(x)]
-train_sets, val_sets = utils.train_val_split(ctc_folders,split=0.8)
+ctc_folders = sorted([x for x in (datapath / 'CTC').iterdir() if x.is_dir() and re.findall('\d\d$',x.name)])
+
+ctc_id_dict = {}
+count = 0
+for ctc_folder in ctc_folders:
+    img_paths = sorted(ctc_folder.iterdir())
+    for img_path in img_paths:
+        ctc_id_dict[ctc_folder.stem + '_' + img_path.stem] = count
+        count += 1
+
+if dataset in ['moma','2D']:
+    train_sets, val_sets = utils.train_val_split(ctc_folders,split=0.8)
+else:
+    train_sets = ctc_folders[:2]
+    val_sets = ctc_folders[2:]
 
 for folder,dataset_paths in zip(folders,[train_sets,val_sets]):
     
@@ -43,10 +62,12 @@ for folder,dataset_paths in zip(folders,[train_sets,val_sets]):
     annotation_id = 0
     annotations = []
 
-    if mothermachine:
+    if dataset != '2D':
         shifts = [0]
     else:
-        shifts = [0,50,100]
+        rand_num = np.random.randint(3)
+        shifts = [0,50,100][rand_num:rand_num+1]
+        shifts = [0]
 
     for dataset_path in dataset_paths:
 
@@ -73,31 +94,31 @@ for folder,dataset_paths in zip(folders,[train_sets,val_sets]):
                     num_shifts = [[-shift,-shift],[shift,shift],[-shift,shift],[shift,-shift],[-shift,0],[0,-shift],[shift,0],[0,shift]]
 
                 for shift_frame in num_shifts:
-                    if not mothermachine:
-                        prev_inputs = cv2.imread(str(datapath / 'raw_data' / 'inputs' / fn),cv2.IMREAD_ANYDEPTH)
-                        img_reader.get_slices((prev_inputs > 0) * 1, shift_frame)
-
+                    if img_reader.crop:
+                        # prev_inputs = cv2.imread(str(datapath / 'raw_data' / 'inputs' / fn),cv2.IMREAD_ANYDEPTH)
+                        final_outputs = cv2.imread(str(fp.parents[1] / (fp.parent.name + '_GT') / 'TRA' / ('man_track' + fps[-1].stem[-3:] + fp.suffix)),cv2.IMREAD_ANYDEPTH)
+                        img_reader.get_slices((final_outputs > 0) * 1, shift_frame)
+                    
                     img = img_reader.read_image(fp)
-                    gt = img_reader.read_gt(fp,counter,track_file)
+                    gt = img_reader.read_gt(fp)
 
                     cellnbs = np.unique(gt)
                     cellnbs = cellnbs[cellnbs != 0]
 
-                    if len(cellnbs) > 0:
-                        for cellnb in cellnbs:
+                    framenb = int(re.findall('\d+',fp.name)[-1])
+                    man_track = track_file[(track_file[:,1] <= framenb) * (track_file[:,2] >= framenb)]
+
+                    np.array_equal(sorted(cellnbs),man_track[:,0])
+                
+                    if len(cellnbs) == 0:
+                        cellnbs = [-1]
+
+                    for cellnb in cellnbs:
                             annotation = utils.create_anno(gt,cellnb,image_id,annotation_id,dataset_name)
                             annotations.append(annotation)
                             annotation_id += 1 
-                    else:
-                        annotation = utils.create_anno(gt,-1,image_id,annotation_id,dataset_name)
-                        annotations.append(annotation)
-                        annotation_id += 1 
 
-
-                    if not mothermachine:
-                        fn = Path(fn).stem + f'_shift_{shift:03d}_{shift_frame[0]}_{shift_frame[1]}' + Path(fn).suffix
-                    else:
-                        fn = dataset_name +'_' + fn
+                    fn = dataset_name +'_' + fn
 
                     image = {
                         'license': 1,
@@ -105,6 +126,8 @@ for folder,dataset_paths in zip(folders,[train_sets,val_sets]):
                         'height': img.shape[0],
                         'width': img.shape[1],
                         'id': image_id,
+                        # 'ctc_id': ctc_id_dict[Path(fn).stem],
+                        'ctc_id': fp.parent.name,
                         'frame_id': 0,
                         'seq_length': 1,
                         }    

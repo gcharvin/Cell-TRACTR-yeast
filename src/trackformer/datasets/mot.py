@@ -3,15 +3,11 @@
 MOT dataset with tracking training augmentations.
 """
 import bisect
-import copy
 import csv
-from email.mime import image
 import os
 import random
 from pathlib import Path
 import re
-import math
-import cv2 
 import numpy as np
 import torch
 
@@ -24,6 +20,16 @@ class MOT(CocoDetection):
         super(MOT, self).__init__(*args, **kwargs)
 
         self._prev_frame_range = prev_frame_range
+
+        self.man_tracks = {}
+
+        self.load_all_txt_files = False
+
+        if self.load_all_txt_files:
+            man_track_paths = (self.root.parents[1] / 'man_track').glob('*.txt')
+            for man_track_path in man_track_paths:
+                man_track = np.loadtxt(man_track_path,dtype=np.int16)
+                self.man_tracks[man_track_path.stem] = man_track
 
     @property
     def sequences(self):
@@ -49,43 +55,92 @@ class MOT(CocoDetection):
             'torch': torch.random.get_rng_state()}
 
         fn = self.coco.imgs[idx]['file_name']
-        # idx = idx if re.findall('\D+',fn)[-1] == '_cur.png' else idx + 1
+        dataset_nb = re.findall('\d+',fn)[:-1]
 
-        img, target = self._getitem_from_id(idx, random_state=random_state)
-        target['image'] = img
-        target['image_id'] = torch.tensor(idx)
-        # target['fn'] = fn
+        if idx < 2:
+            idx = 2
+
+        prev_prev_fn = self.coco.imgs[idx-2]['file_name']
+        prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[:-1]
         
-        # if self._prev_frame:
-        #     prev_img, prev_target = self._getitem_from_id(idx-1, random_state=random_state)
+        while prev_prev_dataset_nb != dataset_nb:
+            idx += 1
+            prev_prev_fn = self.coco.imgs[idx-2]['file_name']
+            prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[:-1]
+            
+        if idx == len(self.coco.imgs) -1:
+            idx -= 1
 
-        #     prev_target['filenb'] = torch.tensor(idx-1)
-        #     prev_target['image'] = prev_img
+        fut_fn = self.coco.imgs[idx+1]['file_name']
+        fut_dataset_nb = re.findall('\d+',fut_fn)[:-1]
 
-        #     framenb = list(map(int,re.findall('\d+',fn)))[-1]
-        #     prev_target['framenb'] = torch.tensor(framenb)
+        if fut_dataset_nb != dataset_nb:
+            idx -= 1
 
-        #     target[f'prev_image'] = prev_img
-        #     target[f'prev_target'] = prev_target
+        fn = self.coco.imgs[idx]['file_name']
+        framenb = int(re.findall('\d+',fn)[-1])
+
+        if self.load_all_txt_files:
+            man_track = self.man_tracks[dataset_nb].copy()
+        else:
+            if len(dataset_nb) > 1:
+                man_track = np.loadtxt(self.root.parents[1] / 'man_track' / (f'{dataset_nb[0]}_{dataset_nb[1]}.txt'),dtype=np.int16)
+                if man_track.ndim == 1:
+                    man_track = man_track[None]
+            else:
+                man_track = np.loadtxt(self.root.parents[1] / 'man_track' / (dataset_nb[0] + '.txt'),dtype=np.int16)
+
+        # We remove cells that disappear and reappear
+        divisions = np.unique(man_track[:,-1])
+        divisions = divisions[divisions != 0]
+        for div in divisions:
+            if (man_track[:,-1] == div).sum() == 1:
+                man_track[man_track[:,-1] == div,-1] = 0
+
+        target = {'man_track': torch.from_numpy(man_track).long()}
+
+        if len(dataset_nb) > 1:
+            target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
+            target['split_nb'] = torch.tensor(int(dataset_nb[1]))
+        else:
+            target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
+
+        img, cur_target = self._getitem_from_id(idx, framenb, random_state=random_state)
+        target['cur_image'] = img
+        target['cur_target'] = cur_target
+        
+        prev_img, prev_target = self._getitem_from_id(idx-1, framenb-1, random_state=random_state)
+        target['prev_image'] = prev_img
+        target['prev_target'] = prev_target
     
+        prev_prev_img, prev_prev_target = self._getitem_from_id(idx-2, framenb-2, random_state=random_state)
+        target['prev_prev_image'] = prev_prev_img
+        target['prev_prev_target'] = prev_prev_target
 
-        #     if self._prev_prev_frame:
-        #         framenb = list(map(int,re.findall('\d+',fn)))[-1]
-        #         pad = re.findall('\d+',fn)[-1].count('0') + int(math.log10(framenb))+1
-        #         fn = fn.replace(re.findall('\d+',fn)[-1],f'{framenb-1:0{str(pad)}d}')
+        fut_img, fut_target = self._getitem_from_id(idx+1, framenb+1, random_state=random_state)
+        target['fut_image'] = fut_img
+        target['fut_target'] = fut_target
+        
+        # print(prev_prev_target['dataset_nb'],prev_target['dataset_nb'],cur_target['dataset_nb'],fut_target['dataset_nb'])
 
-        #         if os.path.exists(self.img_folder / fn):
-        #             prev_prev_img , prev_prev_target = self._getitem_from_id(idx-3, random_state=random_state)
-        #             target[f'prev_prev_image'] = prev_prev_img
-        #             target[f'prev_prev_target'] = prev_prev_target
+        # if int(prev_prev_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     pass
+        # elif int(prev_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     pass
+        # elif int(cur_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     pass
+        # elif int(fut_target['dataset_nb']) != int(dataset_nb[0]): 
+        #     asdf = 0
 
-        #             prev_cur_img , prev_cur_target = self._getitem_from_id(idx-2, random_state)
-
-        #             prev_cur_target['filenb'] = torch.tensor(idx-2)
-        #             prev_cur_target['framenb'] = torch.tensor(framenb)
-
-        #             # target[f'prev_cur_image'] = prev_cur_img
-        #             target[f'prev_cur_target'] = prev_cur_target
+        target['target_og'] = {'man_track': torch.from_numpy(man_track)}
+            
+        for target_name in ['prev_prev_target','prev_target','cur_target','fut_target']:
+            target['target_og'][target_name] = {}
+            target['target_og'][target_name]['boxes'] = target[target_name]['boxes'].clone()
+            target['target_og'][target_name]['track_ids'] = target[target_name]['track_ids'].clone()
+            
+            if 'masks' in target[target_name]:
+                target['target_og'][target_name]['masks'] = target[target_name]['masks'].clone()
 
         return img, target
 
@@ -143,33 +198,23 @@ class WeightedConcatDataset(torch.utils.data.ConcatDataset):
 
 def build_cells(image_set,args):
 
-    root = Path(args.output_dir.parents[1] / 'data' / args.dataset)
+    root = Path(args.data_dir) / args.dataset
 
     assert root.exists()
 
-    split = image_set
-
     transforms, norm_transforms = make_coco_transforms_cells(image_set)
 
-    if args.evaluate_dataset_with_no_data_aug:
+    if args.no_data_aug:
         transforms = None
 
-    datasets = []
-    img_folders = ['prev_prev_img', 'prev_cur_img', 'prev_img', 'cur_img', 'fut_prev_img', 'fut_img']
-    json_files = ['prev_prev', 'prev_cur', 'prev', 'cur', 'fut_prev', 'fut']
-
-    for img_folder,json_file in zip(img_folders,json_files):
-         datasets.append(MOT
-                (
-                root / split / img_folder,
-                root / 'annotations'/ split / (json_file+'.json'),
-                transforms,
-                norm_transforms,
-                return_masks=args.masks,
-                overflow_boxes=args.overflow_boxes,
-                remove_no_obj_imgs=False,
-                )
-            )
+    dataset = MOT(
+        root / image_set / 'img',
+        root / 'annotations'/ image_set / ('anno.json'),
+        transforms,
+        norm_transforms,
+        return_masks=args.masks,
+        overflow_boxes=args.overflow_boxes,
+        remove_no_obj_imgs=False,
+        )  
     
-    
-    return datasets
+    return dataset

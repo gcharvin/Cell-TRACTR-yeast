@@ -5,12 +5,13 @@ import random
 import time
 from argparse import Namespace
 from pathlib import Path
-
+import pathlib
 import numpy as np
 import sacred
 import torch
 import yaml
-
+import itertools
+import re
 from torch.utils.data import DataLoader, DistributedSampler
 
 import trackformer.util.misc as utils
@@ -19,57 +20,74 @@ from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
 from trackformer.datasets import build_dataset
 
-moma = True
 
-if moma:
-    yaml_file = ''
-else:
-    yaml_file = '_2D'
+dataset_name = 'moma' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
+modelname = '230831_moma_no__flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers'
+modelpath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname
 
-ex = sacred.Experiment('train')
-# ex.add_config('../cfgs/train.yaml')
-ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train' + yaml_file + '.yaml')
-ex.add_named_config('deformable', '/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_deformable.yaml')
+ex = sacred.Experiment('pipeline')
+ex.add_config(modelpath.as_posix() + '/config.yaml')
+# ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset_name + '.yaml')
 
 def train(args: Namespace) -> None:
 
-    modelname = '230203_prev_prev_track_final_two_stage_dn_enc_dn_track_dab_mask'
-    
-    args.dn_track = False
-    args.dn_object = False
-    args.group_object = False
-    args.dn_enc = False
-    args.output_dir = Path(args.output_dir) / modelname
+    args.eval_ctc = True
+    args.flex_div = True
+    # args.use_img_for_mask = False
+    # args.CoMOT_loss_ce = True
+
+    # args.target_size = tuple(args.target_size)
+    dn_track = True
+    dn_object = True
+    dn_enc = False
+    args.enc_FN = 0
+
+    if not dn_track or args.eval_ctc:
+        args.dn_track = False
+    if not dn_object or args.eval_ctc:
+        args.dn_object = False
+    if not dn_enc or args.eval_ctc:
+        args.dn_enc = False
+
+    args.output_dir = Path(args.output_dir)
     print(args.output_dir)
-    args.save_model_interval = False
-    args.eval_only = True
     args.resume = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname / 'checkpoint.pth'
-    args.moma = moma 
 
     track = True
-    display_masks = False
+    display_masks = True
 
-    args.eval_ctc = False
+    
+    args.no_data_aug = True
+    display_worst = True
+    args.use_prev_prev_frame = False
+    args.hooks = False
+    args.avg_attn_weight_maps = True
 
-    display_worst = False
-    args.use_prev_prev_frame = True
-
-    run_movie = True
+    run_movie = False
     use_NMS = True
 
-    if moma:
-        if args.eval_ctc:
-            datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/moma/test/ctc_data')
-            args.output_dir = args.output_dir / 'test'
-            args.output_dir.mkdir(exist_ok=True)
-            track = True
-            run_movie = True
-            display_worst = False
+    # args.init_boxes_from_masks = True
+
+    datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data') / dataset_name / 'test' / 'CTC'
+    # datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data' + f'/{dataset_name}' + '/CTC_coco/')
+
+    if args.eval_ctc:
+        if '2D' in dataset_name:
+            args.output_dir = args.output_dir
         else:
-            datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/data/moma/test/raw_data/img')
-            fps = sorted(list((datapath).glob('*.png')))
-    else:
-        raise NotImplementedError
+            args.output_dir = args.output_dir / 'test' / 'CTC'
+        args.output_dir.parent.mkdir(exist_ok=True)
+        args.output_dir.mkdir(exist_ok=True)
+        track = True
+        display_masks = True
+        run_movie = True
+        display_worst = False
+        display_all_aux_outputs = True
+
+    if dataset_name == '2D':
+        display_all_aux_outputs = False
+
+
     
     args.batch_size = 1
 
@@ -87,14 +105,6 @@ def train(args: Namespace) -> None:
     if not args.deformable:
         assert args.num_feature_levels == 1
         
-    output_dir = Path(args.output_dir)
-    if args.output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        yaml.dump(
-            vars(args),
-            open(output_dir / 'config.yaml', 'w'), allow_unicode=True)
-
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -129,8 +139,7 @@ def train(args: Namespace) -> None:
 
     model_state_dict = model_without_ddp.state_dict()
     checkpoint_state_dict = checkpoint['model']
-    checkpoint_state_dict = {
-        k.replace('detr.', ''): v for k, v in checkpoint['model'].items()}
+    checkpoint_state_dict = {k.replace('detr.', ''): v for k, v in checkpoint['model'].items()}
 
     for k, v in checkpoint_state_dict.items():
         if k not in model_state_dict:
@@ -191,60 +200,77 @@ def train(args: Namespace) -> None:
     model_without_ddp.load_state_dict(resume_state_dict)
 
     if run_movie:
+        start_time = time.time()
         model.evaluate_dataset_with_no_data_aug = False
-        if args.eval_ctc:
-            folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if 'GT' not in folderpath.name]
-            for folderpath in folderpaths:
+        folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if re.findall('\d\d$',folderpath.name)]
+        if args.eval_ctc or '2D' in args.dataase_name:
+
+            if '2D' in dataset_name:
+                (args.output_dir / 'pred').mkdir(exist_ok=True)
+
+            for f,folderpath in enumerate(folderpaths):
+
                 fps = sorted(list(folderpath.glob("*.tif")))
 
-                output_dir = args.output_dir / folderpath.name
-                output_dir.mkdir(exist_ok=True)
-                
-                Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
+                if '2D' in dataset_name:
+
+                    if f == len(folderpaths)-1:
+                        continue
+
+                    fut_fps = sorted(list(folderpaths[f+1].glob("*.tif")))
+
+                    if f < len(folderpaths) and int(re.findall('\d+',fut_fps[-1].name)[-1]) > int(re.findall('\d+',fps[-1].name)[-1]):
+                        continue
+                    
+                    output_dir_fol = args.output_dir / 'pred' / folderpath.name
+
+                else:
+                    output_dir_fol = args.output_dir / folderpath.name
+
+                output_dir_fol.mkdir(exist_ok=True)
+
+                Pipeline = pipeline(model, fps, device, output_dir_fol, args, track, use_NMS=use_NMS, display_masks=display_masks,display_all_aux_outputs=display_all_aux_outputs)
                 Pipeline.forward()
 
         else:
-            
-            Pipeline = pipeline(model, fps, device, output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
+            fps = [sorted(list(folderpath.iterdir())) for folderpath in folderpaths]
+
+            Pipeline = pipeline(model, fps, device, args.output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
             Pipeline.forward()
+
+        print(round((start_time - time.time())/60,2))
     
     if display_worst:
 
-        model.evaluate_dataset_with_no_data_aug = True
-        args.evaluate_dataset_with_no_data_aug = False
+        model.eval_prev_prev_frame = args.use_prev_prev_frame
+        model.no_data_aug = args.no_data_aug
+        
+        dataset_train = build_dataset(split='train', args=args)
+        dataset_val = build_dataset(split='val', args=args)
 
-        datasets_train = build_dataset(split='train', args=args)
-        datasets_val = build_dataset(split='val', args=args)
+        if args.distributed:
+            sampler_train = DistributedSampler(dataset_train, shuffle=False)
+            sampler_val = DistributedSampler(dataset_val, shuffle=False)
+        else:
+            sampler_train = torch.utils.data.SequentialSampler(dataset_train)
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-        data_loaders_train = []
-        data_loaders_val = []
+        data_loader_train = DataLoader(
+            dataset_train,
+            batch_size = 1,
+            sampler=sampler_train,
+            collate_fn=utils.collate_fn,
+            num_workers=args.num_workers)
+            
+        data_loader_val = DataLoader(
+            dataset_val, 
+            batch_size = 1,
+            sampler=sampler_val,
+            drop_last=False,
+            collate_fn=utils.collate_fn,
+            num_workers=args.num_workers)
 
-        for dataset_train, dataset_val in zip(datasets_train,datasets_val):
-            if args.distributed:
-                sampler_train = DistributedSampler(dataset_train, shuffle=False)
-                sampler_val = DistributedSampler(dataset_val, shuffle=False)
-            else:
-                sampler_train = torch.utils.data.SequentialSampler(dataset_train)
-                sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-            data_loader_train = DataLoader(
-                dataset_train,
-                batch_size = 1,
-                sampler=sampler_train,
-                collate_fn=utils.collate_fn,
-                num_workers=args.num_workers)
-            data_loader_val = DataLoader(
-                dataset_val, 
-                batch_size = 1,
-                sampler=sampler_val,
-                drop_last=False,
-                collate_fn=utils.collate_fn,
-                num_workers=args.num_workers)
-
-            data_loaders_train.append(data_loader_train)
-            data_loaders_val.append(data_loader_val)
-
-        print_worst(model,criterion,data_loaders_train,data_loaders_val,device,args,track)
+        print_worst(model,criterion,data_loader_train,data_loader_val,device,args,track)
 
 
 

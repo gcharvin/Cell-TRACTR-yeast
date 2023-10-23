@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast
 import torch.nn.functional as F
 
 from ..util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
-from ..util.misc import point_sample
+from ..util.misc import point_sample, threshold_indices
 
 
 class HungarianMatcher(nn.Module):
@@ -46,7 +46,7 @@ class HungarianMatcher(nn.Module):
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
     @torch.no_grad()
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, output_target):
         """ Performs the matching
 
         Params:
@@ -71,14 +71,17 @@ class HungarianMatcher(nn.Module):
         """
         batch_size, num_queries = outputs["pred_logits"].shape[:2]
 
+        if sum([target[output_target]['empty'] for target in targets]) == batch_size:
+            return [(torch.tensor([]).long(),torch.tensor([]).long()) for _ in range(batch_size)], targets
+
         # We flatten to compute the cost matrices in a batch
         #
         # [batch_size * num_queries, num_classes]
         if self.focal_loss:
             out_prob = outputs["pred_logits"]
 
-            if 'track_query_match_ids' in targets[0]:
-                num_tqs = targets[0]['track_queries_mask'].sum()
+            if 'track_query_match_ids' in targets[0][output_target]:
+                num_tqs = targets[0][output_target]['track_queries_mask'].sum()
                 div_out_prob = torch.stack((outputs['pred_logits'][:,:num_tqs,1],outputs['pred_logits'][:,:num_tqs,0]),axis=-1)
                 out_prob = torch.cat((out_prob,div_out_prob),axis=1)
             else:
@@ -93,15 +96,15 @@ class HungarianMatcher(nn.Module):
         out_bbox = outputs["pred_boxes"]
         assert torch.sum(torch.isnan(out_bbox)) == 0, 'Nan in boxes before duplication'
 
-        if 'track_query_match_ids' in targets[0]:
+        if 'track_query_match_ids' in targets[0][output_target]:
             div_out_bbox = torch.cat((outputs['pred_boxes'][:,:num_tqs,4:],outputs['pred_boxes'][:,:num_tqs,:4]),axis=-1)
             out_bbox = torch.cat((out_bbox,div_out_bbox),axis=1)
         
         out_bbox = out_bbox.flatten(0,1)
 
         # Also concat the target labels and boxes
-        tgt_ids = torch.cat([v["labels"] for v in targets])
-        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        tgt_ids = torch.cat([target[output_target]["labels"] for target in targets if not target[output_target]['empty']])
+        tgt_bbox = torch.cat([target[output_target]["boxes"] for target in targets if not target[output_target]['empty']])
 
         keep = tgt_ids[:,1] == 0
 
@@ -146,12 +149,12 @@ class HungarianMatcher(nn.Module):
 
             out_mask = outputs["pred_masks"]
 
-            if 'track_query_match_ids' in targets[0]:
+            if 'track_query_match_ids' in targets[0][output_target]:
                 out_div_mask = torch.cat((outputs["pred_masks"][:,:num_tqs,1:],outputs["pred_masks"][:,:num_tqs,:1]),axis=2)
                 out_mask = torch.cat((out_mask,out_div_mask),axis=1)
 
             out_mask = out_mask.flatten(0,1)  
-            tgt_mask = torch.cat([target["masks"] for target in targets]).to(out_mask)
+            tgt_mask = torch.cat([target[output_target]["masks"] for target in targets if not target[output_target]['empty']]).to(out_mask)
             
             out_mask = F.interpolate(out_mask, size=tgt_mask.shape[-2:], mode="bilinear", align_corners=False)
 
@@ -186,33 +189,31 @@ class HungarianMatcher(nn.Module):
                 cost_dice[:,keep] += batch_dice_loss_jit(out_mask[:,1], tgt_mask[:,1])[:,keep]
 
             cost_matrix += self.cost_mask * cost_mask + self.cost_dice * cost_dice
-
         
         # Final cost matrix
-
         cost_matrix = cost_matrix.view(batch_size, num_queries+num_tqs, -1).cpu()
 
-        sizes = [len(v["boxes"]) for v in targets]
+        sizes = [len(target[output_target]["boxes"]) - target[output_target]['empty'].int() for target in targets]
 
         for i, target in enumerate(targets):
-            if 'track_query_match_ids' not in target:
+            if 'track_query_match_ids' not in target[output_target]:
                 cost_matrix[i,cost_matrix.shape[1]:] = np.inf
                 continue
 
             prop_i = 0
             for j in range(num_queries):
                 # if target['track_queries_fal_pos_mask'][j] or target['track_queries_placeholder_mask'][j]:
-                if target['track_queries_fal_pos_mask'][j]:
+                if target[output_target]['track_queries_fal_pos_mask'][j]:
                     # false positive and palceholder track queries should not
                     # be matched to any target
                     cost_matrix[i, j] = np.inf
                     cost_matrix[i, j + num_queries] = np.inf
-                elif target['track_queries_mask'][j]:
-                    track_query_id = target['track_query_match_ids'][prop_i]
+                elif target[output_target]['track_queries_mask'][j]:
+                    track_query_id = target[output_target]['track_query_match_ids'][prop_i]
                     prop_i += 1
 
                     # If the cell tracks to a cell division, we use first prediction and flipped prediction
-                    if target['labels'][track_query_id,1] == 0: 
+                    if target[output_target]['labels'][track_query_id,1] == 0: 
                         save_1 = torch.clone(cost_matrix[i,j,track_query_id + sum(sizes[:i])])
                         save_2 = torch.clone(cost_matrix[i,j + num_queries,track_query_id + sum(sizes[:i])])
 
@@ -229,15 +230,19 @@ class HungarianMatcher(nn.Module):
                         cost_matrix[i, j] = np.inf
                         cost_matrix[i, j + num_queries] = np.inf
                         cost_matrix[i, j, track_query_id + sum(sizes[:i])] = -1
-                # # New objects cannot predict cell divisions so we ignore the flipped predictions here
-                # else:
-                #     cost_matrix[i,j + cost_matrix.shape[1] // 2] = np.inf
 
-        indices = [linear_sum_assignment(c[i])
-                   for i, c in enumerate(cost_matrix.split(sizes, -1))]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(cost_matrix.split(sizes, -1))]
 
-        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-                for i, j in indices]
+        indices, targets = threshold_indices(indices,targets,output_target,max_ind=num_queries)
+
+        ind = []
+        for(i,j),target in zip(indices,targets):
+            if target[output_target]['empty']:
+                ind.append((torch.tensor([]).long(),torch.tensor([]).long()))
+            else:
+                ind.append((torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)))
+
+        return ind, targets
 
 
 def build_matcher(args):
