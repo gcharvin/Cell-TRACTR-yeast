@@ -116,10 +116,9 @@ class reader():
         self.swap_cellnbs = {}
         self.max_cellnb = self.track_file[-1,0]
 
-    def get_slices(self,seg,shift):
+    def get_slices(self,seg):
     
         y,x = np.where(seg)
-        y,x = int(np.mean(y)) + shift[0] , int(np.mean(x)) + shift[1]
 
         if y < 0:
             y = 0
@@ -417,38 +416,6 @@ class reader():
                 else:
                     pass
 
-
-                # if len(mask_cellnbs) != 1:
-                #     if self.temp_track_file[cellnb-1,1] == framenb and self.temp_track_file[cellnb-1,-1] != 0:
-                #         mother_cellnb = self.temp_track_file[cellnb-1,-1]
-                #         other_cellnb = self.temp_track_file[(self.temp_track_file[:,-1] == mother_cellnb) * (self.temp_track_file[:,0] != cellnb),0][0]
-
-                #         if other_cellnb in gt or (other_cellnb in self.swap_cellnbs.keys() and self.swap_cellnbs[other_cellnb] in gt):
-                #             self.temp_track_file[mother_cellnb-1,2] = self.temp_track_file[other_cellnb-1,2]
-                #             self.temp_track_file[self.temp_track_file[:,-1] == other_cellnb,-1] = mother_cellnb 
-
-                #         self.temp_track_file[other_cellnb-1] = -1                      
-                #         self.removed_cellnbs.append(other_cellnb)
-
-                #         self.temp_track_file[cellnb-1] = -1
-                #         self.removed_cellnbs.append(cellnb)
-
-                #     elif self.temp_track_file[cellnb-1,2] > framenb and self.temp_track_file[cellnb-1,1] == framenb:
-                #         self.temp_track_file[cellnb-1,1] = framenb + 1
-
-                #     elif self.temp_track_file[cellnb-1,1] < framenb:
-                #         last_framenb = self.temp_track_file[cellnb-1,2]
-                #         self.temp_track_file[cellnb-1,2] = framenb 
-
-                #         new_row = np.array([[self.temp_track_file.shape[0],framenb + 1, last_framenb,0]])
-                #         self.temp_track_file = np.concatenate((self.temp_track_file,new_row),axis=0)
-                #         self.swap_cellnbs[cellnb] = self.temp_track_file[-1,0]
-
-                #     else:
-                #         self.temp_track_file[cellnb-1] = -1
-                #         self.removed_cellnbs.append(cellnb)
-
-
         elif self.resize:      
             gt_resized = np.zeros((self.target_size),dtype=np.uint16)
             cellnbs = np.unique(gt)
@@ -547,7 +514,7 @@ class reader():
 
         return annotations
 
-def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
+def create_anno(mask,cellnb,image_id,annotation_id,dataset_name,ctc_counter=None):
    
     mask_sc = mask == cellnb 
 
@@ -574,17 +541,11 @@ def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
         bbox = (X,Y,width,height)
         empty = False
 
-        if X == 0 or Y == 0 or (X + width) == mask_sc.shape[1]-1 or (Y + height) == mask_sc.shape[0]-1:
-            edge=True
-        else:
-            edge=False
-
     else: #empty frame
         area = 0
         seg = []
         bbox = []
         empty = True
-        edge = None
 
         assert cellnb == -1
 
@@ -600,8 +561,10 @@ def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
         'ignore': 0,
         'iscrowd': 0,
         'empty': empty,
-        'edge': edge,
     }
+
+    if ctc_counter:
+        annotation['ctc_counter'] = ctc_counter
 
     return annotation
 

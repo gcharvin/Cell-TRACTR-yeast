@@ -62,7 +62,8 @@ def build_model(args):
         'num_queries': args.num_queries,
         'num_epochs': args.epochs,
         'dn_track_group': args.dn_track_group,
-        'tgt_noise': args.tgt_noise}
+        'tgt_noise': args.tgt_noise,
+        'return_intermediate_masks': args.return_intermediate_masks}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,

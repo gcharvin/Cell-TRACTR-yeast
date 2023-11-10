@@ -7,7 +7,7 @@ import pickle
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/embedtrack/results/test')
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/delta/results/test')
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/230831_moma_no__flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers/test')
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/231024_moma_flex_div_track_dab_mask_4_enc_4_dec_layers/test')
 ctc_path = datapath / 'CTC'
 hota_path = datapath / 'HOTA' / datapath.parts[5]
 gt_path = Path('/projectnb/dunlop/ooconnor/object_detection/data/moma/test/CTC')
@@ -323,10 +323,12 @@ for dataset_path in dataset_paths:
 
                 dataset_error = dataset_errors[error]
 
-                if 'FP' or 'Pr' in error:
+                if 'FP' in error or 'Ass' in error:
                     color = (255,0,0)
-                else:
+                elif 'FN' in error or 'Re' in error:
                     color = (0,255,0)
+                else:
+                    color = (0,0,0)
 
                 if 'Ass' in error:
 
@@ -399,13 +401,31 @@ for dataset_path in dataset_paths:
 
                     for framenb in range(len(dataset_error)):
 
-                        if len(dataset_error[framenb][alpha]) > 0:
+                        if error == 'Edges_GT_ID':
+                            
+                            if len(dataset_error[framenb]) > 0:
+
+                                for cellnb in dataset_error[framenb]:
+                                    instance = cv2.imread(str(gt_path / (dataset_id + '_GT') / 'TRA' / f'man_track{framenb:03d}.tif'),cv2.IMREAD_ANYDEPTH)
+
+                                    mask = instance == cellnb
+                                    mask_color = np.zeros((mask.shape + (3,)))
+                                    mask_color[mask] = color
+
+                                    movie_hota_Div_FN[framenb][mask] = movie_hota_Div_FN[framenb][mask] * transparency + mask_color[mask] * (1-transparency) 
+                                    movie_hota_Det_FN[framenb][mask] = movie_hota_Det_FN[framenb][mask] * transparency + mask_color[mask] * (1-transparency) 
+                                    movie_hota_Div_FP[framenb][mask] = movie_hota_Div_FP[framenb][mask] * transparency + mask_color[mask] * (1-transparency) 
+                                    movie_hota_Det_FP[framenb][mask] = movie_hota_Det_FP[framenb][mask] * transparency + mask_color[mask] * (1-transparency) 
+                                    movie_hota_Ass_Pr[framenb][mask] = movie_hota_Ass_Pr[framenb][mask] * transparency + mask_color[mask] * (1-transparency) 
+                                    movie_hota_Ass_Re[framenb][mask] = movie_hota_Ass_Re[framenb][mask] * transparency + mask_color[mask] * (1-transparency) 
+                        
+                        elif len(dataset_error[framenb][alpha]) > 0:
 
                             cellnbs = np.array(dataset_error[framenb][alpha])
 
                             for cellnb in cellnbs:
 
-                                if 'FN' in error:
+                                if 'FN' in error or 'Edge' in error:
                                     instance = cv2.imread(str(gt_path / (dataset_id + '_GT') / 'TRA' / f'man_track{framenb:03d}.tif'),cv2.IMREAD_ANYDEPTH)
                                     assert cellnb in instance
 

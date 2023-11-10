@@ -14,6 +14,7 @@ lr_drop: 40
 epoch_to_start_using_flexible_divisions: 5
 use_prev_prev_frame: true
 target_size: (256,256)
+flex_div: false
 # gradient clipping max norm
 clip_max_norm: 0.1
 # Deformable DETR
@@ -90,9 +91,9 @@ multi_frame_attention_separate_encoder: false
 merge_frame_features: false
 overflow_boxes: true
 # Segmentation
-masks: true
+masks: false
 mask_dim: 288
-enc_masks: true
+enc_masks: false
 # Matcher
 # Class coefficient in the matching cost
 set_cost_class: 4.0
@@ -114,7 +115,7 @@ init_boxes_from_masks: false
 decoder_use_mask_as_ref: false
 iterative_masks: false
 mult_enc_loss: false
-return_intermediate_masks: true
+return_intermediate_masks: false
 group_object_coef: 1.0
 dn_object_coef: 1.0
 dn_track_coef: 1.0

@@ -55,6 +55,9 @@ def train_one_epoch(model: torch.nn.Module,
     model.train()
     criterion.train()
 
+    # model.eval()
+    # criterion.eval()
+
     track_thresh = 0.1
 
     ids = np.random.randint(0,len(data_loader),args.num_plots)
@@ -65,12 +68,17 @@ def train_one_epoch(model: torch.nn.Module,
     for i, (samples, targets) in enumerate(data_loader):
 
         track = torch.rand(1).item() > track_thresh
+
+        # if track:
+        #     print(i)    
+
+        # print(f"{i}; track:{track}; {[target['cur_target']['image_id'] for target in targets]}")
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
 
-        outputs, targets, _, _, _, prev_outputs = model(samples,targets,track,epoch=epoch)
+        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,track,epoch=epoch)
 
-        del _
+        # del _
 
         if prev_outputs is not None:
             for key in prev_outputs.keys():
@@ -105,9 +113,12 @@ def train_one_epoch(model: torch.nn.Module,
                 assert (loss_dict_key + '_' + training_method) in weight_dict.keys()
                 loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
 
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys())
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if 'mask' not in k)
         
         loss_dict['loss'] = losses
+
+        # torch.set_printoptions(precision=32)
+        # print(losses)
 
         if not math.isfinite(losses.item()):
             print(f"Loss is {losses.item()}, stopping training")
@@ -270,16 +281,33 @@ class pipeline():
         self.write_video = True
         self.track = track
 
-        np.random.seed(24)
+        np.random.seed(1)
 
         if self.track:
-            self.colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)]) # Assume max 1000 cells in one chamber
-            self.colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
+            # self.colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)]) # Assume max 1000 cells in one chamber
+            # self.colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
+            # self.colors = np.array([[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.],[127.5,0.,0.],  
+            #                         [127.5,127.5,0.],[0.,127.5,0.],[0.,0.,127.5],[0.,127.5,127.5],[127.5,0.,127.5],[127.5,0.,0.],  
+            #                         [255.,127.5,0.],[0.,127.5,255.],[0.,255.,127.5],
+            #                         [255.,255.,127.5],[255.,127.5,255.],[127.5,255.,255.],
+            #                         [255.,127.5,127.5],[127.5,127.5,255.],[127.5,255.,127.5],
+            #                         [255.,255.,255.],[127.5,127.5,127.5]
+            #                         ])
+            pass
+            # self.all_colors = np.concatenate(([[255.,0.,0.]],np.concatenate(([self.colors for _ in range(100)]),axis=0)),axis=0)
         else:
             self.colors = np.array([tuple((np.zeros(3))) for _ in range(10000)])
             
         self.all_colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)])
         self.all_colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
+        self.all_colors = np.concatenate((
+                                          self.all_colors,
+                                          np.array([[127.5,127.5,0.],[0.,127.5,0.],[0.,0.,127.5],[0.,127.5,127.5],[127.5,0.,0.],[255.,127.5,255.],
+                                         [255.,127.5,0.],[127.5,255.,127.5],
+                                         [255.,255.,127.5],[127.5,127.5,255.],[50.,200,200],
+                                         [255.,127.5,127.5],[75,75,150.],[127.5,255.,255.],
+                                         [255.,255.,255.],[127.5,127.5,127.5]
+                                         ])))
 
         if args.two_stage:
             # if not args.eval_ctc:
@@ -501,8 +529,9 @@ class pipeline():
 
                 if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
                     dec_attn_outputs = []
-                    hooks = [self.model.decoder.layers[0].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)),
-                        self.model.decoder.layers[-1].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output))]
+                    # hooks = [self.model.decoder.layers[0].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)),
+                    #     self.model.decoder.layers[-1].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output))]
+                    hooks = [self.model.decoder.layers[layer_index].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)) for layer_index in range(len(self.model.decoder.layers))]
 
 
                 img = cv2.imread(str(fp),cv2.IMREAD_ANYDEPTH)
@@ -633,9 +662,9 @@ class pipeline():
                     assert boxes.shape[0] == len(self.cells)
 
                 if self.track:
-                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[self.cells-1],self.div_track,self.new_cells)
+                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.all_colors[self.cells-1],self.div_track,self.new_cells)
                 else:
-                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.colors[:len(self.cells)],self.div_track,None)
+                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.all_colors[:len(self.cells)],self.div_track,None)
 
                 color_frame = cv2.putText(
                     color_frame,
@@ -653,31 +682,46 @@ class pipeline():
                     for hook in hooks:
                         hook.remove()
 
-                    scale = 10
+                    scale = 1
 
-                    for dec_attn_output,layer in zip(dec_attn_outputs,['first','last']):
+                    for layer_index, dec_attn_output in enumerate(dec_attn_outputs):
                         dec_attn_weight_maps = dec_attn_output[1].cpu().numpy() # [output, attention_map]
+                        num_cols, num_rows = dec_attn_weight_maps.shape[-2:]
+                        num_heads = 1 if dec_attn_weight_maps.ndim == 3 else dec_attn_weight_maps.shape[1]
                         dec_attn_weight_maps = np.repeat(dec_attn_weight_maps[...,None],3,axis=-1)
                         for dec_attn_weight_map in dec_attn_weight_maps: # per batch
-                            dec_attn_weight_map_color = np.zeros((dec_attn_weight_map.shape[0]+1,dec_attn_weight_map.shape[1]+1,3))
-                            dec_attn_weight_map_color[-dec_attn_weight_map.shape[0]:,-dec_attn_weight_map.shape[1]:] = dec_attn_weight_map
-                            dec_attn_weight_map_color = ((dec_attn_weight_map_color / np.max(dec_attn_weight_map_color)) * 255).astype(np.uint8)
+                            for h in range(num_heads):
+                                if num_heads > 1:
+                                    dec_attn_weight_map_h = dec_attn_weight_map[h]
+                                else:
+                                    h = 'averaged'
+                                    dec_attn_weight_map_h = dec_attn_weight_map
+                                dec_attn_weight_map_color = np.zeros((num_cols+1,num_rows+1,3))
+                                dec_attn_weight_map_color[-num_cols:,-num_rows:] = dec_attn_weight_map_h
+                                # dec_attn_weight_map_color = ((dec_attn_weight_map_color / np.max(dec_attn_weight_map_color)) * 255).astype(np.uint8)
+                                dec_attn_weight_map_color = (dec_attn_weight_map_color * 255).astype(np.uint8)
 
-                            for tidx in range(len(keep) - self.num_queries):
-                                dec_attn_weight_map_color[tidx+1,0] = self.all_colors[prevcells[tidx]-1]
-                                dec_attn_weight_map_color[0,tidx+1] = self.all_colors[prevcells[tidx]-1]                                
+                                for tidx in range(len(keep) - self.num_queries):
+                                    dec_attn_weight_map_color[tidx+1,0] = self.all_colors[prevcells[tidx]-1]
+                                    dec_attn_weight_map_color[0,tidx+1] = self.all_colors[prevcells[tidx]-1]                                
 
-                            dec_attn_weight_map_color_resize = cv2.resize(dec_attn_weight_map_color,(dec_attn_weight_map.shape[1]*scale,dec_attn_weight_map.shape[0]*scale),interpolation=cv2.INTER_NEAREST)
-                            cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_weight_map_{fp.stem}_{layer}_layer.png')),dec_attn_weight_map_color_resize)
+                                # color Track queries only
+                                if False:
+                                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_weight_map_{fp.stem}_layer_{layer_index}_head_{h}.png')),dec_attn_weight_map_color_resize)
 
-                            for q in range(len(keep) - self.num_queries,len(keep)):
-                                dec_attn_weight_map_color[q+1,0] = self.all_colors[-q]
-                                dec_attn_weight_map_color[0,q+1] = self.all_colors[-q]
+                                for q in range(len(keep) - self.num_queries,len(keep)):
+                                    dec_attn_weight_map_color[q+1,0] = self.all_colors[-q]
+                                    dec_attn_weight_map_color[0,q+1] = self.all_colors[-q]
+                                
+                                cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_map_{fp.stem}_layer_{layer_index}_head_{h}.png')),dec_attn_weight_map_color)
 
-                            
-                            dec_attn_weight_map_color_resize = cv2.resize(dec_attn_weight_map_color,(dec_attn_weight_map.shape[1]*scale,dec_attn_weight_map.shape[0]*scale),interpolation=cv2.INTER_NEAREST)
-                            cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_weight_map_{fp.stem}_oq_color_{layer}_layer.png')),dec_attn_weight_map_color_resize)
+                            if num_heads > 1:
+                                dec_attn_weight_map_avg = (dec_attn_weight_map.mean(0) * 255).astype(np.uint8)
 
+                                dec_attn_weight_map_avg_color = dec_attn_weight_map_color
+                                dec_attn_weight_map_avg_color[-num_cols:,-num_rows:] = dec_attn_weight_map_avg
+
+                                cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_map_{fp.stem}_layer_{layer_index}_head_averaged.png')),dec_attn_weight_map_avg_color)
 
                 if self.eval_ctc:
 
@@ -711,7 +755,7 @@ class pipeline():
                           
                                 if track_ind in self.div_indices:          
                                     keep_div[track_ind] = False
-                                    self.div_indicies = self.div_indices[self.div_indices != track_ind]
+                                    self.div_indices = self.div_indices[self.div_indices != track_ind]
 
                                     other_div_cell = self.cells[(self.div_track == track_ind) * (keep_cells)]
 
@@ -886,6 +930,10 @@ class pipeline():
 
                     references = outputs['references'].detach()
 
+                    if references.shape[-1] == 2:
+                        assert self.args.use_dab == False
+                        references = torch.cat((references, torch.zeros(references.shape[:-1] + (6,),device=references.device)),axis=-1)
+
                     aux_outputs = outputs['aux_outputs'] # output from the intermedaite layers of decoder
                     aux_outputs = [{'pred_boxes':references[0]}] + aux_outputs # add the initial anchors / reference points
                     aux_outputs.append({'pred_boxes':outputs['pred_boxes'].detach(),'pred_masks':outputs['pred_masks'].detach(),'pred_logits':outputs['pred_logits'].detach()}) # add the last layer of the decoder which is the final prediction
@@ -894,10 +942,13 @@ class pipeline():
 
                     cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells.astype(np.int64)) if c not in self.cells]) if prevcells is not None else None
 
+                    enc_oqs_indices = torch.where(outputs['enc_outputs']['pred_logits'][0,:,0].sigmoid() > 0.5)[0] + (len(keep) - self.num_queries)
+
                     if self.track:
                         previmg_copy = previmg.copy()
                         img_box = img.copy()
                         img_mask = img.copy()
+                        img_enc_oqs = img.copy()
                     for a,aux_output in enumerate(aux_outputs):
                         all_boxes = aux_output['pred_boxes'][0].detach()
                         img_copy = img.copy()
@@ -911,42 +962,53 @@ class pipeline():
                         
                         if a > 0:
                             all_logits = aux_output['pred_logits'][0].detach()
-                            all_masks = aux_output['pred_masks'][0].detach()
-                            object_boxes = all_boxes[-self.num_queries:,:4]
-                            object_masks = all_masks[-self.num_queries:,0]
-                            object_logits = all_logits[-self.num_queries:,0]
 
+                            object_boxes = all_boxes[-self.num_queries:,:4]
+                            object_logits = all_logits[-self.num_queries:,0]
                             object_indices = torch.where(object_logits > 0.5)[0]
                             pred_object_boxes = object_boxes[object_indices]
-                            pred_object_masks = object_masks[object_indices]
+                            
+                            pred_enc_oqs_boxes = all_boxes[enc_oqs_indices]
+
+                            if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
+                                all_masks = aux_output['pred_masks'][0].detach()
+                                object_masks = all_masks[-self.num_queries:,0]
+                                pred_object_masks = object_masks[object_indices]
+                            else:
+                                pred_object_masks = None
 
                             object_indices += (len(keep) - self.num_queries)
 
                             if len(object_indices) > 0:
                                 img_object = utils.plot_tracking_results(img_copy,pred_object_boxes,pred_object_masks,self.all_colors[-object_indices.cpu()],None,None)
                             else:
-                                img_object = img_copy
+                                img_object = utils.plot_tracking_results(img_copy,pred_enc_oqs_boxes,None,self.all_colors[-enc_oqs_indices.cpu()],None,None)
+                                # img_object = img_copy
 
                         if track_indices_tq_only is not None:
                             
                             if a > 0: # initial reference points are all single boxes; this applies to the outputs of decoder
                                 if len(track_indices_tq_only) > 0:
                                     track_boxes = all_boxes[track_indices_tq_only]
-                                    track_masks = all_masks[track_indices_tq_only]
                                     track_logits = all_logits[track_indices_tq_only]
-                                    # unique_divs = np.unique(self.div_track[self.div_track != -1])
+                                    if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
+                                        track_masks = all_masks[track_indices_tq_only]
+
                                     unique_divs = np.unique(div_track[div_track != -1])
                                     for unique_div in unique_divs:
                                         div_ids = (div_track == unique_div).nonzero()[0]
-                                        # div_ids = (self.div_track == unique_div).nonzero()[0]
                                         track_boxes[div_ids[1],:4] = track_boxes[div_ids[0],4:]
-                                        track_masks[div_ids[1],:1] = track_masks[div_ids[0],1:]
                                         track_logits[div_ids[1],:1] = track_logits[div_ids[0],1:]
+                                        if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
+                                            track_masks[div_ids[1],:1] = track_masks[div_ids[0],1:]
 
                                     track_boxes = track_boxes[:,:4]
-                                    track_masks = track_masks[:,0]
                                     track_logits = track_logits[:,0]
-                                    # div_track = self.div_track
+
+                                    if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
+                                        track_masks = track_masks[:,0]
+                                    else:
+                                        track_masks = None
 
                                     track_box_colors = self.all_colors[self.cells-1]
                                     new_cells = self.new_cells if self.track else None
@@ -955,13 +1017,14 @@ class pipeline():
 
                             elif a == 0:
                                 track_masks = None
-                                # track_boxes = all_boxes[np.unique(track_indices_tq_only[track_indices_tq_only < len(keep) - self.num_queries])]
                                 track_boxes = all_boxes[np.arange(len(keep) - self.num_queries)]
                                 object_boxes = all_boxes[-self.num_queries:]
                                 track_box_colors = self.all_colors[prevcells-1] if prevcells is not None else self.all_colors[self.cells-1]
                                 object_box_colors = np.array([(np.array([0.,0.,0.])) for _ in range(self.num_queries)])
                                 div_track = np.ones((track_boxes.shape[0])) * -1
                                 new_cells = None
+
+                                pred_enc_oqs_boxes = all_boxes[enc_oqs_indices]
 
                                 all_black = object_box_colors.copy()
 
@@ -984,15 +1047,24 @@ class pipeline():
                                 img_object_anchor_boxes_all = utils.plot_tracking_results(img_copy,object_boxes,None,object_box_colors,None,None)
                                 img_object_anchor_boxes_not_track_only = utils.plot_tracking_results(img_copy,object_boxes,None,all_black,None,None)
 
-                                oq_indices = np.array([q for q in range(len(keep)) if q not in track_indices_tq_only])
-                                oq_colors = self.all_colors[-oq_indices]
+                                oq_indices = []
+                                for q in range(len(keep)):
+                                    if q not in track_indices_tq_only:
+                                        if q < (len(keep) - self.num_queries):
+                                            oq_indices.append(q)
+                                        else:
+                                            oq_indices.append(-q)
+                                oq_colors = self.all_colors[oq_indices]
+                                oq_indices = [abs(oq_ind) for oq_ind in oq_indices]
                                 img_object_anchor_boxes_not_track_color_only = utils.plot_tracking_results(img_copy,all_boxes[oq_indices],None,oq_colors,None,None)
+
+                                img_enc_oqs = utils.plot_tracking_results(img_copy,pred_enc_oqs_boxes,None,self.all_colors[-enc_oqs_indices.cpu()],None,None)
 
                                 if not self.track:
                                     img_object_anchor_boxes_track_only = utils.plot_tracking_results(img_copy,object_boxes[-len(track_indices_tq_only):],None,track_box_colors,None,None)
                                     img_object_anchor_boxes = np.concatenate((img_object_anchor_boxes_all,img_object_anchor_boxes_not_track_only,img_object_anchor_boxes_track_only,img_object_anchor_boxes_not_track_color_only),axis=1)
                                 else:
-                                    img_object_anchor_boxes = np.concatenate((img_object_anchor_boxes_all,img_object_anchor_boxes_not_track_only,img_object_anchor_boxes_not_track_color_only),axis=1)
+                                    img_object_anchor_boxes = np.concatenate((img_object_anchor_boxes_all,img_object_anchor_boxes_not_track_only,img_object_anchor_boxes_not_track_color_only,img_enc_oqs),axis=1)
 
                                 if i == 1:
                                     all_prev_logits = prev_outputs['pred_logits'][0].detach().sigmoid()
@@ -1056,13 +1128,11 @@ class pipeline():
                             else: # all cells / track queries stayed in the chamber
                                 boxes = torch.cat((all_boxes[-self.num_queries:,:4],track_boxes))
                                 all_colors = np.concatenate((color_queries,self.all_colors[self.cells-1]),axis=0)
-                                # div_track_all = np.concatenate((np.ones((self.num_queries))*-1,self.div_track))
                                 div_track_all = np.concatenate((np.ones((self.num_queries))*-1,div_track))
 
                                 assert len(div_track_all) == len(boxes)
 
                             new_cell_thickness = np.zeros_like(div_track_all).astype(bool)
-                            # new_cell_thickness[self.num_queries:] = True # set all track queries with a thickened boudning box so it's easier to see
                             if cells_exit_ids is not None and cells_exit_ids.shape[0] > 0:
                                 new_cell_thickness[self.num_queries:-track_boxes.shape[0]] = False
                             img_final_box = utils.plot_tracking_results(img_copy,boxes,None,all_colors,div_track_all,new_cell_thickness)
@@ -1087,12 +1157,33 @@ class pipeline():
 
                         if len(aux_object_ind) > 0:
                             aux_boxes = outputs['aux_outputs'][-2]['pred_boxes'][0,aux_object_ind,:4]
-                            aux_masks = outputs['aux_outputs'][-2]['pred_masks'][0,aux_object_ind,0]
+
+                            if self.args.return_intermediate_masks:
+                                aux_masks = outputs['aux_outputs'][-2]['pred_masks'][0,aux_object_ind,0]
+                            else:
+                                aux_masks = None
 
                             img_CoMOT_color = utils.plot_tracking_results(img_CoMOT_color,aux_boxes,aux_masks,self.all_colors[-aux_object_ind],None,None)
 
-
                         decoder_frame = np.concatenate((decoder_frame,img_CoMOT_color),axis=1)
+
+                    else:
+
+                        if 'enc_outputs' in outputs:
+
+                            img_top_oq_last = img.copy()
+                            img_top_oq_first = img.copy()
+ 
+                            top_oq_ind = np.where(outputs['enc_outputs']['pred_logits'][0,:,0].sigmoid().cpu().numpy() > 0.5)[0] + (len(keep) - self.num_queries)
+
+                            top_oq_boxes_last = outputs['aux_outputs'][-1]['pred_boxes'][0, + top_oq_ind,:4]
+                            top_oq_boxes_first = outputs['aux_outputs'][0]['pred_boxes'][0, + top_oq_ind,:4]
+
+                            img_top_oq_last = utils.plot_tracking_results(img_top_oq_last,top_oq_boxes_last,None,self.all_colors[-len(top_oq_ind):],None,None)
+                            img_top_oq_first = utils.plot_tracking_results(img_top_oq_first,top_oq_boxes_first,None,self.all_colors[-len(top_oq_ind):],None,None)
+
+                            decoder_frame = np.concatenate((decoder_frame,img_top_oq_first,img_top_oq_last),axis=1)
+
 
                     method = 'object_detection' if not self.track else 'track'
                     cv2.imwrite(str(self.output_dir / self.predictions_folder / 'decoder_bbox_outputs' / (f'{method}_decoder_frame_{fp.stem}.png')),decoder_frame)
@@ -1135,7 +1226,6 @@ class pipeline():
             spacer = 1
             scale = self.target_size[0] / self.enc_map[0].shape[0]
             enc_maps = []
-            output_enc_maps = []
             max_value = 0
             for e,enc_map in enumerate(self.enc_map):
 
@@ -1150,7 +1240,6 @@ class pipeline():
             enc_maps = np.concatenate((enc_maps),axis=1)
 
             img_empty = cv2.imread(str(self.output_dir.parents[4] / 'examples' / 'empty_chamber.png'))
-            
 
             enc_maps[enc_maps!=-1] = (enc_maps[enc_maps!=-1] / max_value) * 255
             enc_maps[enc_maps==-1] = 255

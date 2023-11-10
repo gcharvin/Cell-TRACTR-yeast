@@ -31,7 +31,8 @@ class DETRTrackingBase(nn.Module):
                  num_queries = 30,
                  num_epochs = None,
                  dn_track_group = False,
-                 tgt_noise=1e-6):
+                 tgt_noise=1e-6,
+                 return_intermediate_masks=False):
 
         self._matcher = matcher
         self._backprop_prev_frame = backprop_prev_frame
@@ -49,6 +50,7 @@ class DETRTrackingBase(nn.Module):
         self.num_epochs = num_epochs
         self.dn_track_group = dn_track_group
         self.tgt_noise = tgt_noise
+        self.return_intermediate_masks = return_intermediate_masks
 
         self.epoch_to_start_using_flexible_divisions = epoch_to_start_using_flexible_divisions
         self.use_prev_prev_frame = use_prev_prev_frame
@@ -500,7 +502,7 @@ class DETRTrackingBase(nn.Module):
 
             target['cur_target']['num_queries'] = len(track_queries_mask) + self.num_queries
 
-    def forward(self, samples: utils.NestedTensor, targets: list = None, track=False, prev_features=None, prev_out=None, epoch=None, rand_num=None):   
+    def forward(self, samples: utils.NestedTensor, targets: list = None, track=False, prev_features=None, prev_out=None, epoch=None):   
 
         add_object_queries_to_dn_track=False  
         if targets is not None and (not self._tracking or self.no_data_aug):
@@ -662,6 +664,7 @@ class DETRTrackingBase(nn.Module):
 
                     targets = utils.man_track_ids(targets,'prev_target','cur_target')
                     add_object_queries_to_dn_track = torch.rand(1).item() < 0.1
+                    # print(f'add_object_queries_to_dn_track: {add_object_queries_to_dn_track}')
                     self.get_random_mask(targets,prev_indices)
                     self.add_track_queries_to_targets(targets, prev_outputs_without_aux,add_object_queries_to_dn_track=add_object_queries_to_dn_track)
 
@@ -677,6 +680,7 @@ class DETRTrackingBase(nn.Module):
                     target['track'] = False
                     
         dn_enc = self.dn_enc and torch.rand(1).item() < 0.2
+        # print(f'dn_enc: {dn_enc}')
 
         out, targets, features, memory, hs  = super().forward(samples, targets, 'cur_target', prev_features, dn_object=self.dn_object, dn_enc=dn_enc, add_object_queries_to_dn_track=add_object_queries_to_dn_track,track=track)
 
@@ -686,6 +690,6 @@ class DETRTrackingBase(nn.Module):
 
 class DeformableDETRTracking(DETRTrackingBase, DeformableDETR, DeformableTransformer):
     def __init__(self, tracking_kwargs, detr_kwargs, transformer_kwargs):
-        DeformableTransformer.__init__(self, **detr_kwargs)
+        DeformableTransformer.__init__(self, **transformer_kwargs)
         DeformableDETR.__init__(self, **detr_kwargs)
         DETRTrackingBase.__init__(self, **tracking_kwargs)

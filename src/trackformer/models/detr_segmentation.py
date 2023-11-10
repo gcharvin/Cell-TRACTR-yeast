@@ -35,8 +35,8 @@ class DETRSegmBase(nn.Module):
             self.decoder.device = self.device
             self.decoder.iterative_masks = self.iterative_masks
     
-    def forward(self, samples: NestedTensor, targets: list = None, track=False, prev_features=None, epoch=None, rand_num=None):
-        out, targets, features, memory, hs, prev_out = super().forward(samples, targets,  track=track, prev_features=prev_features,epoch=epoch,rand_num=rand_num)
+    def forward(self, samples: NestedTensor, targets: list = None, track=False, prev_features=None, epoch=None):
+        out, targets, features, memory, hs, prev_out = super().forward(samples, targets,  track=track, prev_features=prev_features,epoch=epoch)
 
         if not self.decoder_use_mask_as_ref:
             pred_masks, pred_logits = self.forward_prediction_heads(hs[-1],len(hs)-1)
@@ -53,27 +53,11 @@ class DETRSegmBase(nn.Module):
         return out, targets, features, memory, hs, prev_out
     
 
-
-# # TODO: with meta classes
-# class DETRSegm(DETRSegmBase, DETR):
-#     def __init__(self, mask_kwargs, detr_kwargs):
-#         DETR.__init__(self, **detr_kwargs)
-#         DETRSegmBase.__init__(self, **mask_kwargs)
-
-
 class DeformableDETRSegm(DETRSegmBase, DeformableDETR, DeformableTransformer):
     def __init__(self, mask_kwargs, detr_kwargs, transformer_kwargs):
         DeformableTransformer.__init__(self, **transformer_kwargs)
         DeformableDETR.__init__(self, **detr_kwargs)
         DETRSegmBase.__init__(self, **mask_kwargs)
-
-
-# class DETRSegmTracking(DETRSegmBase, DETRTrackingBase, DETR):
-#     def __init__(self, mask_kwargs, tracking_kwargs, detr_kwargs):
-#         DETR.__init__(self, **detr_kwargs)
-#         DETRTrackingBase.__init__(self, **tracking_kwargs)
-#         DETRSegmBase.__init__(self, **mask_kwargs)
-
 
 class DeformableDETRSegmTracking(DETRSegmBase, DETRTrackingBase, DeformableDETR, DeformableTransformer):
     def __init__(self, mask_kwargs, tracking_kwargs, detr_kwargs, transformer_kwargs):

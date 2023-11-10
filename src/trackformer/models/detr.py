@@ -287,8 +287,10 @@ class SetCriterion(nn.Module):
         src_masks = src_masks[keep_non_empty_chambers]
 
         # upsample predictions to the target size
-        src_masks = interpolate(src_masks, size=target_masks.shape[-2:],
-                                    mode="bilinear", align_corners=False)
+        # src_masks = interpolate(src_masks, size=target_masks.shape[-2:],
+        #                             mode="bilinear", align_corners=False)
+        src_masks = F.interpolate(src_masks, size=target_masks.shape[-2:])
+
 
         division_ind = target_masks[:,1].sum(-1).sum(-1) > 0
 

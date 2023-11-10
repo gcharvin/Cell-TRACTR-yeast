@@ -30,12 +30,12 @@ def crop(image, target, region, overflow_boxes=False):
 
     fields = ["labels", "area", "iscrowd", "ignore", "track_ids"]
 
-    orig_area = target["area"]
+    # orig_area = target["area"]
 
     if "boxes" in target:
         boxes = target["boxes"]
         max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
+        cropped_boxes = boxes -  torch.as_tensor([j, i, j, i])
 
         if overflow_boxes:
             for i, box in enumerate(cropped_boxes):
@@ -71,7 +71,9 @@ def crop(image, target, region, overflow_boxes=False):
         if "boxes" in target:
             cropped_boxes = target['boxes'].reshape(-1, 2, 2)
             keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
-
+            
+            if 'masks' in target:
+                assert (keep == target['masks'].flatten(1).any(1).bool()).all()
             # new area must be at least % of orginal area
             # keep = target["area"] >= orig_area * 0.2
         else:
@@ -202,10 +204,10 @@ class RandomCrop:
         # in hxw
         self.size = size
         self.overflow_boxes = overflow_boxes
+        self.region = None
 
     def __call__(self, img, target):
-        region = T.RandomCrop.get_params(img, self.size)
-        return crop(img, target, region, self.overflow_boxes)
+        return crop(img, target, self.region, self.overflow_boxes)
 
 
 class RandomSizeCrop:

@@ -9,6 +9,7 @@ from datetime import date
 import shutil
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import numpy as np
 import sacred
@@ -21,8 +22,8 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
-dataset = 'moma' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
-# dataset = '2D' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
+# dataset = 'moma' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
+dataset = '2D' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
 
 ex = sacred.Experiment('train')
 ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset + '.yaml')
@@ -32,7 +33,7 @@ def train(args: Namespace) -> None:
     if args.resume:
         args.output_dir = Path(args.resume).parent
     else:
-        args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_{dataset}{"" if args.flex_div else "_no"}_flex_div{"_CoMOT" if args.CoMOT else ""}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc and args.two_stage else ""}{"_dn_track" if args.dn_track else ""}{"_dn_track_group" if args.dn_track_group and args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}{"_intermediate" if args.masks and args.return_intermediate_masks else ""}{"_mask" if args.masks else "_no_mask"}_{args.enc_layers}_enc_{args.dec_layers}_dec_layers')
+        args.output_dir = Path(args.output_dir) / (f'{date.today().strftime("%y%m%d")}_blah_{dataset}{"" if args.flex_div else "_no"}_flex_div{"_CoMOT" if args.CoMOT else ""}{"_object_detection_only" if args.object_detection_only else "_track"}{"_two_stage" if args.two_stage else ""}{"_dn_enc" if args.dn_enc and args.two_stage else ""}{"_dn_track" if args.dn_track else ""}{"_dn_track_group" if args.dn_track_group and args.dn_track else ""}{"_dn_object" if args.dn_object else ""}{"_dab" if args.use_dab else ""}{"_intermediate" if args.masks and args.return_intermediate_masks else ""}{"_mask" if args.masks else "_no_mask"}_{args.enc_layers}_enc_{args.dec_layers}_dec_layers')
         args.output_dir.mkdir(exist_ok=True)
     
     if args.dn_track or args.dn_object:
@@ -107,7 +108,11 @@ def train(args: Namespace) -> None:
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
+    torch.cuda.manual_seed_all(seed)
+    # torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.set_num_threads(1)
 
     model, criterion = build_model(args)
     model.to(device)
@@ -117,6 +122,7 @@ def train(args: Namespace) -> None:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
+        
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('NUM TRAINABLE MODEL PARAMS:', n_parameters)
 
@@ -144,8 +150,7 @@ def train(args: Namespace) -> None:
                        if match_name_keywords(n, ['layers_track_attention']) and p.requires_grad],
             "lr": args.lr_track})
 
-    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                  weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     
     args_drop_num = args.epochs // args.lr_drop
     lr_drop = [args.lr_drop * i for i in range(1,args_drop_num+1)] 
@@ -164,19 +169,26 @@ def train(args: Namespace) -> None:
 
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
-
+    
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        
     data_loader_train = DataLoader(
         dataset_train,
         batch_sampler=batch_sampler_train,
         collate_fn=utils.collate_fn,
-        num_workers=args.num_workers)
+        num_workers=args.num_workers,
+        worker_init_fn=seed_worker)
 
     data_loader_val = DataLoader(
         dataset_val, args.batch_size,
         sampler=sampler_val,
         drop_last=False,
         collate_fn=utils.collate_fn,
-        num_workers=args.num_workers)
+        num_workers=args.num_workers,
+        worker_init_fn=seed_worker)
 
     if args.resume:
         if args.resume.startswith('https'):
@@ -284,6 +296,7 @@ def train(args: Namespace) -> None:
     for epoch in range(args.start_epoch, args.epochs + 1):
         start_epoch = time.time()
         # TRAIN
+        dataset_train.set_epoch(epoch)
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_metrics = train_one_epoch(model, criterion, data_loader_train, optimizer, epoch, args)
@@ -291,6 +304,8 @@ def train(args: Namespace) -> None:
         lr_scheduler.step()
 
         checkpoint_paths = [args.output_dir / 'checkpoint.pth']
+
+        dataset_val.set_epoch(epoch)
 
         val_metrics = evaluate(model, criterion, data_loader_val,args, epoch)
 

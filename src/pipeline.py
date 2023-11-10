@@ -5,12 +5,9 @@ import random
 import time
 from argparse import Namespace
 from pathlib import Path
-import pathlib
 import numpy as np
 import sacred
 import torch
-import yaml
-import itertools
 import re
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -22,7 +19,7 @@ from trackformer.datasets import build_dataset
 
 
 dataset_name = 'moma' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
-modelname = '230831_moma_no__flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers'
+modelname = '231025_moma_flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers'
 modelpath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname
 
 ex = sacred.Experiment('pipeline')
@@ -32,7 +29,7 @@ ex.add_config(modelpath.as_posix() + '/config.yaml')
 def train(args: Namespace) -> None:
 
     args.eval_ctc = True
-    args.flex_div = True
+    args.flex_div = False
     # args.use_img_for_mask = False
     # args.CoMOT_loss_ce = True
 
@@ -55,13 +52,12 @@ def train(args: Namespace) -> None:
 
     track = True
     display_masks = True
-
     
     args.no_data_aug = True
     display_worst = True
     args.use_prev_prev_frame = False
-    args.hooks = False
-    args.avg_attn_weight_maps = True
+    args.hooks = True
+    args.avg_attn_weight_maps = False
 
     run_movie = False
     use_NMS = True
@@ -86,8 +82,6 @@ def train(args: Namespace) -> None:
 
     if dataset_name == '2D':
         display_all_aux_outputs = False
-
-
     
     args.batch_size = 1
 

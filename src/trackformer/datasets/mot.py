@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import numpy as np
 import torch
+import time
 
 from . import transforms as T
 from .coco import CocoDetection, make_coco_transforms_cells
@@ -17,7 +18,7 @@ from .coco import CocoDetection, make_coco_transforms_cells
 class MOT(CocoDetection):
 
     def __init__(self, *args, prev_frame_range=1, **kwargs):
-        super(MOT, self).__init__(*args, **kwargs)
+        super(MOT, self).__init__(*args, **kwargs,)
 
         self._prev_frame_range = prev_frame_range
 
@@ -48,11 +49,32 @@ class MOT(CocoDetection):
     def sample_weight(self, idx):
         return 1.0 / self.seq_length(idx)
 
+    def set_epoch(self, epoch):
+        """Set the current epoch number."""
+        self.current_epoch = epoch
+
+    def set_dataset_type(self,dataset):
+        self.dataset_type = dataset
+
+    def set_target_size(self,target_size):
+        self.target_size = torch.tensor(list(map(int,re.findall('\d+',target_size))))
+        self.RandomCrop = T.RandomCrop(self.target_size)
+
     def __getitem__(self, idx):
-        random.seed(random.randint(0,100))
-        random_state = {
-            'random': random.getstate(),
-            'torch': torch.random.get_rng_state()}
+        # random.seed(random.randint(0,100))
+
+        # curr_random_state = {
+        #     'random': random.getstate(),
+        #     'torch': torch.random.get_rng_state(),
+        #     'numpy': np.random.get_state()}
+
+        # Setting a different seed for each sample
+        # Important to note that data augmentations will get applied randomly to sequential frames
+        # If flipping samples horizontally / vertically are added, will need to make sure randomness is same for all
+        random.seed(idx + self.current_epoch)
+        torch.manual_seed(idx + self.current_epoch)
+        torch.cuda.manual_seed(idx + self.current_epoch)
+        np.random.seed(idx + self.current_epoch)
 
         fn = self.coco.imgs[idx]['file_name']
         dataset_nb = re.findall('\d+',fn)[:-1]
@@ -105,32 +127,27 @@ class MOT(CocoDetection):
         else:
             target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
 
-        img, cur_target = self._getitem_from_id(idx, framenb, random_state=random_state)
+        self.RandomCrop.region = None
+
+        img, cur_target = self._getitem_from_id(idx, framenb)
         target['cur_image'] = img
         target['cur_target'] = cur_target
         
-        prev_img, prev_target = self._getitem_from_id(idx-1, framenb-1, random_state=random_state)
+        prev_img, prev_target = self._getitem_from_id(idx-1, framenb-1)
         target['prev_image'] = prev_img
         target['prev_target'] = prev_target
     
-        prev_prev_img, prev_prev_target = self._getitem_from_id(idx-2, framenb-2, random_state=random_state)
+        prev_prev_img, prev_prev_target = self._getitem_from_id(idx-2, framenb-2)
         target['prev_prev_image'] = prev_prev_img
         target['prev_prev_target'] = prev_prev_target
 
-        fut_img, fut_target = self._getitem_from_id(idx+1, framenb+1, random_state=random_state)
+        fut_img, fut_target = self._getitem_from_id(idx+1, framenb+1)
         target['fut_image'] = fut_img
         target['fut_target'] = fut_target
-        
-        # print(prev_prev_target['dataset_nb'],prev_target['dataset_nb'],cur_target['dataset_nb'],fut_target['dataset_nb'])
 
-        # if int(prev_prev_target['dataset_nb']) != int(dataset_nb[0]): 
-        #     pass
-        # elif int(prev_target['dataset_nb']) != int(dataset_nb[0]): 
-        #     pass
-        # elif int(cur_target['dataset_nb']) != int(dataset_nb[0]): 
-        #     pass
-        # elif int(fut_target['dataset_nb']) != int(dataset_nb[0]): 
-        #     asdf = 0
+        # random.setstate(curr_random_state['random'])
+        # torch.random.set_rng_state(curr_random_state['torch'])
+        # np.random.set_state(curr_random_state['numpy'])
 
         target['target_og'] = {'man_track': torch.from_numpy(man_track)}
             
@@ -216,5 +233,8 @@ def build_cells(image_set,args):
         overflow_boxes=args.overflow_boxes,
         remove_no_obj_imgs=False,
         )  
+    
+    dataset.set_dataset_type(args.dataset)
+    dataset.set_target_size(args.target_size)
     
     return dataset

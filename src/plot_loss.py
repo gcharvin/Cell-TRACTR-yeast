@@ -10,7 +10,7 @@ import re
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results')
 folder = '230809_2D_CoMOT_track_two_stage_dn_track_dn_track_group_dab_intermediate_mask_3_enc_3_dec_layers'
-folder = '230831_moma_no__flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers'
+folder = '231023_moma_flex_div_CoMOT_track_two_stage_dn_track_dab_intermediate_mask_4_enc_4_dec_layers'
 
 with open(datapath / folder / 'metrics_train.pkl', 'rb') as f:
     metrics_train = pickle.load(f)

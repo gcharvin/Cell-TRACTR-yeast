@@ -11,7 +11,7 @@ dataset = 'moma' # ['moma',''2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
 data_format = 'MOTS' # ['MOT','MOTS']
 
 datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data') / dataset / 'test' 
-datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/230831_moma_flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers/test')
+datapath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results/231029_moma_flex_div_track_two_stage_dn_track_dn_track_group_dab_mask_4_enc_4_dec_layers/test')
 # datapath = Path('/projectnb/dunlop/ooconnor/object_detection/embedtrack/results/test')
 # datapath = Path('/projectnb/dunlop/ooconnor/object_detection/delta/results/test')
 

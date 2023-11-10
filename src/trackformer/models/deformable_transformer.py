@@ -190,7 +190,7 @@ class DeformableTransformer(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        for p in self.parameters():
+        for name,p in self.named_parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         for m in self.modules():
@@ -337,9 +337,11 @@ class DeformableTransformer(nn.Module):
         for fidx, fpn in enumerate(fpns):
             
             cur_fpn = self.lateral_layers[fidx](fpn)
-            y = cur_fpn + F.interpolate(memory_list[fidx], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False) # Mask DINO uses just the largest spatial shape output from encoder however we use all encoder outputs
+            # y = cur_fpn + F.interpolate(memory_list[fidx], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False) # Mask DINO uses just the largest spatial shape output from encoder however we use all encoder outputs
+            y = cur_fpn + F.interpolate(memory_list[fidx], size=cur_fpn.shape[-2:]) # Mask DINO uses just the largest spatial shape output from encoder however we use all encoder outputs
             y = self.output_layers[fidx](y)
-            mask_features.append(F.interpolate(y, size=mask_size, mode="bilinear", align_corners=False))
+            # mask_features.append(F.interpolate(y, size=mask_size, mode="bilinear", align_corners=False))
+            mask_features.append(F.interpolate(y, size=mask_size))
 
         if self.use_img_for_mask:
             mask_features.append(images_enc)
@@ -471,7 +473,6 @@ class DeformableTransformer(nn.Module):
                         assert num_enc_boxes == tgt_enc.shape[1]
                         assert tgt_enc.shape[1] >= num_enc_boxes
 
-
                         # denoise enc boxes
                         l_1 = self.dn_enc_l1
                         l_2 = self.dn_enc_l2
@@ -520,10 +521,12 @@ class DeformableTransformer(nn.Module):
             tgt_oqs_clone = tgt[:,-self.num_queries:].clone()
             boxes_oqs_clone = reference_points[:,-self.num_queries:].clone()
             query_embed = None
+            init_masks = False
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
             tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            init_masks = False
 
             reference_points = self.reference_points(query_embed).sigmoid()
 

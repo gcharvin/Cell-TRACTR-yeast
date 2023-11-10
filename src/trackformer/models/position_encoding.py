@@ -97,13 +97,23 @@ class PositionEmbeddingSine(nn.Module):
             scale = 2 * math.pi
         self.scale = scale
 
+    def deterministic_cumsum(self, t, dim):
+        output = torch.zeros_like(t).float()
+        for i in range(1, t.size(dim)):
+            output.select(dim, i).add_(output.select(dim, i-1)).add_(t.select(dim, i))
+        return output
+
     def forward(self, tensor_list: NestedTensor):
         x = tensor_list.tensors
         mask = tensor_list.mask
         assert mask is not None
         not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        # y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        # x_embed = not_mask.cumsum(2, dtype=torch.float32)
+
+        y_embed = self.deterministic_cumsum(not_mask,1)
+        x_embed = self.deterministic_cumsum(not_mask,2)
+
         if self.normalize:
             eps = 1e-6
             y_embed = (y_embed - 0.5) / (y_embed[:, -1:, :] + eps) * self.scale

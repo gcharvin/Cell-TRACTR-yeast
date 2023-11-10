@@ -2149,7 +2149,7 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
     This will eventually be supported natively by PyTorch, and this
     class can go away.
     """
-    if float(torchvision.__version__[:3]) < 0.7:
+    if float(torchvision.__version__[2]) == 0 and float(torchvision.__version__[3]) < 0.7:
         if input.numel() > 0:
             return torch.nn.functional.interpolate(
                 input, size, scale_factor, mode, align_corners
@@ -3499,19 +3499,22 @@ def man_track_ids(targets,input_target_name:str,output_target_name:str = None):
 
                     div_cur_track_ids = man_track[man_track[:,-1] == prev_track_id,0]
 
-                    assert len(div_cur_track_ids) == 2
+                    if len(div_cur_track_ids) == 2:
 
-                    div_ind_1 = output_target['track_ids'] == div_cur_track_ids[0]
-                    div_ind_2 = output_target['track_ids'] == div_cur_track_ids[1]
+                        div_ind_1 = output_target['track_ids'] == div_cur_track_ids[0]
+                        div_ind_2 = output_target['track_ids'] == div_cur_track_ids[1]
 
-                    output_target['track_ids'][div_ind_1] = prev_track_id
-                    remove_ind = output_target['track_ids'] != div_cur_track_ids[1]         
+                        output_target['track_ids'][div_ind_1] = prev_track_id
+                        remove_ind = output_target['track_ids'] != div_cur_track_ids[1]         
 
-                    for feature in features:
-                        if feature not in ['flexible_divisions','track_ids']:
-                            feature_len = output_target[feature].shape[1]
-                            output_target[feature][div_ind_1,feature_len//2:] = output_target[feature][div_ind_2,:feature_len//2]
-                        output_target[feature] = output_target[feature][remove_ind]
+                        for feature in features:
+                            if feature not in ['flexible_divisions','track_ids']:
+                                feature_len = output_target[feature].shape[1]
+                                output_target[feature][div_ind_1,feature_len//2:] = output_target[feature][div_ind_2,:feature_len//2]
+                            output_target[feature] = output_target[feature][remove_ind]
+
+                    else:
+                        div_ind = output_target['track_ids'] == div_cur_track_ids[0]
 
     return targets
 
