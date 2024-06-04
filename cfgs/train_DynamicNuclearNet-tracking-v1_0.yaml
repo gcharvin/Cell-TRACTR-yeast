@@ -7,13 +7,13 @@ lr_linear_proj_mult: 0.1
 lr_track: 0.0001
 overwrite_lrs: false
 overwrite_lr_scheduler: false
-batch_size: 2
+batch_size: 1
 weight_decay: 0.0001
-epochs: 12
-lr_drop: 11
-target_size: (256,32)
+epochs: 24
+lr_drop: 20
+target_size: (584,600)
 # Number of object queries
-num_queries: 30
+num_queries: 400
 # Flexible divisions
 flex_div: false
 # Tracking 2 sequential frames - use prev_prev, prev and cur frame (detection 1 frame and track for 2 frames - 3 frames total)
@@ -21,7 +21,7 @@ use_prev_prev_frame: true
 # For 2D data, image will be randomly cropped around objects
 crop: false
 # Shift only applies to cropped images. Crop will be shifted between sequential frames
-shift: false
+shift: True
 # gradient clipping max norm
 clip_max_norm: 0.1
 # Deformable DETR parameters
@@ -35,7 +35,7 @@ enc_n_points: 4
 freeze_detr: false
 load_mask_head_from_model: null
 # Backbone
-# Name of the convolutional backbone to use. ('resnet18, resnet34, resnet50', 'resnet101')
+# Name of the convolutional backbone to use. ('resnet50', 'resnet101')
 backbone: resnet18
 # If true, we replace stride with dilation in the last convolutional block (DC5)
 dilation: false
@@ -45,15 +45,15 @@ position_embedding: sine
 num_feature_levels: 3
 # Transformer
 # Number of encoding layers in the transformer
-enc_layers: 4
+enc_layers: 1
 # Number of decoding layers in the transformer
-dec_layers: 4
+dec_layers: 3
 # Number of decoding layers in transformer used for object detection. Rest of layers will be used for tracking
 num_OD_layers: 1
 # Intermediate size of the feedforward layers in the transformer blocks
 dim_feedforward: 512
 # Size of the embeddings (dimension of the transformer)
-hidden_dim: 144 # needs to be divisible by 8
+hidden_dim: 144
 # Dropout applied in the transformer
 dropout: 0.1
 # Number of attention heads inside the transformer's attentions
@@ -61,7 +61,7 @@ nheads: 8
 # DAB-DETR 4D coordinates instead of 2D
 use_dab: true
 # DN-DETR denoising parameters
-# Denoised tracking queries
+# Denoised tracking queriesdn_track: true
 dn_track: true
 dn_track_l1: 0.2
 dn_track_l2: 0.1
@@ -103,24 +103,24 @@ multi_frame_attention_separate_encoder: false
 overflow_boxes: true
 # Segmentation
 masks: true
-mask_dim: 288
+mask_dim: 144
 enc_masks: true
-use_img_for_mask: true
+use_img_for_mask: false
 # Matcher - matching cost
 set_cost_class: 4.0
 set_cost_bbox: 5.0
 set_cost_giou: 2.0
 set_cost_mask: 5.0
-set_cost_dice: 5.0
+set_cost_dice: 2.0
 # Use masks in matching - more expensive computational
 match_masks: true
 # num of points to use when matching - reduces computational load
 num_points: 10000
 # Loss
-# Backpropagate for every aux layer
+# Disables auxiliary decoding losses (loss at each layer)
 aux_loss: true
 # Backpropagate for mask at every aux layer (can create OOM issues)
-return_intermediate_masks: true
+return_intermediate_masks: false
 # Loss coefficients
 loss_coef: 1.0 # This is just a formality
 cls_loss_coef: 4.0 
@@ -145,7 +145,7 @@ focal_loss: true
 focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
-dataset: moma
+dataset: DynamicNuclearNet-tracking-v1_0
 # Number of plots
 num_plots: 10
 # Miscellaneous
@@ -177,6 +177,6 @@ iou_threshold: 0.5
 # Data Viz
 data_viz: True
 # Data Viz - show all 
-display_all: True
+display_all: False
 hooks: False
 avg_attn_weight_maps: True

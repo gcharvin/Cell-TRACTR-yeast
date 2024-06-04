@@ -8,15 +8,32 @@ import re
 
 random.seed(24)
 
-def train_val_split(files,split=0.8):
-
-    random.shuffle(files)
-    train_val_split = 0.8
-    split = int(train_val_split*len(files))
-    train = sorted(files[:split])
-    val = sorted(files[split:])
-
-    return train, val
+def get_info(dataset):
+    if dataset == 'moma':
+        info = {
+            'contributor': 'Dunlop Lab (Owen OConnor)',
+            'date_created':'2022',
+            'description':'E. Coli growing in mother machine',
+            'version': '1.0',
+            'year': '2024'
+            }
+    elif dataset == '2D':
+        info = {
+            'contributor': 'Simon van Vliet',
+            'paper':'Spatially Correlated Gene Expression in Bacterial Groups: The Role of Lineage History, Spatial Gradients, and Cell-Cell Interactions (2018 van Vliet et al.)',
+            'description':'E. Coli and Salmonella growing on agarose pads',
+            'version': '1.0',
+            'year': '2024'
+            }
+    elif dataset == 'DynamicNuclearNet-tracking-v1_0':
+        info = {
+            'contributor': 'Van Valen Lab',
+            'paper':'Caliban: Accurate cell tracking and lineage construction in live-cell imaging experiments with deep learning (2023 M. Schwartz et al.)',
+            'version': '1.0',
+            'year': '2024'
+            }
+        
+    return info
 
 def create_folders(datapath,folders):
 
@@ -24,12 +41,14 @@ def create_folders(datapath,folders):
     (datapath / 'annotations').mkdir(exist_ok=True)
     (datapath / 'man_track').mkdir(exist_ok=True)
 
-    man_track_paths = (datapath / 'man_track').glob('*.txt')
-    for man_track_path in man_track_paths:
-        man_track_path.unlink()
-
     # Create train and val folder to store images and ground truths
     for folder in folders:
+
+        (datapath / 'man_track' / folder).mkdir(exist_ok=True)
+        man_track_paths = (datapath / 'man_track' / folder).glob('*.txt')
+        for man_track_path in man_track_paths:
+            man_track_path.unlink()
+
         (datapath / 'annotations' / folder).mkdir(exist_ok=True)
         (datapath / folder).mkdir(exist_ok=True)
         for img_type in ['img','gt']:
@@ -81,28 +100,17 @@ def polygonFromMask(seg):
 
 
 class reader():
-    def __init__(self,dataset,target_size,min_area):
+    def __init__(self,dataset,target_size,resize,min_area):
 
         self.target_size = target_size
         self.min_area = min_area
+        self.resize = resize
         self.dtype = {'uint8': 255,
                       'uint16': 65535}
-
-        if dataset == 'moma':
-            self.crop = False
-            self.resize = True
-            self.rescale = False
-            self.remove_min = False
-        elif dataset == '2D' or dataset == '2D_512x512':
-            self.crop = False
-            self.resize = False
-            self.rescale = False
-            self.remove_min = False
-        else:
-            self.crop = False
-            self.resize = True
-            self.rescale = False
-            self.remove_min = True
+        
+        self.crop = False
+        self.rescale = False
+        self.remove_min = False
 
         self.max_num_of_cells = 0
     
@@ -115,6 +123,21 @@ class reader():
         self.removed_cellnbs = []
         self.swap_cellnbs = {}
         self.max_cellnb = self.track_file[-1,0]
+
+    def read_gts(self,fps):
+
+        gts = []
+
+        dataset_nb = fps[0].parts[-2]
+
+        for fp in fps:
+
+            gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{fp.name[1:]}')
+
+            # Read inputs and outputs
+            gts.append(cv2.imread(str(gt_fp),cv2.IMREAD_UNCHANGED).astype(np.uint16))
+
+        self.gts = np.stack(gts)
 
     def get_slices(self,seg,shift):
     
@@ -230,24 +253,20 @@ class reader():
 
                     return None
 
-                else:
-                    adfasd= 0
         else:
             new_cellnb = self.swap_cellnbs[cellnb]
 
         return new_cellnb
 
-    def read_gt(self,fp,counter=None):
+    def read_gt(self,fp,counter):
 
         nb = re.findall('\d+',fp.stem)[-1]
         framenb = int(nb)
         self.framenb = framenb
-        pad = len(nb)
         dataset_nb = fp.parts[-2]
-        gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{int(nb):0{pad}}{fp.suffix}')
+        gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{fp.name}')
 
-        # Read inputs and outputs
-        gt = cv2.imread(str(gt_fp),cv2.IMREAD_UNCHANGED).astype(np.uint16)
+        gt = self.gts[counter]
 
         skip = []
 
@@ -459,11 +478,27 @@ class reader():
 
                 contours, _ = cv2.findContours(mask_cellnb_resized, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
                 
-                if (sum([contour.size >= 6 for contour in contours]) > 0 and (mask_cellnb_resized > 127).sum() >= self.min_area):
+                if sum([contour.size >= 6 for contour in contours]) > 0 and ((mask_cellnb_resized > 127).sum() >= self.min_area or not self.remove_min):
                     gt_resized[mask_cellnb_resized > 127] = cellnb
                 else:
-                    if not self.remove_min:
-                        gt_resized[mask_cellnb_resized > 127] = cellnb
+                    row = self.track_file_orig[self.track_file_orig[:,0] == cellnb][0]
+
+                    if row[2] == framenb:
+                        self.track_file_orig[self.track_file_orig[:,0] == cellnb,2] -= 1
+                    elif row[1] == framenb:
+                        self.track_file_orig[self.track_file_orig[:,0] == cellnb,1] += 1
+                    else:
+                        old_exit_framenb = row[2]
+                        self.track_file_orig[self.track_file_orig[:,0] == cellnb,2] = framenb-1
+
+                        max_cellnb = np.max(self.track_file_orig[:,0]) + 1
+                        new_cell = np.array([[max_cellnb,framenb+1,old_exit_framenb,0]])
+
+                        self.track_file_orig = np.concatenate((self.track_file_orig, new_cell))
+
+                        for f in range(1,old_exit_framenb-framenb+1):
+                            assert cellnb in self.gts[counter+f]
+                            self.gts[counter+f, self.gts[counter+f] == cellnb] = max_cellnb
 
                     #TODO need to remove cell from man_track.txt if it's too small in terms of area or contour.size
 

@@ -13,16 +13,15 @@ import torch
 from torch import nn
 from torch.nn.init import constant_, normal_, xavier_uniform_
 import torch.nn.functional as F
-import fvcore.nn.weight_init as weight_init
 
-from ..util.misc import inverse_sigmoid,add_noise_to_boxes, mask_to_bbox, combine_boxes_parallel
+from ..util.misc import inverse_sigmoid
 from ..util import box_ops
 from .ops.modules import MSDeformAttn
 from .transformer import _get_clones, _get_activation_fn
 
 
 class DeformableTransformer(nn.Module):
-    def __init__(self, d_model=256, nhead=8, feature_channels=None,
+    def __init__(self, d_model=256, nhead=8,
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024,
                  dropout=0.1, activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
@@ -31,9 +30,9 @@ class DeformableTransformer(nn.Module):
                  multi_frame_attention_separate_encoder=False, 
                  refine_track_queries=False, refine_div_track_queries=False,
                  init_enc_queries_embeddings=False,device='cuda',masks=False,
-                 dn_enc_l1=0, dn_enc_l2=0, mask_dim=288,init_boxes_from_masks=False,
-                 dn_track_add_object_queries=False,enc_masks=False,enc_FN=0,avg_attn_weight_maps=True,
-                 decoder_use_mask_as_ref=False,tgt_noise=1e-6,use_img_for_mask=False):
+                 dn_enc_l1=0, dn_enc_l2=0, init_boxes_from_masks=False,
+                 enc_masks=False,enc_FN=0,avg_attn_weight_maps=True,
+                 tgt_noise=1e-6,use_img_for_mask=False, num_OD_layers=0,use_div_box_as_ref_pts=False):
         super().__init__()
 
         self.d_model = d_model
@@ -45,23 +44,22 @@ class DeformableTransformer(nn.Module):
         self.multi_frame_attention_separate_encoder = multi_frame_attention_separate_encoder
         self.use_dab = use_dab
         self.device = device
-        self.masks = masks
         self.enc_masks = enc_masks
         self.enc_FN = enc_FN
         self.avg_attn_weight_maps = avg_attn_weight_maps
-        self.decoder_use_mask_as_ref = decoder_use_mask_as_ref
         self.tgt_noise = tgt_noise
         self.use_img_for_mask = use_img_for_mask
-
-        # self.forward_prediction_heads = None
 
         self.refine_track_queries = refine_track_queries
         self.refine_div_track_queries = refine_div_track_queries
         self.init_enc_queries_embeddings = init_enc_queries_embeddings
         self.init_boxes_from_masks = init_boxes_from_masks
 
-        self.dn_track_add_object_queries = dn_track_add_object_queries
+        self.num_OD_layers = num_OD_layers
 
+        if self.num_OD_layers > 1:
+            raise NotImplementedError
+        
         if self.refine_track_queries:
             self.track_embedding = nn.Embedding(1,self.d_model)
 
@@ -78,16 +76,12 @@ class DeformableTransformer(nn.Module):
         if multi_frame_attention_separate_encoder:
             enc_num_feature_levels = enc_num_feature_levels // 2
 
-        encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
-                                                          dropout, activation,
-                                                          enc_num_feature_levels, nhead, enc_n_points)
+        encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward, dropout, activation, enc_num_feature_levels, nhead, enc_n_points)
         self.encoder = DeformableTransformerEncoder(encoder_layer, num_encoder_layers)
 
-        decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
-                                                          dropout, activation,
-                                                          num_feature_levels, nhead, dec_n_points,avg_attn_weight_maps)
-        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec,
-                                                    use_dab=use_dab, d_model=d_model, high_dim_query_update=high_dim_query_update, no_sine_embed=no_sine_embed)
+        decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward, dropout, activation, num_feature_levels, nhead, dec_n_points,avg_attn_weight_maps)
+        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, use_dab=use_dab, d_model=d_model, return_intermediate_dec=return_intermediate_dec,
+                                                    high_dim_query_update=high_dim_query_update, no_sine_embed=no_sine_embed, num_OD_layers=self.num_OD_layers,use_div_box_as_ref_pts=use_div_box_as_ref_pts)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
@@ -107,85 +101,6 @@ class DeformableTransformer(nn.Module):
         self.high_dim_query_update = high_dim_query_update
         if high_dim_query_update:
             assert not self.use_dab, "use_dab must be True"
-
-        self.mask_dim = mask_dim
-        
-        mask_num_feature_levels = num_feature_levels
-
-        if self.use_img_for_mask:
-            mask_num_feature_levels += 1
-
-        # use 1x1 conv instead
-        self.mask_features = nn.Conv2d(
-            d_model*mask_num_feature_levels,
-            self.mask_dim,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-        )
-
-        if self.use_img_for_mask:
-            self.img_encoder = nn.Sequential(
-                nn.Conv2d(
-                3,
-                d_model,
-                kernel_size=3,
-                stride=1,
-                padding='same',
-                bias=True
-                ),
-                nn.GroupNorm(d_model // 9, d_model),
-                nn.ReLU(),
-                nn.Conv2d(
-                    d_model,
-                    d_model,
-                    kernel_size=3,
-                    stride=1,
-                    padding='same',
-                    bias=True
-                    ),
-                nn.ReLU(),
-                nn.GroupNorm(d_model // 9, d_model),
-                )
-
-        weight_init.c2_xavier_fill(self.mask_features)
-
-        self.lateral_layers = []
-        self.output_layers = []
-
-        for in_channels in feature_channels[:self.num_feature_levels][::-1]:
-
-            lateral_layer = nn.Sequential(
-                nn.Conv2d(in_channels, d_model, kernel_size=1, bias=True),
-                nn.GroupNorm(d_model // 9, d_model),
-            )
-
-            output_layer = nn.Sequential(
-                nn.Conv2d(
-                    d_model,
-                    d_model,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    bias=True,
-                ),
-                nn.ReLU(),
-                nn.GroupNorm(d_model // 9, d_model),
-           )
-
-            weight_init.c2_xavier_fill(lateral_layer[0])
-            weight_init.c2_xavier_fill(output_layer[0])
-
-            self.lateral_layers.append(lateral_layer)
-            self.output_layers.append(output_layer)
-
-        self.lateral_layers = nn.ModuleList(self.lateral_layers).to(self.device)
-        self.output_layers = nn.ModuleList(self.output_layers).to(self.device)
-
-        self.mask_enc_embed = MLP(d_model, d_model, self.mask_dim, 3)
-
-        # init decoder
-        self.decoder_enc_norm  = nn.LayerNorm(d_model)
 
         self._reset_parameters()
 
@@ -207,7 +122,7 @@ class DeformableTransformer(nn.Module):
         temperature = 10000
         scale = 2 * math.pi
 
-        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=proposals.device)
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=self.device)
         dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
         # N, L, 4
         proposals = proposals.sigmoid() * scale
@@ -227,8 +142,8 @@ class DeformableTransformer(nn.Module):
             valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
             valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
 
-            grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
-                                            torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
+            grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=self.device),
+                                            torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=self.device))
             grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1)
 
             scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N_, 1, 1, 2)
@@ -258,7 +173,49 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, output_target=None, query_attn_mask=None, dn_enc=False,training_methods=[],add_object_queries_to_dn_track=False,track=True):
+    def get_PEM(self,features,memory):
+
+            offset = 0
+            memory_slices = []
+            batch_size, _, channels = memory.shape
+            for height,width in self.spatial_shapes:
+                memory_slice = memory[:, offset:offset + height * width].permute(0, 2, 1).view(
+                    batch_size, channels, height, width)
+                memory_slices.append(memory_slice)
+                offset += height * width
+
+            memory = memory_slices[::-1] # this will be used in segmentation; flip the order to follow DINO
+
+            # Get mask_features needed for segmentation
+            fpns = [features[i].tensors for i in range(self.num_feature_levels)][::-1]
+            mask_size = fpns[-1].shape[-2:]
+
+            mask_features = []
+
+            if self.use_img_for_mask:
+                images = self.samples.tensors.to(self.device)
+                images_enc = self.img_encoder(images)
+                mask_size = images.shape[-2:]
+                # fpns.append(images_enc)
+
+            for fidx, fpn in enumerate(fpns):
+                
+                cur_fpn = self.lateral_layers[fidx](fpn)
+                y = cur_fpn + F.interpolate(memory[fidx], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False) # Mask DINO uses just the largest spatial shape output from encoder 
+                # Below is a deterministic version of F.interpolate
+                # y = cur_fpn + F.interpolate(memory[-1], size=cur_fpn.shape[-2:]) # Mask DINO uses just the largest spatial shape output from encoder
+                y = self.output_layers[fidx](y)
+                mask_features.append(F.interpolate(y, size=mask_size, mode="bilinear", align_corners=False))
+                # Below is a deterministic version of F.interpolate
+                # mask_features.append(F.interpolate(y, size=mask_size))
+
+            if self.use_img_for_mask:
+                mask_features.append(images_enc)
+
+            mask_features = torch.cat(mask_features,1)
+            self.all_mask_features = self.mask_features(mask_features)
+
+    def forward(self, features, srcs, masks, pos_embeds, query_embed=None, targets=None, output_target=None, query_attn_mask=None,training_methods=[]):
         assert self.two_stage or query_embed is not None
         if not self.two_stage:
             assert torch.sum(torch.isnan(query_embed)) == 0, 'Nan in reference points'
@@ -282,11 +239,11 @@ class DeformableTransformer(nn.Module):
         src_flatten = torch.cat(src_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
-        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=self.device)
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
         # encoder
-        if self.multi_frame_attention_separate_encoder:
+        if self.multi_frame_attention_separate_encoder and self.multi_frame_attention:
             level_start_index = torch.cat((spatial_shapes[:spatial_shapes.shape[0]//2].new_zeros((1, )), spatial_shapes[:spatial_shapes.shape[0]//2].prod(1).cumsum(0)[:-1]))
             prev_memory = self.encoder(
                 src_flatten[:, :src_flatten.shape[1] // 2],
@@ -309,45 +266,10 @@ class DeformableTransformer(nn.Module):
             level_start_index = torch.cat((spatial_shapes[:spatial_shapes.shape[0]].new_zeros((1, )), spatial_shapes[:spatial_shapes.shape[0]].prod(1).cumsum(0)[:-1]))
             memory = self.encoder(src_flatten, spatial_shapes, valid_ratios, level_start_index, lvl_pos_embed_flatten, mask_flatten)
 
-        # prepare input for decoder
-        bs, _, c = memory.shape
+        self.spatial_shapes = spatial_shapes # needed for detr_segmentation.py
 
-        # reformat memory to be used to generate mask_features
-        memory_list = []
-        j = 0
-        for i in range(self.num_feature_levels ):
-            size = spatial_shapes[i,0] * spatial_shapes[i,1]
-            memory_list.append(memory[:,j:j+size,:].transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
-            j += size
-
-        memory_list = memory_list[::-1]
-
-        # Get mask_features needed for segmentation
-        fpns = [features[i].tensors for i in range(self.num_feature_levels)][::-1]
-        mask_size = fpns[-1].shape[-2:]
-
-        mask_features = []
-
-        if self.use_img_for_mask:
-            images = self.samples.tensors.to(self.device)
-            images_enc = self.img_encoder(images)
-
-            mask_size = images.shape[-2:]
-
-        for fidx, fpn in enumerate(fpns):
-            
-            cur_fpn = self.lateral_layers[fidx](fpn)
-            # y = cur_fpn + F.interpolate(memory_list[fidx], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False) # Mask DINO uses just the largest spatial shape output from encoder however we use all encoder outputs
-            y = cur_fpn + F.interpolate(memory_list[fidx], size=cur_fpn.shape[-2:]) # Mask DINO uses just the largest spatial shape output from encoder however we use all encoder outputs
-            y = self.output_layers[fidx](y)
-            # mask_features.append(F.interpolate(y, size=mask_size, mode="bilinear", align_corners=False))
-            mask_features.append(F.interpolate(y, size=mask_size))
-
-        if self.use_img_for_mask:
-            mask_features.append(images_enc)
-
-        mask_features = torch.cat(mask_features,1)
-        self.all_mask_features = self.mask_features(mask_features)
+        if self.masks:
+            self.get_PEM(features,memory)
 
         enc_outputs = {}
 
@@ -359,7 +281,8 @@ class DeformableTransformer(nn.Module):
                 output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
             # hack implementation for two-stage Deformable DETR
-            enc_outputs_class = self.class_embed(output_memory)[...,:1]
+            # enc_outputs_class = self.class_embed(output_memory)[...,:1]
+            enc_outputs_class = self.class_embed[-1](output_memory)[...,:1]
             enc_outputs_coord_unact = self.bbox_embed[-1](output_memory)[...,:output_proposals.shape[-1]] + output_proposals
 
             assert self.num_queries <= enc_outputs_class.shape[1]
@@ -370,18 +293,12 @@ class DeformableTransformer(nn.Module):
             topk_coords_undetach = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
             topk_coords_detach = topk_coords_undetach.detach()
             reference_points = topk_coords_detach.sigmoid()
-            init_reference_out = reference_points
             topk_classes = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
 
             tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))  # unsigmoid
-            
-            if self.masks and self.enc_masks:
-                outputs_mask, outputs_class = self.forward_prediction_heads(tgt_undetach,-1)
-                enc_outputs['pred_masks'] = outputs_mask
-                enc_outputs['pred_logits'] = outputs_class
-            else:
-                topk_classes = topk_classes[...,:1]
-                enc_outputs['pred_logits'] = torch.cat((topk_classes,torch.zeros_like(topk_classes)),axis=-1)  # I use weight map to discard the second prediction in loss function
+
+            topk_classes = topk_classes[...,:1]
+            enc_outputs['pred_logits'] = torch.cat((topk_classes,torch.zeros_like(topk_classes)),axis=-1)  # I use weight map to discard the second prediction in loss function
          
             enc_outputs['pred_boxes'] = torch.cat((topk_coords_undetach.sigmoid(),torch.zeros_like(topk_coords_undetach)),axis=-1)
             enc_outputs['topk_proposals'] = topk_proposals
@@ -397,123 +314,30 @@ class DeformableTransformer(nn.Module):
                 # gather tgt
                 tgt = tgt_undetach.detach()
 
-            if targets is not None and 'dn_track' in targets[0] and self.dn_track_add_object_queries and add_object_queries_to_dn_track:
-                tgt_oqs_clone = tgt.clone()
-                boxes_oqs_clone = reference_points.clone()
+            if self.enc_masks and self.masks:
 
-            if self.masks and self.init_boxes_from_masks:
-                flatten_mask = outputs_mask.detach().flatten(0, 1)[:,0]
-                h, w = outputs_mask.shape[-2:]
+                outputs_mask = self.forward_prediction_heads(tgt_undetach,-1)
+                enc_outputs['pred_masks'] = outputs_mask
+                
+                # if self.init_boxes_from_masks:
+                if self.init_boxes_from_masks: 
+                    flatten_mask = outputs_mask.detach().flatten(0, 1)[:,0]
 
-                refpoint_embed = mask_to_bbox(flatten_mask > 0)
-                refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
-                enc_outputs['mask_enc_boxes'] = refpoint_embed.clone().cpu()
-                # refpoint_embed = inverse_sigmoid(refpoint_embed)
-
-                reference_points = refpoint_embed
-                init_reference_out = reference_points
-
-                if self.iterative_masks:
-                    init_masks = outputs_mask
-
-            if not self.iterative_masks:
-                init_masks = None
+                    #TODO need to make this work for torch instead of numpy so everything can stay on the gpu
+                    # h, w = outputs_mask.shape[-2:]
+                    # refpoint_embed = box_ops.masks_to_boxes(flatten_mask > 0)
+                    # refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],dtype=torch.float,device=self.device)
+                    
+                    refpoint_embed = box_ops.masks_to_boxes(flatten_mask > 0,cxcywh=True) # bbox are 0 to 1 so we don't have to resize masks before getting bboxes
+                    refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
+                    enc_outputs['mask_enc_boxes'] = refpoint_embed.clone().cpu()
+                    reference_points = refpoint_embed
 
             if query_embed is not None: # used for dn_object or if you want to add extra object queries on top of two_stage
                 reference_points = torch.cat((reference_points,query_embed[..., self.d_model:].sigmoid()),axis=1)
                 tgt = torch.cat((tgt,query_embed[..., :self.d_model]),axis=1)
 
-                if self.iterative_masks:
-                    b,_,_,h,w = init_masks.shape
-                    init_masks = torch.cat((init_masks,torch.zeros((b,query_embed[..., self.d_model:].shape[1],2,h,w),device=tgt.device)),axis=1)
-
                 query_embed = None
-
-            if targets is not None and dn_enc and sum([t[output_target]['empty'] for t in targets]) == 0: # Only use dn_enc when current frame is fed to model
-                assert output_target == 'cur_target'
-                enc_thresh = 0.2
-
-                if torch.rand(1).item() < self.enc_FN:
-                    enc_FN = True
-                    random_number = torch.randint(low=1, high=3, size=(1,))[0]
-                    topk_dn_enc = topk + random_number
-                    assert enc_outputs_class.shape[1] > topk_dn_enc
-                else:
-                    enc_FN=False
-                    topk_dn_enc = topk
-                    random_number = 0
-
-                topk_proposals = torch.topk(enc_outputs_class[..., 0], topk_dn_enc, dim=1)[1][:,random_number:]
-
-                topk_cls_undetach = torch.gather(enc_outputs_class, 1, topk_proposals.unsqueeze(-1))
-                keep_enc_boxes = topk_cls_undetach[:,:,0].sigmoid() > enc_thresh
-                num_enc_boxes = 0
-
-                for target in targets:
-                    num_enc_boxes = max(num_enc_boxes,target[output_target]['boxes'].shape[0] + (target[output_target]['boxes'][:,-1] > 0).sum())
-
-                if num_enc_boxes > 0:
-
-                    total_boxes = sum([target[output_target]['boxes'].shape[0] - target[output_target]['empty'].int() for target in targets])
-                    if keep_enc_boxes.sum() > total_boxes - 2 or enc_FN: # if most boxes are detected; 2 is an arbitrary number because enc may predict single cell when in fact it's two separate cells 
-
-                        if enc_FN:
-                            topk_dn_boxes = topk_proposals 
-                            num_enc_boxes = topk
-                            tgt_enc = torch.gather(output_memory, 1, topk_dn_boxes.unsqueeze(-1).repeat(1, 1, self.d_model)).detach()
-                            reference_points_enc = torch.gather(enc_outputs_coord_unact,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4)).detach().sigmoid()
-                        else:
-                            topk_dn_boxes = torch.topk(topk_cls_undetach[...,0], num_enc_boxes, dim=1)[1]
-                            tgt_enc = torch.gather(tgt,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,self.d_model))
-                            reference_points_enc = torch.gather(reference_points,1,topk_dn_boxes.unsqueeze(-1).repeat(1,1,4))
-
-                        tgt_enc += torch.normal(0,self.tgt_noise,size=tgt_enc.shape,device=self.device)
-                        tgt = torch.cat((tgt,tgt_enc),axis=1)
-
-                        assert num_enc_boxes == tgt_enc.shape[1]
-                        assert tgt_enc.shape[1] >= num_enc_boxes
-
-                        # denoise enc boxes
-                        l_1 = self.dn_enc_l1
-                        l_2 = self.dn_enc_l2
-                        reference_points_enc_noised = add_noise_to_boxes(reference_points_enc.clone(),l_1,l_2)
-
-                        reference_points = torch.cat((reference_points,reference_points_enc_noised),axis=1)
-
-                        if self.iterative_masks:
-                            b,_,_,h,w = init_masks.shape
-                            init_masks = torch.cat((init_masks,torch.zeros((b,reference_points_enc_noised.shape[1],2,h,w),device=tgt.device)),axis=1)
-
-                        assert len(tgt_enc) == len(reference_points_enc)
-                        assert len(tgt) == len(reference_points)
-                        assert query_attn_mask is not None
-
-                        new_query_attn_mask = torch.zeros((query_attn_mask.shape[0] + tgt_enc.shape[1],query_attn_mask.shape[1] + tgt_enc.shape[1])).bool().to(tgt.device)
-                        new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
-                        query_attn_mask = new_query_attn_mask                          
-
-                        query_attn_mask[-num_enc_boxes:,:-num_enc_boxes] = True
-                        query_attn_mask[:-num_enc_boxes,-num_enc_boxes:] = True
-
-                        for t,target in enumerate(targets):
-                            target['dn_enc'] = {}
-                            target['dn_enc']['boxes'] = target[output_target]['boxes_orig'].clone()
-                            target['dn_enc']['enc_boxes_noised'] = reference_points_enc_noised[t].detach()
-                            target['dn_enc']['enc_boxes'] = reference_points_enc[t].detach()
-                            target['dn_enc']['enc_logits'] = topk_cls_undetach[:,:,0].sigmoid()[t].detach()
-                            target['dn_enc']['labels'] = target[output_target]['labels_orig'].clone()
-                            target['dn_enc']['track_ids'] = target[output_target]['track_ids_orig'].clone()
-                            target['dn_enc']['prev_target'] = target['prev_target'].copy()
-                            target['dn_enc']['fut_target'] = target['fut_target'].copy()
-                            target['dn_enc']['empty'] = target[output_target]['empty']
-                            target['dn_enc']['track_queries_mask'] = torch.zeros((reference_points_enc.shape[1])).bool().to(tgt.device)
-                            target['dn_enc']['num_queries'] = reference_points_enc.shape[1]
-                            target['dn_enc']['framenb'] = target[output_target]['framenb']
-
-                            if 'masks' in target[output_target]:
-                                target['dn_enc']['masks'] = target[output_target]['masks_orig'].clone()
-
-                        training_methods.append('dn_enc')
 
         elif self.use_dab:
             reference_points = query_embed[..., self.d_model:].sigmoid() 
@@ -521,28 +345,24 @@ class DeformableTransformer(nn.Module):
             tgt_oqs_clone = tgt[:,-self.num_queries:].clone()
             boxes_oqs_clone = reference_points[:,-self.num_queries:].clone()
             query_embed = None
-            init_masks = False
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
             tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
-            init_masks = False
 
             reference_points = self.reference_points(query_embed).sigmoid()
 
-            assert torch.sum(torch.isnan(reference_points)) == 0, 'Nan in reference points'
+        num_track_queries = 0
 
+        if targets is not None and 'track_query_hs_embeds' in targets[0]['main'][output_target]:
 
-        if targets is not None and 'track_query_hs_embeds' in targets[0][output_target]:
+            prev_hs_embed = torch.stack([t['main'][output_target]['track_query_hs_embeds'] for t in targets])
+            prev_boxes = torch.stack([t['main'][output_target]['track_query_boxes'] for t in targets])
 
-            prev_hs_embed = torch.stack([t[output_target]['track_query_hs_embeds'] for t in targets])
-            prev_boxes = torch.stack([t[output_target]['track_query_boxes'] for t in targets])
+            num_track_queries += prev_boxes.shape[1]
 
             if self.refine_track_queries:
                 prev_hs_embed += self.track_embedding.weight
-
-            assert torch.sum(torch.isnan(prev_hs_embed)) == 0, 'Nan in track query_hs embeds'
-            assert torch.sum(torch.isnan(prev_boxes)) == 0, 'Nan in track boxes'
 
             if not self.use_dab:
                 prev_query_embed = torch.zeros_like(prev_hs_embed)
@@ -553,22 +373,19 @@ class DeformableTransformer(nn.Module):
 
             reference_points = torch.cat([prev_boxes[..., :reference_points.shape[-1]], reference_points], dim=1)
 
-            if self.iterative_masks:
-                prev_masks = torch.stack([t[output_target]['track_query_masks'] for t in targets])
-                init_masks = torch.cat((init_masks,prev_masks),axis=1)
-
             if 'dn_track' in targets[0]:
                 
-                # targets_dn_track = [target['dn_track'] for target in targets]
-
-                num_dn_track = targets[0]['dn_track']['num_queries']
+                num_dn_track = targets[0]['dn_track']['cur_target']['num_queries']
                 assert num_dn_track > 0
 
-                prev_hs_embed_dn_track = torch.stack([t['dn_track']['track_query_hs_embeds'] for t in targets])
-                prev_boxes_dn_track = torch.stack([t['dn_track']['track_query_boxes'] for t in targets])
+                num_total_queries = query_attn_mask.shape[0]
 
-                assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
-                assert torch.sum(torch.isnan(prev_boxes_dn_track)) == 0, 'Nan in track boxes'
+                for target in targets:
+                    target['dn_track']['start_query_ind'] = num_total_queries
+                    target['dn_track']['end_query_ind'] = num_total_queries + num_dn_track
+
+                prev_hs_embed_dn_track = torch.stack([t['dn_track'][output_target]['track_query_hs_embeds'] for t in targets])
+                prev_boxes_dn_track = torch.stack([t['dn_track'][output_target]['track_query_boxes'] for t in targets])
 
                 if not self.use_dab:
                     prev_query_embed_dn_track = torch.zeros_like(prev_hs_embed_dn_track)
@@ -576,26 +393,15 @@ class DeformableTransformer(nn.Module):
 
                 prev_tgt_dn_track = prev_hs_embed_dn_track
 
-                if self.dn_track_add_object_queries and add_object_queries_to_dn_track:
-                    prev_tgt_dn_track = torch.cat([prev_tgt_dn_track,tgt_oqs_clone], dim=1)
-                    prev_boxes_dn_track = torch.cat([prev_boxes_dn_track[..., :reference_points.shape[-1]],boxes_oqs_clone], dim=1)
-                    # num_dn_track += self.num_queries
-
                 tgt = torch.cat([tgt,prev_tgt_dn_track], dim=1)
                 reference_points = torch.cat([reference_points,prev_boxes_dn_track[..., :reference_points.shape[-1]]], dim=1)
 
-                if self.iterative_masks:
-                    b,_,_,h,w = init_masks.shape
-                    init_masks = torch.cat((init_masks,torch.zeros((b,prev_boxes_dn_track.shape[1],2,h,w),device=tgt.device)),axis=1)
-
-                new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=tgt.device).bool()
-
-                assert query_attn_mask is not None
+                new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=self.device).bool()
                 new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
 
                 new_query_attn_mask[:-num_dn_track,-num_dn_track:] = True
-                # new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
-                new_query_attn_mask[-num_dn_track:,self.num_queries:-num_dn_track] = True
+                new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
+                # new_query_attn_mask[-num_dn_track:,self.num_queries:-num_dn_track] = True
 
                 query_attn_mask = new_query_attn_mask
 
@@ -603,14 +409,15 @@ class DeformableTransformer(nn.Module):
 
                 if self.dn_track_group and 'dn_track_group' in targets[0]:
 
-                    num_dn_track_group = targets[0]['dn_track_group']['num_queries']
+                    num_dn_track_group = targets[0]['dn_track_group'][output_target]['num_queries']
                     assert num_dn_track_group > 0
 
-                    prev_hs_embed_dn_track_group = torch.stack([t['dn_track_group']['track_query_hs_embeds'] for t in targets])
-                    prev_boxes_dn_track_group = torch.stack([t['dn_track_group']['track_query_boxes'] for t in targets])
+                    for target in targets:
+                        target['dn_track_group']['start_query_ind'] = query_attn_mask.shape[0]
+                        target['dn_track_group']['end_query_ind'] = query_attn_mask.shape[0] + num_dn_track_group
 
-                    assert torch.sum(torch.isnan(prev_hs_embed_dn_track)) == 0, 'Nan in track query_hs embeds'
-                    assert torch.sum(torch.isnan(prev_boxes_dn_track_group)) == 0, 'Nan in track boxes'
+                    prev_hs_embed_dn_track_group = torch.stack([t['dn_track_group'][output_target]['track_query_hs_embeds'] for t in targets])
+                    prev_boxes_dn_track_group = torch.stack([t['dn_track_group'][output_target]['track_query_boxes'] for t in targets])
 
                     if not self.use_dab:
                         prev_hs_embed_dn_track_group = torch.zeros_like(prev_hs_embed_dn_track_group)
@@ -618,44 +425,50 @@ class DeformableTransformer(nn.Module):
 
                     prev_tgt_dn_track_group = prev_hs_embed_dn_track_group
 
-                    if self.dn_track_add_object_queries and add_object_queries_to_dn_track:
-                        prev_tgt_dn_track_group = torch.cat([prev_tgt_dn_track_group,tgt_oqs_clone], dim=1)
-                        prev_boxes_dn_track_group = torch.cat([prev_boxes_dn_track_group[..., :reference_points.shape[-1]],boxes_oqs_clone], dim=1)
-                        # num_dn_track_group += self.num_queries
-
                     tgt = torch.cat([tgt,prev_tgt_dn_track_group], dim=1)
                     reference_points = torch.cat([reference_points,prev_boxes_dn_track_group[..., :reference_points.shape[-1]]], dim=1)
 
-                    if self.iterative_masks:
-                        b,_,_,h,w = init_masks.shape
-                        init_masks = torch.cat((init_masks,torch.zeros((b,prev_boxes_dn_track_group.shape[1],2,h,w),device=tgt.device)),axis=1)
-
-                    new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=tgt.device).bool()
-
-                    assert query_attn_mask is not None
+                    new_query_attn_mask = torch.zeros((tgt.shape[1],tgt.shape[1]),device=self.device).bool()
                     new_query_attn_mask[:query_attn_mask.shape[0],:query_attn_mask.shape[1]] = query_attn_mask
 
                     new_query_attn_mask[:-num_dn_track_group,-num_dn_track_group:] = True
                     # new_query_attn_mask[-num_dn_track_group:,:-num_dn_track_group] = True
-                    new_query_attn_mask[-num_dn_track_group:,self.num_queries:-num_dn_track_group] = True
+                    new_query_attn_mask[-num_dn_track_group:,self.num_queries + prev_boxes.shape[1] :-num_dn_track_group] = True
+                    new_query_attn_mask[-num_dn_track_group:,:prev_boxes.shape[1]] = True
 
                     query_attn_mask = new_query_attn_mask
 
                     training_methods.append('dn_track_group')
 
+        OD_outputs = None
 
-        init_reference_out = reference_points
+        if targets is not None and 'prev_prev_frame' in targets[0]['main'][output_target]: # dn_track queies are mixed with object queries; easiest solution to make the dn_track queries not see the object queries because i only care about the dn_track queries
+            query_attn_mask[:-self.num_queries,-self.num_queries:] = True
+            query_attn_mask[-self.num_queries:,:-self.num_queries] = True # object queries are needed to detect any new objects
+
+        if self.num_OD_layers > 0:
+            OD_tgt = tgt[:,num_track_queries:num_track_queries + self.num_queries]
+            OD_query_attn_mask = torch.zeros((OD_tgt.shape[1],OD_tgt.shape[1]),device=self.device).bool()
+            OD_reference_points = reference_points[:,num_track_queries:num_track_queries + self.num_queries]
+            OD_hs, OD_inter_references_points, OD_outputs_class, OD_outputs_bbox = self.decoder.forward_OD_only(OD_tgt, OD_reference_points, memory, spatial_shapes, valid_ratios, level_start_index, query_embed, mask_flatten, OD_query_attn_mask)
+
+            OD_outputs = {'pred_logits': OD_outputs_class[-1],
+                        'pred_boxes': OD_outputs_bbox[-1],
+                        'hs_embed': OD_hs[-1],
+                        'training_methods': 'OD_only',}
+            
+            assert (tgt[:,num_track_queries:num_track_queries + self.num_queries] == OD_tgt).all()
+            reference_points[:,num_track_queries:num_track_queries + self.num_queries] = OD_inter_references_points.clone()
+          
+        init_reference_point = reference_points[None]
 
         # decoder
-        hs, inter_references, cls_outputs, mask_outputs = self.decoder(
-            tgt, reference_points, memory, spatial_shapes,
-            valid_ratios, level_start_index, query_embed, mask_flatten, query_attn_mask,init_masks)
+        hs, inter_references_points, outputs_class, outputs_bbox = self.decoder( tgt, reference_points, memory, spatial_shapes, valid_ratios, 
+                                                          level_start_index, query_embed, mask_flatten, query_attn_mask)
 
-        assert torch.sum(torch.isnan(hs)) == 0, 'Nan in hs_embedding decoder outputs'
+        reference_points = torch.cat((init_reference_point,inter_references_points),axis=0)     
 
-        inter_references_out = inter_references             
-
-        return hs, memory, init_reference_out, inter_references_out, enc_outputs, training_methods, init_masks, mask_outputs, cls_outputs
+        return hs, memory, reference_points, outputs_class, outputs_bbox, enc_outputs, training_methods, OD_outputs
 
 class DeformableTransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -788,16 +601,16 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False, use_dab=False, d_model=256, high_dim_query_update=False, no_sine_embed=False):
+    def __init__(self, decoder_layer, num_layers, use_dab=False, d_model=256, return_intermediate_dec=False, high_dim_query_update=False, no_sine_embed=False,num_OD_layers=0,use_div_box_as_ref_pts=False):
         super().__init__()
-        self.layers = _get_clones(decoder_layer, num_layers)
+        self.layers = _get_clones(decoder_layer, num_layers - num_OD_layers)
         self.num_layers = num_layers
-        self.return_intermediate = return_intermediate
+        self.return_intermediate_dec = return_intermediate_dec
         # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
         self.bbox_embed = None
         self.class_embed = None
         self.mask_embed = None
-        self.use_div_ref_pts = False
+        self.use_div_box_as_ref_pts = use_div_box_as_ref_pts
 
         #### DAB-DETR
         self.use_dab = use_dab
@@ -814,8 +627,13 @@ class DeformableTransformerDecoder(nn.Module):
             self.high_dim_query_proj = MLP(d_model, d_model, d_model, 2)
         #### DAB-DETR
 
+        self.num_OD_layers = num_OD_layers
+
+        if self.num_OD_layers > 0:
+            self.OD_layers = _get_clones(decoder_layer,self.num_OD_layers)
+
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_valid_ratios, src_level_start_index,
-                query_pos=None, src_padding_mask=None, query_attn_mask=None, iter_masks=None):
+                query_pos=None, src_padding_mask=None, query_attn_mask=None):
         output = tgt
 
         #### DAB-DETR
@@ -825,8 +643,9 @@ class DeformableTransformerDecoder(nn.Module):
 
         intermediate = []
         intermediate_reference_points = []
-        intermediate_masks = []
         intermediate_cls = []
+        intermediate_bboxes = []
+        bboxes = reference_points.clone()
 
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
@@ -849,126 +668,104 @@ class DeformableTransformerDecoder(nn.Module):
                 query_pos = query_pos + self.high_dim_query_proj(output) 
             #### DAB-DETR
 
-
             output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, query_attn_mask)
-            assert torch.sum(torch.isnan(output)) == 0, 'Output causing nan'
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
-                if self.decoder_use_mask_as_ref:
-                    
-                    pred_masks, cls = self.forward_prediction_heads(output,lid)
-                    
-                    if self.iterative_masks:
-                        pred_masks += iter_masks
-                        iter_masks = pred_masks.detach()
 
-                    decoder_masks = pred_masks.sigmoid()
-                    decoder_masks = decoder_masks * cls[...,None,None].sigmoid()
-                        
-                    decoder_masks = decoder_masks.flatten(0, 1)
+                # cls = self.class_embed(output)
+                cls = self.class_embed[lid](output)
+                layer_output = self.bbox_embed[lid](output) 
 
-                    boxes = mask_to_bbox(decoder_masks[:,0] > 0.5)
-                    div_boxes = mask_to_bbox(decoder_masks[:,1] > 0.5)
+                if self.use_div_box_as_ref_pts:
+                    inverse_box = inverse_sigmoid(bboxes)
 
-                    combined_boxes = combine_boxes_parallel(boxes,div_boxes)
+                    if lid == 0:
+                        bboxes = torch.cat((layer_output[:,:,:4] + inverse_box, layer_output[:,:,4:] + inverse_box),axis=-1).sigmoid()
+                    else:
+                        bboxes = (layer_output + inverse_box).sigmoid()
 
-                    boxes = boxes.reshape(pred_masks.shape[0], pred_masks.shape[1], 4)
-                    combined_boxes = combined_boxes.reshape(pred_masks.shape[0], pred_masks.shape[1], 4)
+                    div = cls[:,:,1].sigmoid() > 0.5
 
-                    boxes[cls[:,:,1] > 0] = combined_boxes[cls[:,:,1] > 0]
+                    new_reference_points = torch.zeros((bboxes.shape[0],bboxes.shape[1],4),device=bboxes.device)
+                    new_reference_points[~div] = bboxes[~div][:,:4].detach()
+                  
+                    if div.sum() > 0:
+                        div_bboxes = bboxes[div].detach()
+                        combined_boxes = box_ops.combine_boxes_parallel(div_bboxes[:,:4],div_bboxes[:,4:])
 
-                    new_reference_points = combined_boxes
+                        new_reference_points[div] = combined_boxes
 
-
-                    # decoder_masks = decoder_masks[:,:,0] + decoder_masks[:,:,1]
-                    # h, w = tmp.shape[-2:]
-                    # tmp = box_ops.masks_to_boxes(tmp > 0.5).cuda()
-                    # tmp = box_ops.box_xyxy_to_cxcywh(tmp) / torch.as_tensor([w, h, w, h],dtype=torch.float,device=self.device)
-                    # new_reference_points = tmp.reshape(decoder_masks.shape[0], decoder_masks.shape[1], 4)
-
+                        reference_points = new_reference_points.detach()
+                                    
                 else:
                     
-                    cls = self.class_embed(output)
-                    
-                    if self.use_div_ref_pts:
-                        tmp = self.bbox_embed[lid](output)
-                        box_1_ratio = torch.exp(cls[:,:,0]) / (torch.exp(cls[:,:,0]) + torch.exp(cls[:,:,1]))
-                        box_1_ratio = box_1_ratio[:,:,None].repeat(1,1,4)
-                        tmp = tmp[:,:,:4] * box_1_ratio + tmp[:,:,4:] * (1 - box_1_ratio)
-                    else:
-                        tmp = self.bbox_embed[lid](output)[:,:,:4]  # I am using the first box as the basis for the reference points
-                    if reference_points.shape[-1] == 4:
-                        new_reference_points = tmp + inverse_sigmoid(reference_points)
-                        assert torch.sum(torch.isnan(new_reference_points)) == 0, 'Reference points causing nan'
-                        new_reference_points = new_reference_points.sigmoid()
-                    else:
-                        assert reference_points.shape[-1] == 2
-                        new_reference_points = tmp
-                        new_reference_points[..., :2] = tmp[..., :2] + inverse_sigmoid(reference_points)
-                        new_reference_points = new_reference_points.sigmoid()
-                reference_points = new_reference_points.detach()
+                    inverse_sig_ref_pts =  inverse_sigmoid(reference_points)
+                    reference_points = (layer_output[:,:,:4] + inverse_sig_ref_pts).sigmoid().detach()
+                    bboxes = torch.cat((layer_output[:,:,:4] + inverse_sig_ref_pts, layer_output[:,:,4:] + inverse_sig_ref_pts),axis=-1).sigmoid()
 
-            if self.return_intermediate:
+            if self.return_intermediate_dec:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
+                intermediate_cls.append(cls)
+                intermediate_bboxes.append(bboxes)
 
-                if self.decoder_use_mask_as_ref:
-                    intermediate_masks.append(pred_masks)
-                    intermediate_cls.append(cls)
+        if self.return_intermediate_dec:
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), torch.stack(intermediate_cls), torch.stack(intermediate_bboxes)
+        
+        return output[None], reference_points[None], cls[None], bboxes[None]
 
-        if self.decoder_use_mask_as_ref:
-            stack_masks = torch.stack(intermediate_masks)
-            stack_cls = torch.stack(intermediate_cls)
-        else:
-            stack_masks = None
-            stack_cls = None
+    def forward_OD_only(self, tgt, reference_points, src, src_spatial_shapes, src_valid_ratios, src_level_start_index,
+                query_pos=None, src_padding_mask=None, query_attn_mask=None):
+        
+        output = tgt
 
-        if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points), stack_cls, stack_masks
+        intermediate = []
+        intermediate_reference_points = []
+        intermediate_cls = []
+        intermediate_bboxes = []
 
-        return output, reference_points, cls, pred_masks
+        for lid, layer in enumerate(self.OD_layers):
+            if reference_points.shape[-1] == 4:
+                reference_points_input = reference_points[:, :, None] * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
+            else:
+                reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
 
+            #### DAB-DETR
+            if self.use_dab:
+                if self.no_sine_embed:
+                    raw_query_pos = self.ref_point_head(reference_points_input)
+                else:
+                    query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :],self.d_model) # bs, nq, d_model * 2
+                    raw_query_pos = self.ref_point_head(query_sine_embed) # bs, nq, 256
+                pos_scale = self.query_scale(output) if lid != 0 else 1
+                query_pos = pos_scale * raw_query_pos
+            if self.high_dim_query_update and lid != 0:
+                query_pos = query_pos + self.high_dim_query_proj(output) 
+            #### DAB-DETR
 
-def build_deforamble_transformer(args):
+            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, query_attn_mask)
 
-    num_feature_levels = args.num_feature_levels
-    if args.multi_frame_attention:
-        num_feature_levels *= 2
+            # hack implementation for iterative bounding box refinement
+            if self.bbox_embed is not None:
 
-    return DeformableTransformer(
-        d_model=args.hidden_dim,
-        nhead=args.nheads,
-        num_encoder_layers=args.enc_layers,
-        num_decoder_layers=args.dec_layers,
-        dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout,
-        activation="relu",
-        return_intermediate_dec=True,
-        num_feature_levels=num_feature_levels,
-        dec_n_points=args.dec_n_points,
-        enc_n_points=args.enc_n_points,
-        two_stage=args.two_stage,
-        num_queries=args.num_queries,
-        batch_size=args.batch_size,
-        use_dab=args.use_dab,
-        multi_frame_attention_separate_encoder=args.multi_frame_attention and args.multi_frame_attention_separate_encoder,
-        init_enc_queries_embeddings=args.init_enc_queries_embeddings,
-        dn_enc_l1=args.dn_enc_l1,
-        dn_enc_l2=args.dn_enc_l2,
-        mask_dim=args.mask_dim,
-        init_boxes_from_masks=args.init_boxes_from_masks,
-        feature_channels = args.feature_channels,
-        device=args.device,
-        masks=args.masks,
-        dn_track_add_object_queries=args.dn_track_add_object_queries,
-        enc_masks=args.enc_masks,
-        enc_FN =args.enc_FN,
-        avg_attn_weight_maps=args.avg_attn_weight_maps,
-        decoder_use_mask_as_ref=args.decoder_use_mask_as_ref,
-        tgt_noise=args.tgt_noise,
-        use_img_for_mask=args.use_img_for_mask,
-        )
+                cls = self.class_embed[-2](output)
+                layer_output = self.bbox_embed[-2](output)                                   
+
+                inverse_sig_ref_pts =  inverse_sigmoid(reference_points)
+                reference_points = (layer_output[:,:,:4] + inverse_sig_ref_pts).sigmoid().detach()
+                bboxes = torch.cat((layer_output[:,:,:4] + inverse_sig_ref_pts, layer_output[:,:,4:] + inverse_sig_ref_pts),axis=-1).sigmoid()
+
+            if self.return_intermediate_dec:
+                intermediate.append(output)
+                intermediate_reference_points.append(reference_points)
+                intermediate_cls.append(cls)
+                intermediate_bboxes.append(bboxes)
+
+        if self.return_intermediate_dec:
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), torch.stack(intermediate_cls), torch.stack(intermediate_bboxes)
+        
+        return output[None], reference_points[None], cls[None], bboxes[None]
 
 class MLP(nn.Module):
     """ 

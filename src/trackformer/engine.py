@@ -11,37 +11,46 @@ import torch
 import cv2
 from pathlib import Path
 from tqdm import tqdm
+from ast import literal_eval
+import ffmpeg
+import time
+from skimage.measure import label
+import matplotlib.pyplot as plt
+
 from .util import data_viz
 from .util import misc as utils
 from .util import box_ops
 from .util import data_viz
 from .datasets.transforms import Normalize,ToTensor,Compose
-import ffmpeg
+
+def calc_loss_for_training_methods(outputs, targets, criterion):
+
+    outputs_split = {}
+    losses = {}
+    training_methods =  outputs['training_methods'] # dn_object, dn_track, dn_enc
+    outputs_split = {}
+
+    for training_method in training_methods:
+
+        target_TM = targets[0][training_method]
+        outputs_TM = utils.split_outputs(outputs,target_TM)
         
+        if training_method == 'main':
+            if 'two_stage' in outputs:
+                outputs_TM['two_stage'] = outputs['two_stage']
+                outputs_split['two_stage'] = outputs['two_stage']
+            if 'OD' in outputs:
+                outputs_TM['OD'] = outputs['OD']
+                outputs_split['OD'] = outputs['OD']
 
-def calc_loss_for_training_methods(training_method:str,
-                                   outputs,
-                                   groups,
-                                   targets,
-                                   criterion,
-                                   epoch,
-                                   args):
-    outputs_TM = {}
-    outputs_TM['aux_outputs'] = [{} for _ in range(len(outputs['aux_outputs']))]
+        outputs_split[training_method] = outputs_TM
+        
+        losses = criterion(outputs_TM, targets, losses, training_method)
 
-    # groups.append(groups[-1] + targets[0][training_method]['num_queries'])
-    num_queries = targets[0][training_method]['num_queries']
-    
-    if training_method == 'cur_target':
-        if 'enc_outputs' in outputs:
-            outputs_TM['enc_outputs'] = outputs['enc_outputs']
-
-    # outputs_TM = utils.split_outputs(outputs,groups[-2:],outputs_TM)
-    outputs_TM = utils.split_outputs(outputs,num_queries,outputs_TM)
-
-    loss_dict_TM = criterion(outputs_TM, targets, training_method, epoch)
-
-    return outputs_TM, loss_dict_TM, groups
+    outputs_split['prev_outputs'] = outputs['prev_outputs']
+    outputs_split['prev_prev_outputs'] = outputs['prev_prev_outputs']
+        
+    return outputs_split, losses
 
 def train_one_epoch(model: torch.nn.Module, 
                     criterion: torch.nn.Module,
@@ -55,70 +64,26 @@ def train_one_epoch(model: torch.nn.Module,
     model.train()
     criterion.train()
 
-    # model.eval()
-    # criterion.eval()
-
-    track_thresh = 0.1
-
-    ids = np.random.randint(0,len(data_loader),args.num_plots)
-    ids = np.concatenate((ids,[0]))
+    ids = np.concatenate(([0],np.random.randint(0,len(data_loader),args.num_plots)))
 
     metrics_dict = {}
 
     for i, (samples, targets) in enumerate(data_loader):
 
-        track = torch.rand(1).item() > track_thresh
-
-        # if track:
-        #     print(i)    
-
-        # print(f"{i}; track:{track}; {[target['cur_target']['image_id'] for target in targets]}")
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
 
-        outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,track,epoch=epoch)
+        outputs, targets, _, _, _ = model(samples,targets)
 
-        # del _
+        del _
+        torch.cuda.empty_cache()
 
-        if prev_outputs is not None:
-            for key in prev_outputs.keys():
-                if 'pred' in key:
-                    prev_outputs[key] = prev_outputs[key].cpu()
-
-        training_methods =  outputs['training_methods'] # dn_object, dn_track, dn_enc
-
-        meta_data = {}
-        groups = [0]
-
-        for training_method in training_methods:
-            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args)
-
-            meta_data[training_method] = {}
-            meta_data[training_method]['outputs'] = outputs_TM
-            meta_data[training_method]['loss_dict'] = loss_dict_TM
-
-        outputs = meta_data['cur_target']['outputs'] 
-        loss_dict = meta_data['cur_target']['loss_dict']
-
+        outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion)
+        
         weight_dict = criterion.weight_dict
 
-        loss_dict_keys = list(loss_dict.keys())
-
-        for training_method in training_methods:
-            if training_method == 'cur_target':
-                continue 
-            for loss_dict_key in loss_dict_keys:
-                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc','loss_mask_enc','loss_dice_enc'] or 'CoMOT' in loss_dict_key or loss_dict_key not in meta_data[training_method]['loss_dict']: # enc loss only calculated once since dn_track / dn_object will not affect
-                    continue
-                assert (loss_dict_key + '_' + training_method) in weight_dict.keys()
-                loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
-
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if 'mask' not in k)
-        
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys())
         loss_dict['loss'] = losses
-
-        # torch.set_printoptions(precision=32)
-        # print(losses)
 
         if not math.isfinite(losses.item()):
             print(f"Loss is {losses.item()}, stopping training")
@@ -137,27 +102,36 @@ def train_one_epoch(model: torch.nn.Module,
             for p,param_group in enumerate(optimizer.param_groups):
                 lr[0,p] = param_group['lr']
 
-        cur_targets = [target['cur_target'] for target in targets]
+        main_targets = [target['main']['cur_target'] for target in targets]
 
+        acc_dict = {}
         if targets[0]['track']:
-            acc_dict = utils.calc_track_acc(outputs,cur_targets,args)
+            acc_dict = utils.calc_track_acc(acc_dict,outputs['main'],main_targets,args)
+
+        if outputs['prev_prev_outputs'] is not None:
+            det_outputs = outputs['prev_prev_outputs']
+            det_targets = [target['main']['prev_prev_target'] for target in targets]
+        elif outputs['prev_outputs'] is not None:
+            det_outputs = outputs['prev_outputs']
+            det_targets = [target['main']['prev_target'] for target in targets]
         else:
-            acc_dict = utils.calc_bbox_acc(outputs,cur_targets,args)
+            det_outputs = outputs['main']
+            det_targets = main_targets
+
+        acc_dict = utils.calc_bbox_acc(acc_dict,det_outputs,det_targets,args)
+
+        if 'OD' in outputs:
+            OD_targets = [target['OD']['cur_target'] for target in targets]
+            acc_dict = utils.calc_bbox_acc(acc_dict,outputs['OD'],OD_targets,args,text='OD_L1_')
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i,lr)
 
-        dict_shape = metrics_dict['loss_ce'].shape
-        for metrics_dict_key in metrics_dict.keys():
-            if metrics_dict_key == 'lr':
-                continue
-            assert metrics_dict[metrics_dict_key].shape[:2] == dict_shape, 'Metrics needed to be added per epoch'
+        if (i in ids and (epoch % 5 == 0 or epoch == 1)) and args.data_viz:
+            data_viz.plot_results(outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args)
 
-        if i in ids and (epoch % 5 == 0 or epoch == 1):
-            data_viz.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args,meta_data=meta_data)
- 
         if i > 0 and (i % interval == 0 or i == len(data_loader) - 1):
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
-
+    
     return metrics_dict
 
 @torch.no_grad()
@@ -166,61 +140,48 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
     model.eval()
     criterion.eval()
     dataset = 'val'
-    ids = np.random.randint(0,len(data_loader),args.num_plots)
-    ids = np.concatenate((ids,[0]))
-
-    track_thresh = 0.1
+    ids = np.concatenate(([0],np.random.randint(0,len(data_loader),args.num_plots)))
 
     metrics_dict = {}
     for i, (samples, targets) in enumerate(data_loader):
          
-        track = torch.rand(1).item() > track_thresh
-
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
 
-        outputs, targets, _, _, _, prev_outputs = model(samples,targets,track=track,epoch=epoch)
+        outputs, targets, _, _, _ = model(samples,targets)
+        outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion)
 
-        training_methods = outputs['training_methods'] # dn_object, dn_track, dn_enc
-
-        meta_data = {}
-        groups = [0]
-
-        for training_method in training_methods:
-            outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, epoch, args)
-
-            meta_data[training_method] = {}
-            meta_data[training_method]['outputs'] = outputs_TM
-            meta_data[training_method]['loss_dict'] = loss_dict_TM
-
-        outputs = meta_data['cur_target']['outputs']
-        loss_dict = meta_data['cur_target']['loss_dict']
         weight_dict = criterion.weight_dict
-
-        loss_dict_keys = list(loss_dict.keys())
-
-        for training_method in training_methods:
-            if training_method == 'cur_target':
-                continue
-            for loss_dict_key in loss_dict_keys:
-                if loss_dict_key in ['loss_ce_enc','loss_bbox_enc','loss_giou_enc','loss_mask_enc','loss_dice_enc'] or 'CoMOT' in loss_dict_key or loss_dict_key not in meta_data[training_method]['loss_dict']: # enc loss only calculated once since dn_track / dn_object will not affect
-                    continue
-                loss_dict[loss_dict_key + '_' + training_method] = meta_data[training_method]['loss_dict'][loss_dict_key] 
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys())
         loss_dict['loss'] = losses
 
-        cur_targets = [target['cur_target'] for target in targets]
+        main_targets = [target['main']['cur_target'] for target in targets]
 
+        acc_dict = {}
         if targets[0]['track']:
-            acc_dict = utils.calc_track_acc(outputs,cur_targets,args)
+            acc_dict = utils.calc_track_acc(acc_dict,outputs['main'],main_targets,args)
+
+        if outputs['prev_prev_outputs'] is not None:
+            det_outputs = outputs['prev_prev_outputs']
+            det_targets = [target['main']['prev_prev_target'] for target in targets]
+        elif outputs['prev_outputs'] is not None:
+            det_outputs = outputs['prev_outputs']
+            det_targets = [target['main']['prev_target'] for target in targets]
         else:
-            acc_dict = utils.calc_bbox_acc(outputs,cur_targets,args)
+            det_outputs = outputs['main']
+            det_targets = main_targets
+
+        acc_dict = utils.calc_bbox_acc(acc_dict,det_outputs,det_targets,args)
+
+        if 'OD' in outputs:
+            OD_targets = [target['OD']['cur_target'] for target in targets]
+            acc_dict = utils.calc_bbox_acc(acc_dict,outputs['OD'],OD_targets,args,text='OD_L1_')
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
-        if i in ids and (epoch % 5 == 0 or epoch == 1):
-            data_viz.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args,meta_data=meta_data)
+        if i in ids and (epoch % 5 == 0 or epoch == 1) and args.data_viz:
+            data_viz.plot_results(outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args)
 
         if i > 0 and (i % interval == 0  or i == len(data_loader) - 1):
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
@@ -228,1283 +189,1010 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
     return metrics_dict
 
 
-
 @torch.no_grad()
 class pipeline():
-    def __init__(self,model, fps, device, output_dir, args, track=True, use_NMS=False, display_masks=False,display_all_aux_outputs=None):
+    def __init__(self,model, fps, args, display_all_aux_outputs=False):
+        
         self.model = model
-        self.model.tracking()
-
-        self.args = args
-        self.use_NMS = use_NMS
-        self.masks = display_masks and args.masks
-        self.eval_ctc = args.eval_ctc
-        self.output_dir = output_dir
         self.display_all_aux_outputs = display_all_aux_outputs
 
-        if not self.eval_ctc:
-            self.predictions_folder = 'predictions' 
-            (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
-
-            self.predictions_folder += '/track' if track else '/object_detection'
-            self.predictions_folder += '_mask' if self.masks else ''
-            self.predictions_folder += '_NMS' if self.use_NMS else ''
-
-            (self.output_dir / self.predictions_folder).mkdir(exist_ok=True)
-        else:
-            self.predictions_folder = ''
-
-        if args.hooks:
-            self.use_hooks = True
-            (self.output_dir / self.predictions_folder / 'attn_weight_maps').mkdir(exist_ok=True)
-        else:
-            self.use_hooks = False
-
-
-        self.normalize = Compose([
-            ToTensor(),
-            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-
-        self.threshold = 0.5
-        self.target_size = args.target_size
-
-        if isinstance(self.target_size[0],str):
-            string_joined = ''.join([str(s) for s in self.target_size if s.isdigit() or s == ','])
-            self.target_size = tuple(int(num) for num in string_joined.split(','))
-
-        self.num_queries = args.num_queries
-        self.device = device
-        self.use_dab = args.use_dab
-        self.two_stage = args.two_stage
+        # Make a new folder with CTC folder number
+        self.output_dir = args.output_dir / fps[0].parts[-2]
+        self.output_dir.mkdir(exist_ok=True)
 
         self.write_video = True
-        self.track = track
+
+        # Convert args into class attributes
+        self.args = args
+        self.target_size = args.target_size
+        self.num_queries = args.num_queries
+        self.device = args.device
+        self.masks = args.masks
+        self.use_dab = args.use_dab
+        self.two_stage = args.two_stage
+        self.return_intermediate_masks = args.return_intermediate_masks
+        self.track = args.tracking
+        self.all_videos_same_size = True
+
+        self.data_viz_folder = 'data_viz'
+        (self.output_dir / self.data_viz_folder).mkdir(exist_ok=True)
+
+        self.fps = fps
+        self.threshold = 0.5
+        self.mask_threshold = 0.5
+        self.alpha = 0.25
+
+        self.method = 'object_detection' if not self.track else 'track'
+
+        # Image needs to be normalized same as ResNet 
+        self.normalize = Compose([ToTensor(), Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+
+        # Get attention maps for self attention in deocder (too info for a full movie. only use this for a couple of frames)
+        self.use_hooks = False
+        if self.use_hooks:
+            (self.output_dir / self.data_viz_folder / 'attn_weight_maps').mkdir(exist_ok=True)
+
+        # Because target size is stored as a string within the yaml file, we have to convert it back into a number
+        if isinstance(self.target_size[0],str):
+            self.target_size = literal_eval(self.target_size)
 
         np.random.seed(1)
 
-        if self.track:
-            # self.colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)]) # Assume max 1000 cells in one chamber
-            # self.colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
-            # self.colors = np.array([[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.],[127.5,0.,0.],  
-            #                         [127.5,127.5,0.],[0.,127.5,0.],[0.,0.,127.5],[0.,127.5,127.5],[127.5,0.,127.5],[127.5,0.,0.],  
-            #                         [255.,127.5,0.],[0.,127.5,255.],[0.,255.,127.5],
-            #                         [255.,255.,127.5],[255.,127.5,255.],[127.5,255.,255.],
-            #                         [255.,127.5,127.5],[127.5,127.5,255.],[127.5,255.,127.5],
-            #                         [255.,255.,255.],[127.5,127.5,127.5]
-            #                         ])
-            pass
-            # self.all_colors = np.concatenate(([[255.,0.,0.]],np.concatenate(([self.colors for _ in range(100)]),axis=0)),axis=0)
-        else:
-            self.colors = np.array([tuple((np.zeros(3))) for _ in range(10000)])
-            
+        # Set colors; we set the first six colors as primary colors
         self.all_colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)])
         self.all_colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
-        self.all_colors = np.concatenate((
-                                          self.all_colors,
-                                          np.array([[127.5,127.5,0.],[0.,127.5,0.],[0.,0.,127.5],[0.,127.5,127.5],[127.5,0.,0.],[255.,127.5,255.],
-                                         [255.,127.5,0.],[127.5,255.,127.5],
-                                         [255.,255.,127.5],[127.5,127.5,255.],[50.,200,200],
-                                         [255.,127.5,127.5],[75,75,150.],[127.5,255.,255.],
-                                         [255.,255.,255.],[127.5,127.5,127.5]
-                                         ])))
+        self.all_colors = np.concatenate((self.all_colors, np.array([[127.5,127.5,0.],[0.,127.5,0.],[0.,0.,127.5],[0.,127.5,127.5],[127.5,0.,0.],[255.,127.5,255.],[255.,127.5,0.],[127.5,255.,127.5],[255.,255.,127.5],[127.5,127.5,255.],[50.,200,200],[255.,127.5,127.5],[75,75,150.],[127.5,255.,255.],[255.,255.,255.],[127.5,127.5,127.5]])))
 
         if args.two_stage:
-            # if not args.eval_ctc:
-            (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
-
-            final_fmap = np.array([self.target_size[0] // 32, self.target_size[1] // 32])
-            # TODO need to finish
-            self.enc_map = [np.zeros((final_fmap[0]*2**f,final_fmap[1]*2**f)) for f in range(args.num_feature_levels)][::-1]
-
-        self.oq_div = False # Can object queries detect divisions
-
-        # if not self.eval_ctc or self.display_all_aux_outputs is not None and self.display_all_aux_outputs:
-        #     self.display_decoder_aux = True
-        #     if self.display_decoder_aux:
-        #         (self.output_dir / self.predictions_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
-        #         self.num_decoder_frames = 1
-        #         if args.two_stage:
-        #             (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
-                    
-        # else:
-        #     self.display_decoder_aux = False          
-
-        self.display_decoder_aux = True
-        if self.display_decoder_aux:
-            (self.output_dir / self.predictions_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
-            self.num_decoder_frames = 1
-            if args.two_stage:
-                (self.output_dir / self.predictions_folder / 'enc_outputs').mkdir(exist_ok=True)
-
-        if self.eval_ctc:
-            self.display_object_query_boxes = False
+            (self.output_dir.parent / 'two_stage').mkdir(exist_ok=True)
+            (self.output_dir / self.data_viz_folder / 'two_stage').mkdir(exist_ok=True)
+            # final_fmap = np.array([self.target_size[0] // 32, self.target_size[1] // 32])
+            # self.enc_map = [np.zeros((final_fmap[0]*2**f,final_fmap[1]*2**f)) for f in range(args.num_feature_levels)][::-1]
+            self.enc_map = None
         else:
-            if self.two_stage:
-                self.display_object_query_boxes = False
-            else:
-                self.display_object_query_boxes = True
-
-        if self.display_object_query_boxes:
-            self.query_box_locations = [np.zeros((1,4)) for i in range(args.num_queries)]
-
-        self.fps_split = fps
-        self.videoname_list = []
+            self.query_box_locations = [np.zeros((0,4)) for i in range(args.num_queries)]
         
-        for fp in fps:
-            if isinstance(fp,list):
-                self.videoname_list.append(fp[0].parts[-2])
-            elif fp.parts[-2] not in self.videoname_list:
-                self.videoname_list.append(fp.parts[-2])
+        self.query_box_locations = [np.zeros((0,4)) for i in range(args.num_queries)]
 
-        if isinstance(self.fps_split[0],Path):
-            max_len = len(self.fps_split)
-            self.fps_split = [self.fps_split]
+        self.display_decoder_aux = True if args.dataset == 'moma' else False
+
+        if self.display_decoder_aux:
+            (self.output_dir / self.data_viz_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
+            # Number of deocder frames in a video to display (selected randomly)
+            self.num_decoder_frames = 1
+
+        img = PIL.Image.open(fps[0],mode='r')
+        self.color_stack = np.zeros((len(fps),img.size[1],img.size[0],3))
+
+        if np.max(img) < 2**8:
+            self.max_val = 255
+        elif np.max(img) < 2**12:
+            self.max_val = 2**12-1
         else:
-            max_len = max([len(fp_split) for fp_split in self.fps_split])
-
-        self.color_stack = np.zeros((max_len,self.target_size[0],self.target_size[1]*len(self.videoname_list),3))
-            
-    def update_query_box_locations(self,pred_boxes,keep,keep_div):
+            self.max_val = 2**16-1
+                    
+    def update_query_box_locations(self,pred_boxes):
         # This is only used to display to reference points for object queries that are detected
-        # Get x,y location of all detected object queries 
-        all_oq_boxes = pred_boxes[-self.num_queries:].cpu().numpy()
-        oq_boxes = all_oq_boxes[keep[-self.num_queries:],:4]
 
-        if keep_div[-self.num_queries:].sum():
-            oq_div_boxes = all_oq_boxes[keep_div[-self.num_queries:],4:]
-            oq_boxes = np.concatenate((oq_boxes,oq_div_boxes),axis=0)
+        oq_boxes = pred_boxes[self.object_indices,:4].cpu().numpy()
 
         oq_boxes[:,1::2] = np.clip(oq_boxes[:,1::2] * self.target_size[0], 0, self.target_size[0])
         oq_boxes[:,0::2] = np.clip(oq_boxes[:,::2] * self.target_size[1], 0, self.target_size[1])
 
-        oq_indices = keep[-self.num_queries:].nonzero()[0]
-        for oq_ind, oq_box in zip(oq_indices,oq_boxes):
+        oq_indices_norm = (self.object_indices - self.num_TQs)
+        for oq_ind, oq_box in zip(oq_indices_norm,oq_boxes):
             self.query_box_locations[oq_ind] = np.append(self.query_box_locations[oq_ind], oq_box[None],axis=0)
-
 
     def split_up_divided_cells(self):
 
-        self.div_track = -1 * np.ones((len(self.track_indices) + len(self.div_indices)),dtype=np.uint16) # keeps track of which cells were the result of cell division
-
+        self.div_track = -1 * np.ones((len(self.all_indices) + len(self.div_indices)),dtype=np.uint16) # keeps track of which cells were the result of cell division
+        nb_divs = 0
         for div_ind in self.div_indices:
-            ind = np.where(self.track_indices==div_ind)[0][0]
+            ind = np.where(self.all_indices==div_ind)[0][0]
 
             self.max_cellnb += 1             
             self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add daughter cellnb after mother cellnb
+            self.all_indices = np.concatenate((self.all_indices[:ind],self.all_indices[ind:ind+1],self.all_indices[ind:])) # order doesn't matter here since they are the same track indices
             self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:])) # order doesn't matter here since they are the same track indices
 
             self.div_track[ind:ind+2] = div_ind 
+            nb_divs += 1
 
-        self.new_cells = self.cells == 0
+        self.object_indices += nb_divs
+
+        # Used for data visualization; highlights cells that were detected, not tracked
+        if self.i > 0:
+            self.new_cells = self.cells == 0
 
         if 0 in self.cells:
             self.max_cellnb += 1   
             self.cells[self.cells==0] = np.arange(self.max_cellnb,self.max_cellnb+sum(self.cells==0),dtype=np.uint16)
             
-            assert np.max(self.cells) >= self.max_cellnb
+            # Update the max cellnb
             self.max_cellnb = np.max(self.cells)
 
-    def update_div_boxes(self,boxes,masks=None):
+    def update_div_boxes(self,pred_boxes,pred_masks=None):
         # boxes where div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
         unique_divs = np.unique(self.div_track[self.div_track != -1])
         for unique_div in unique_divs:
             div_ids = (self.div_track == unique_div).nonzero()[0]
-            boxes[div_ids[1],:4] = boxes[div_ids[0],4:]
+            pred_boxes[div_ids[1],:4] = pred_boxes[div_ids[0],4:]
             # e.g. [[15, 45, 16, 22, 14, 62, 15, 20]   -->  [[15, 45, 16, 22, 14, 62, 15, 20]   -->  [[15, 45, 16, 22]  --> fed to decoder
             #       [15, 45, 16, 22, 14, 62, 15, 20]]  -->   [14, 62, 15, 20, 14, 62, 15, 20]]  -->   [14, 62, 15, 20]]  --> fed to decoder
 
-            if masks is not None:
-                masks[div_ids[1],:1] = masks[div_ids[0],1:] 
+            if pred_masks is not None:
+                pred_masks[div_ids[1],:1] = pred_masks[div_ids[0],1:] 
 
-        return boxes, masks
+        return pred_boxes[:,:4], pred_masks[:,0]   
+    
+    def preprocess_img(self,fp):
 
-    def NMS(self, pred_boxes, keep, keep_div, pred_masks):
-        ''' Non-Max Suppresion'''
-        keep, keep_div = torch.tensor(keep), torch.tensor(keep_div)
-        ind_keep = torch.where(keep == True)[0]
-        track_keep = [i_keep for i_keep in ind_keep if i_keep < len(keep) - self.num_queries]
-        new_keep = [i_keep for i_keep in ind_keep if i_keep >= len(keep) - self.num_queries]
-        ind_div_keep = torch.where(keep_div == True)[0]
-        track_div_keep = [i_keep for i_keep in ind_div_keep if i_keep < len(keep) - self.num_queries]
+        self.img = cv2.imread(str(fp),cv2.IMREAD_ANYDEPTH)
+        ### This is the preprocessing when converting the CTC to COCO - maybe we want to chnage this for the future as 8 bti is less info than 16 bit
+        self.img = self.img / np.max(self.img)
+        self.img = (255 * self.img).astype(np.uint8)
+        ###
+        img = PIL.Image.fromarray(self.img)
+        self.img_size = img.size
+        
+        img_resized = img.resize((self.target_size[1],self.target_size[0])).convert('RGB')
 
-        track_boxes = torch.cat((pred_boxes[track_keep,:4],pred_boxes[track_div_keep,4:]),axis=0)
+        samples = self.normalize(img_resized)[0][None]
+        samples = samples.to(self.device)            
 
-        for ind in new_keep:
-            box = pred_boxes[ind,:4]
+        return samples
+    
+    def get_track_object_div_indices(self,pred_logits):
 
-            for track_box in track_boxes:
-                iou = utils.calc_iou(box,track_box)
+        N,_ = pred_logits.shape
+        self.num_TQs = N - self.num_queries
 
-                if iou > 0.5:
-                    keep[ind] = False
-                    break
+        keep = (pred_logits[:,0] > self.threshold)
+        keep_div = (pred_logits[:,1] > self.threshold)
+        keep_div[-self.num_queries:] = False # disregard any divisions predicted by object queries; model should have learned not to do this anyways
+        keep_div[~keep] = False
+            
+        all_indices = keep.nonzero()[0] # Get query indices (object or track) where a cell was detected / tracked; this is used to create track queries for next  frame
+        track_indices = np.array([ind for ind in all_indices if ind < self.num_TQs],dtype=int)
+        object_indices = np.array([ind for ind in all_indices if ind >= self.num_TQs],dtype=int)
+        div_indices = keep_div.nonzero()[0] # Get track query indices where a cell division was tracked; object queries should not be able to detect divisions
 
-        track_ious = torch.triu(box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(track_boxes),box_ops.box_cxcywh_to_xyxy(track_boxes),return_iou_only=True),diagonal=1)
+        return all_indices, track_indices, object_indices, div_indices
+    
+    def post_process_masks(self,masks,boxes):
 
-        topk_nonself_matches = torch.where(track_ious > 0.5)
+        # Resize mask to original size
+        masks = cv2.resize(np.transpose(masks.cpu().numpy(),(1,2,0)),self.img_size) # regardless of cropping / resize, segmentation is 2x smaller than the original image                                
+        masks = masks[:,:,None] if masks.ndim == 2 else masks # cv2.resize will drop last dim if it is 1
+        masks = np.transpose(masks,(-1,0,1))
 
-        if len(topk_nonself_matches[0] > 0):
-            for midx in range(len(topk_nonself_matches[0])):
-                box_1_ind = topk_nonself_matches[0][midx]
-                box_2_ind = topk_nonself_matches[1][midx]
+        # Get max pixel value across all segmentations and then threshold
+        masks_filt = np.zeros((masks.shape))
+        argmax = np.argmax(masks,axis=0)
+        for m in range(masks.shape[0]):
+            masks_filt[m,argmax==m] = masks[m,argmax==m]
+            
+        masks = masks_filt > self.mask_threshold
 
-                if box_1_ind < len(track_keep) and box_2_ind < len(track_keep):
-                    if pred_masks is not None: # here we pick the track query that has a matching mask; if mask is incorrect, then bbox is probably incorrect
-                        mask_1 = pred_masks[track_keep[box_1_ind],0]
-                        mask_2 = pred_masks[track_keep[box_2_ind],0]
+        # If a mask has no area, we remove it regardless of the bounding box prediction
+        keep_all_cells = np.ones(len(self.all_indices),dtype=bool)
+        keep_track_cells = np.ones(len(self.track_indices),dtype=bool)
+        keep_object_cells = np.ones(len(self.object_indices),dtype=bool)
+        keep_div_cells = np.ones(len(self.div_indices),dtype=bool)
 
-                        if (mask_1 > 0.5).sum() == 0:
-                            keep[track_keep[box_1_ind]] = False
-                            keep_div[track_keep[box_1_ind]] = False
-                            continue
-                        elif (mask_2 > 0.5).sum() == 0:
-                            keep[track_keep[box_2_ind]] = False
-                            keep_div[track_keep[box_2_ind]] = False
-                            continue
+        # Keep largest segmentation per mask by area; we don't want multiple objects/cells/segmentations per mask; assume the largets is correct
+        for m,mask in enumerate(masks):
+            if mask.sum() > 0:
+                # label each segmentation for a mask
+                label_mask = label(mask)
+                labels = np.unique(label_mask)
+                labels = labels[labels != 0]
 
-                        mask_1_where = torch.where(mask_1 > 0.5)
-                        min_y_1, max_y_1 = mask_1_where[0].min(), mask_1_where[0].max() 
-                        min_x_1, max_x_1  = mask_1_where[1].min(), mask_1_where[1].max()
-                        height_1 = max_y_1 - min_y_1
-                        width_1 = max_x_1 - min_x_1
-                        center_y_1 = height_1 / 2 + min_y_1
-                        center_x_1 = width_1 / 2 + min_x_1
+                # Find largest segmentation and remove all other segmentations 
+                largest_ind = np.argmax(np.array([label_mask[label_mask == label].sum() for label in labels]))
+                new_mask = np.zeros_like(mask,dtype=bool)
+                new_mask[label_mask == labels[largest_ind]] = True
+                masks[m] = new_mask
 
-                        mask_1_box = torch.tensor([[center_x_1,center_y_1,width_1,height_1]],device=self.device)
-                        mask_1_box[:,::2] = mask_1_box[:,::2] / mask_1.shape[-1]
-                        mask_1_box[:,1::2] = mask_1_box[:,1::2] / mask_1.shape[-2]
+            else: # Embedding was predicted to be a cell but there is no cell mask so we remove it
+                keep_all_cells[m] = False # Remove track/object index
 
-                        mask_2_where = torch.where(mask_2 > 0.5)
-                        min_y_2, max_y_2 = mask_2_where[0].min(), mask_2_where[0].max() 
-                        min_x_2, max_x_2  = mask_2_where[1].min(), mask_2_where[1].max()
-                        height_2 = max_y_2 - min_y_2
-                        width_2 = max_x_2 - min_x_2
-                        center_y_2 = height_2 / 2 + min_y_2
-                        center_x_2 = width_2 / 2 + min_x_2
+                # Update track and object queries
+                if self.all_indices[m] < self.num_TQs:
+                    keep_track_cells[m] = False
+                else:
+                    keep_object_cells[m - len(self.track_indices)] = False
+                    assert len(self.all_indices) - len(self.object_indices) == len(self.track_indices)
 
-                        mask_2_box = torch.tensor([[center_x_2,center_y_2,width_2,height_2]],device=self.device)
-                        mask_2_box[:,::2] = mask_2_box[:,::2] / mask_2.shape[-1]
-                        mask_2_box[:,1::2] = mask_2_box[:,1::2] / mask_2.shape[-2]
+                index = self.all_indices[self.cells == self.cells[m]][0]
+        
+                # If cell was part of division, we need to change it from cell division to regular tracking
+                if index in self.div_indices:          
 
-                        iou_1 = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(track_boxes[box_1_ind]),box_ops.box_cxcywh_to_xyxy(mask_1_box),return_iou_only=True)
-                        iou_2 = box_ops.generalized_box_iou(box_ops.box_cxcywh_to_xyxy(track_boxes[box_2_ind]),box_ops.box_cxcywh_to_xyxy(mask_2_box),return_iou_only=True)
+                    keep_div_cells[self.div_indices == index] = False # Remove division indiex
 
-                        if iou_1 > iou_2:
-                            keep[track_keep[box_2_ind]] = False
-                            keep_div[track_keep[box_2_ind]] = False
-                        else:
-                            keep[track_keep[box_1_ind]] = False
-                            keep_div[track_keep[box_1_ind]] = False
+                    self.div_track[self.div_track == index] = -1
 
-                    else: # without masks, it is impossible to tell which is correct
-                        keep[track_keep[box_2_ind]] = False
-                        keep_div[track_keep[box_2_ind]] = False
-                elif box_1_ind < len(track_keep) and box_2_ind >= len(track_keep): # track query and div overlap
-                    keep_div[track_div_keep[box_2_ind - len(track_keep)]] = False
-                elif box_2_ind < len(track_keep) and box_1_ind >= len(track_keep): # track query and div overlap
-                    keep_div[track_div_keep[box_1_ind - len(track_keep)]] = False
-                elif box_1_ind > len(track_keep) and box_1_ind > len(track_keep): # div query and div overlap
-                    keep_div[track_div_keep[box_2_ind - len(track_keep)]] = False
+                    # Since there is no division, update other divided cell with the mother number since it is just being tracked
+                    if index < self.num_TQs and self.prevcells[index] not in self.cells:
+                        other_div_cell = self.cells[(self.div_track == index) * (self.cells != self.cells[m])]
+                        self.cells[self.cells == other_div_cell] = self.prevcells[index]
+                    else:
+                        a=0
+                            
 
-        return keep.numpy(), keep_div.numpy()
+        self.cells = self.cells[keep_all_cells]
+        self.all_indices = self.all_indices[keep_all_cells]
+
+        self.track_indices = self.track_indices[keep_track_cells]
+        self.object_indices = self.object_indices[keep_object_cells]
+
+        self.div_indices = self.div_indices[keep_div_cells]
+        self.div_track = self.div_track[keep_all_cells]
+
+        masks = masks[keep_all_cells]
+        boxes = boxes[keep_all_cells]
+
+        self.num_TQs -= (~keep_track_cells).sum()
+
+        return masks, boxes
+    
+    def reset_vars(self):
+                
+        self.all_indices = None
+        self.track_indices = None
+        self.object_indices = None
+        self.div_track = -1 * np.ones(len(self.cells),dtype=np.uint16)
+        self.new_cells = None
 
     def forward(self):
-        for r,fps_ROI in enumerate(self.fps_split):
-            print(self.videoname_list[r])
-            print(f'video {r+1}/{len(self.fps_split)}')
 
-            self.max_cellnb = 0
-            targets = None
-            prev_features = None
+        print(f'video {self.fps[0].parts[-2]}')
+        
+        if self.display_decoder_aux:
+            random_nbs = np.random.choice(np.arange(1,len(self.fps)),self.num_decoder_frames)
+            random_nbs = np.concatenate((random_nbs,random_nbs+1)) # so we can see two consecutive frames
 
-            if self.eval_ctc:
-                ctc_data = None
-            
-            if self.display_decoder_aux:
-                random_nbs = np.random.choice(np.arange(1,len(fps_ROI)),self.num_decoder_frames)
-                random_nbs = np.concatenate((random_nbs,random_nbs+1)) # so we can see two consecutive frames
+        ctc_data = np.zeros((0,4))
 
-            for i, fp in enumerate(tqdm(fps_ROI)):
+        targets = [{'main': {'cur_target':{}}}]
+        self.max_cellnb = 0
+        self.cells = np.zeros((0))
 
-                if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
-                    dec_attn_outputs = []
-                    # hooks = [self.model.decoder.layers[0].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)),
-                    #     self.model.decoder.layers[-1].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output))]
-                    hooks = [self.model.decoder.layers[layer_index].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)) for layer_index in range(len(self.model.decoder.layers))]
+        for i, fp in enumerate(tqdm(self.fps)):
 
+            self.reset_vars()
+            self.fp = fp
+            self.i = i
 
-                img = cv2.imread(str(fp),cv2.IMREAD_ANYDEPTH)
-                img_dtype = img.dtype
-                img_shape = img.shape
-                if img_dtype == 'uint16':
-                    img = ((img - np.min(img)) / np.ptp(img))
-                    img = cv2.resize(img,(self.target_size[1],self.target_size[0]))
-                    img = (255 * img).astype(np.uint8)
-                    img = PIL.Image.fromarray(img).convert('RGB')
+            # This will display self attention map for deocder for all layer for self.num_decoder_frames
+            if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
+                dec_attn_outputs = []
+                hooks = [self.model.decoder.layers[layer_index].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)) for layer_index in range(len(self.model.decoder.layers))]
+
+            samples = self.preprocess_img(fp)
+
+            with torch.no_grad():
+                outputs, targets, _, _, _ = self.model(samples,targets=targets)                
+
+            pred_logits = outputs['pred_logits'][0].sigmoid().cpu().numpy()
+
+            self.all_indices, self.track_indices, self.object_indices, self.div_indices = self.get_track_object_div_indices(pred_logits)
+
+            # Keep track of cell numbers from the previous frame that correspond to the track queries
+            self.prevcells = np.copy(self.cells)
+            self.cells = np.zeros((len(self.all_indices)),dtype=np.uint16)
+
+            if len(self.all_indices) > 0:
+
+                # Update cell numbers with track queries that were successfully tracked
+                self.cells[:len(self.track_indices)] = self.prevcells[self.track_indices]
+
+                # Indices for track queries that divide are duplicated since there are two cells for one query
+                self.split_up_divided_cells()
+
+                # Get predicted boxes and masks
+                boxes = outputs['pred_boxes'][0][self.all_indices] # For div_indices, the boxes will be repeated and will properly updated below
+
+                if self.masks:
+                    masks = outputs['pred_masks'][0].sigmoid()[self.all_indices]
+
+                # Track queries that were predicted to be divisions need to split into separate boxes/masks
+                boxes, masks = self.update_div_boxes(boxes,masks)
+
+                # post-process mask; need to get max pixel value across all segmentations and then threshold into a binary mask
+                if self.masks:
+                    masks, boxes = self.post_process_masks(masks, boxes)
+
+                # 'hs_embed' is used as the content embedding for the track queries
+                targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.all_indices] # For div_indices, hs_embeds will be the same; no update
+
+                # 'track_query_boxes' are used as the positional embeddings for the track queries
+                # You can use the bounding box or mask as a positional embedding; default is to use the mask
+                if self.args.init_boxes_from_masks:
+                    boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks),cxcywh=True).to(self.device)
+                    targets[0]['main']['cur_target']['track_query_boxes'] = boxes_encoded_from_masks
                 else:
-                    img = PIL.Image.open(fp,mode='r')
-                    img_shape = img.size
-                    img = img.resize((self.target_size[1],self.target_size[0])).convert('RGB')
+                    targets[0]['main']['cur_target']['track_query_boxes'] = boxes
 
-                if i > 0:
-                    if img_dtype == 'uint16':
-                        previmg = cv2.imread(str(fps_ROI[i-1]),cv2.IMREAD_ANYDEPTH)
-                        previmg = ((previmg - np.min(previmg)) / np.ptp(previmg))
-                        previmg = cv2.resize(previmg,(self.target_size[1],self.target_size[0]))
-                        previmg = (255 * previmg).astype(np.uint8)
-                        previmg = PIL.Image.fromarray(previmg).convert('RGB')
-                    else:
-                        previmg = PIL.Image.open(fps_ROI[i-1],mode='r').resize((self.target_size[1],self.target_size[0])).convert('RGB') if i > 0 else None # saved for analysis later
+                boxes = boxes.cpu().numpy()
 
-                samples = self.normalize(img)[0][None]
-                samples = samples.to(self.device)
-
-                if not self.track: # If object detction only, we don't feed information from the previous frame
-                    targets = None
-                    self.max_cellnb = 0
-                    prev_features = None
-
-                with torch.no_grad():
-                    outputs, targets, prev_features, memory, hs, _ = self.model(samples,targets=targets,prev_features=prev_features)
-
-                if targets is None:
-                    targets = [{'cur_target':{}}]
-
-                pred_logits = outputs['pred_logits'][0].sigmoid().detach().cpu().numpy()
-                pred_boxes = outputs['pred_boxes'][0].detach()
-
-                keep = (pred_logits[:,0] > self.threshold)
-                keep_div = (pred_logits[:,1] > self.threshold)
-                keep_div[-self.num_queries:] = False # disregard any divisions predicted by object queries; model should have learned not to do this anyways
-                keep_div[~keep] = False
-
-                if self.use_NMS and len(keep) > self.num_queries:
-                    if 'pred_masks' in outputs:
-                        pred_masks = outputs['pred_masks'][0].sigmoid().detach()
-                    else:
-                        pred_masks = None
-
-                    keep, keep_div = self.NMS(pred_boxes, keep, keep_div,pred_masks)
-
-                if i > 0:
-                    prevcells = np.copy(self.cells)
-
-                self.cells = np.zeros((keep.sum()),dtype=np.uint16)
+                assert boxes.shape[0] == len(self.cells)
+            else:
+                boxes = None
                 masks = None
 
-                # If no objects are detected, skip
-                if self.display_object_query_boxes and keep[-self.num_queries:].sum() > 0:
-                    self.update_query_box_locations(pred_boxes,keep,keep_div)
-
-                if sum(keep) > 0:
-                    self.track_indices = keep.nonzero()[0] # Get query indices (object or track) where a cell was detected / tracked; this is used to create track queries for next  frame
-                    self.div_indices = keep_div.nonzero()[0] # Get track query indices where a cell division was tracked; object queries should not be able to detect divisions
-
-                    if pred_logits.shape[0] > self.num_queries: # If track queries are fed to the model
-                        tq_keep = keep[:len(prevcells)]
-                        self.cells[:sum(tq_keep)] = prevcells[tq_keep]
-                    else:
-                        prevcells = None
-
-                    self.split_up_divided_cells()
-
-                    targets[0]['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.track_indices] # For div_indices, hs_embeds will be the same; no update
-                    boxes = pred_boxes[self.track_indices] # For div_indices, the boxes will be repeated and will properly updated below
-
-                    if self.masks:
-                        masks = outputs['pred_masks'][0,self.track_indices].sigmoid().detach()
-
-                    boxes,masks = self.update_div_boxes(boxes,masks)
-                    boxes = boxes[:,:4] # only one cell is tracked at a time
-        
-                    if masks is not None: # gets rid of the division mask which we rearrange above
-                        masks = masks[:,0]
-
-                    if self.args.init_boxes_from_masks:
-                        h, w = masks.shape[-2:]
-
-                        mask_boxes = utils.mask_to_bbox(masks > 0.5)
-
-                        # mask_boxes = box_ops.masks_to_boxes(masks > 0.5).cuda()
-                        # mask_boxes = box_ops.box_xyxy_to_cxcywh(mask_boxes) / torch.as_tensor([w, h, w, h],dtype=torch.float,device=self.device)
-                        targets[0]['cur_target']['track_query_boxes'] = mask_boxes
-
-                        if self.args.iterative_masks:
-                            track_query_masks = torch.cat((masks[:,None],torch.zeros_like(masks[:,None])),axis=1)
-                            targets[0]['cur_target']['track_query_masks'] = track_query_masks
-
-                            assert track_query_masks.shape[0] == boxes.shape[0]
-                            assert track_query_masks.shape[0] == outputs['hs_embed'][0,self.track_indices].shape[0]
-
-                    else:
-                        targets[0]['cur_target']['track_query_boxes'] = boxes
-
-                    if i == 0: # self.new_cells is used to visually highlight errors specifically for the mother machine. This is because no new cells will ever appear so I know this is an erorr
-                        self.new_cells = None
-
-                else:
-                    self.track_indices = None
-                    self.div_track = None
-                    if prevcells is not None:
-                        self.div_track = -1 * np.ones(len(prevcells),dtype=np.uint16)
-                    else:
-                        self.div_track = np.ones(0,dtype=np.uint16)
-                    boxes = None
-                    self.new_cells = None
-                    # prevcells = None
-                    masks = None
-
-                    targets = None
-
-
-                if boxes is not None: # No cells
-                    assert boxes.shape[0] == len(self.cells)
-
-                if self.track:
-                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.all_colors[self.cells-1],self.div_track,self.new_cells)
-                else:
-                    color_frame = utils.plot_tracking_results(img,boxes,masks,self.all_colors[:len(self.cells)],self.div_track,None)
-
-                color_frame = cv2.putText(
-                    color_frame,
-                    text = f'{i:03d}', 
-                    org=(0,10), 
-                    fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                    fontScale = 0.4,
-                    color = (255,255,255),
-                    thickness=1,
-                    )
-
-                self.color_stack[i,:,r*self.target_size[1]:(r+1)*self.target_size[1]] = color_frame         
-
-                if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
-                    for hook in hooks:
-                        hook.remove()
-
-                    scale = 1
-
-                    for layer_index, dec_attn_output in enumerate(dec_attn_outputs):
-                        dec_attn_weight_maps = dec_attn_output[1].cpu().numpy() # [output, attention_map]
-                        num_cols, num_rows = dec_attn_weight_maps.shape[-2:]
-                        num_heads = 1 if dec_attn_weight_maps.ndim == 3 else dec_attn_weight_maps.shape[1]
-                        dec_attn_weight_maps = np.repeat(dec_attn_weight_maps[...,None],3,axis=-1)
-                        for dec_attn_weight_map in dec_attn_weight_maps: # per batch
-                            for h in range(num_heads):
-                                if num_heads > 1:
-                                    dec_attn_weight_map_h = dec_attn_weight_map[h]
-                                else:
-                                    h = 'averaged'
-                                    dec_attn_weight_map_h = dec_attn_weight_map
-                                dec_attn_weight_map_color = np.zeros((num_cols+1,num_rows+1,3))
-                                dec_attn_weight_map_color[-num_cols:,-num_rows:] = dec_attn_weight_map_h
-                                # dec_attn_weight_map_color = ((dec_attn_weight_map_color / np.max(dec_attn_weight_map_color)) * 255).astype(np.uint8)
-                                dec_attn_weight_map_color = (dec_attn_weight_map_color * 255).astype(np.uint8)
-
-                                for tidx in range(len(keep) - self.num_queries):
-                                    dec_attn_weight_map_color[tidx+1,0] = self.all_colors[prevcells[tidx]-1]
-                                    dec_attn_weight_map_color[0,tidx+1] = self.all_colors[prevcells[tidx]-1]                                
-
-                                # color Track queries only
-                                if False:
-                                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_weight_map_{fp.stem}_layer_{layer_index}_head_{h}.png')),dec_attn_weight_map_color_resize)
-
-                                for q in range(len(keep) - self.num_queries,len(keep)):
-                                    dec_attn_weight_map_color[q+1,0] = self.all_colors[-q]
-                                    dec_attn_weight_map_color[0,q+1] = self.all_colors[-q]
-                                
-                                cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_map_{fp.stem}_layer_{layer_index}_head_{h}.png')),dec_attn_weight_map_color)
-
-                            if num_heads > 1:
-                                dec_attn_weight_map_avg = (dec_attn_weight_map.mean(0) * 255).astype(np.uint8)
-
-                                dec_attn_weight_map_avg_color = dec_attn_weight_map_color
-                                dec_attn_weight_map_avg_color[-num_cols:,-num_rows:] = dec_attn_weight_map_avg
-
-                                cv2.imwrite(str(self.output_dir / self.predictions_folder / 'attn_weight_maps' / (f'self_attn_map_{fp.stem}_layer_{layer_index}_head_averaged.png')),dec_attn_weight_map_avg_color)
-
-                if self.eval_ctc:
-
-                    mask_threshold = 0.5
-
-                    if sum(keep) > 0:
-                        # Convert tensor to numpy and resize array to target size
-                        masks = masks.cpu().numpy()
-                        masks = np.transpose(masks,(1,2,0))
-                        masks = cv2.resize(masks,img_shape)
-                        if masks.ndim == 2: # cv2.resize will drop last dim if it is 1
-                            masks = masks[:,:,None]
-                        masks = np.transpose(masks,(-1,0,1))
-
-                        masks_filt = np.zeros((masks.shape))
-                        argmax = np.argmax(masks,axis=0)
-                        
-                        for m in range(masks.shape[0]):
-                            masks_filt[m,argmax==m] = masks[m,argmax==m]
-                            
-                        masks_filt = masks_filt > mask_threshold
-
-                        mask = np.zeros(masks.shape[-2:],dtype=np.uint16)
-                        
-                        for m, cell in enumerate(self.cells):
-                            if masks_filt[m].sum() > 0:
-                                mask[masks_filt[m] > 0] = cell
-                            else: # Embedding was predicted to be a cell but therer is no cell mask so we remove it
-                                keep_cells = self.cells != cell
-                                track_ind = self.track_indices[~keep_cells][0]
-                          
-                                if track_ind in self.div_indices:          
-                                    keep_div[track_ind] = False
-                                    self.div_indices = self.div_indices[self.div_indices != track_ind]
-
-                                    other_div_cell = self.cells[(self.div_track == track_ind) * (keep_cells)]
-
-                                    self.div_track[self.div_track == track_ind] = -1
-                                    self.cells[self.cells == other_div_cell] = prevcells[track_ind]
-                                
-                                self.cells = self.cells[keep_cells]
-                                keep[track_ind] = False
-                                self.track_indices = self.track_indices[keep_cells]
-                                self.div_track = self.div_track[keep_cells]
-
-                                targets[0]['cur_target']['track_query_hs_embeds'] = targets[0]['cur_target']['track_query_hs_embeds'][keep_cells]
-                                targets[0]['cur_target']['track_query_boxes'] = targets[0]['cur_target']['track_query_boxes'][keep_cells]
-
-                                if 'track_query_masks' in targets[0]['cur_target']:
-                                    targets[0]['cur_target']['track_query_masks'] = targets[0]['cur_target']['track_query_masks'][keep_cells]
-
-                        mask_cells = np.unique(mask)
-                        mask_cells = mask_cells[mask_cells != 0]
-
-                    if ctc_data is None:
-                        ctc_data = []
-                        for cell in self.cells:
-                            ctc_data.append(np.array([cell,i,i,0]))
-                        ctc_data = np.stack(ctc_data)
-                        ctc_cells = np.copy(self.cells)
-                    else:
-                        max_cellnb = ctc_data.shape[0]
-
-                        ctc_cells_new = np.copy(self.cells)
-                        mask_copy = np.copy(mask)
-
-                        if prevcells is not None:
-                            for c,cell in enumerate(prevcells):
-                                if cell in self.cells:
-                                    ctc_cell = ctc_cells[c]
-                                    if self.div_track[self.cells == cell] != -1:
-                                        div_ind = self.div_track[self.cells == cell]
-                                        div_cells = self.cells[self.div_track == div_ind]
-                                        max_cellnb += 1
-                                        new_cell_1 = np.array([max_cellnb,i,i,ctc_cell])[None]
-                                        ctc_cells_new[self.cells == div_cells[0]] = max_cellnb 
-                                        mask[mask_copy == div_cells[0]] = max_cellnb
-                                        max_cellnb += 1
-                                        new_cell_2 = np.array([max_cellnb,i,i,ctc_cell])[None]
-                                        ctc_data = np.concatenate((ctc_data,new_cell_1,new_cell_2),axis=0)
-                                        ctc_cells_new[self.cells == div_cells[1]] = max_cellnb
-                                        mask[mask_copy == div_cells[1]] = max_cellnb
-                                        assert div_cells[0] in mask_copy and div_cells[1] in mask_copy
-
-                                    else:
-                                        ctc_data[ctc_cell-1,2] = i
-                                        ctc_cells_new[self.cells == cell] = ctc_cells[prevcells == cell]
-                                        mask[mask_copy == cell] = ctc_cell
-                                        assert cell in mask_copy
-
-                        for c,cell in enumerate(self.cells):
-                            if prevcells is None or cell not in prevcells and self.div_track[c] == -1:
-                                max_cellnb += 1
-                                new_cell = np.array([max_cellnb,i,i,0])
-                                ctc_data = np.concatenate((ctc_data,new_cell[None]),axis=0)
-
-                                ctc_cells_new[self.cells == cell] = max_cellnb     
-                                mask[mask_copy == cell] = max_cellnb
-
-                        ctc_cells = ctc_cells_new
-
-                    cv2.imwrite(str(self.output_dir / self.predictions_folder / f'mask{i:03d}.tif'),mask)
-                            
-
-                if ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
-
-                    if 'enc_outputs' in outputs:
-                        enc_frame = np.array(img).copy()
-                        enc_outputs = outputs['enc_outputs']
-                        logits_topk = enc_outputs['pred_logits'][0,:,0].sigmoid()
-                        boxes_topk = enc_outputs['pred_boxes'][0]
-                        topk_proposals = enc_outputs['topk_proposals'][0]
-
-                        enc_colors = np.array([(np.array([0.,0.,0.])) for _ in range(self.num_queries)])
-                        used_object_queries = torch.where(outputs['pred_logits'][0,-self.num_queries:,0].sigmoid() > self.threshold)[0].sort()[0]
-                        num_tracked_cells = len(self.cells) - len(used_object_queries)
-
-                        if self.track:
-                            if len(used_object_queries) > 0:
-                                counter = 0
-                                for pidx in used_object_queries:
-                                        enc_colors[pidx] = self.all_colors[self.cells[num_tracked_cells+counter]-1]
-                                        counter += 1
-                            else:
-                                enc_colors = np.array([tuple((255*np.random.random(3))) for _ in range(logits_topk.shape[0])])
-                        else:
-                            enc_colors[:len(self.cells)] = self.all_colors[self.cells-1]
-
-                        t0,t1,t2,t3 = 0.1,0.3,0.5,0.8
-                        boxes_list = []
-                        boxes_list.append(boxes_topk[logits_topk > t3])
-                        boxes_list.append(boxes_topk[(logits_topk > t2) * (logits_topk < t3)])
-                        boxes_list.append(boxes_topk[(logits_topk > t1) * (logits_topk < t2)])
-                        boxes_list.append(boxes_topk[(logits_topk > t0) * (logits_topk < t1)])
-                        boxes_list.append(boxes_topk[logits_topk < t0])
-
-                        num_per_box = [box.shape[0] for box in boxes_list]
-                        all_enc_boxes = []
-                        enc_frames = []
-                        for b,boxes in enumerate(boxes_list):
-                            enc_frame = np.array(img).copy()
-                            enc_frames.append(utils.plot_tracking_results(enc_frame,boxes,None,enc_colors[sum(num_per_box[:b]):sum(num_per_box[:b+1])],None,None))
-                            all_enc_boxes.append(boxes[sum(num_per_box[:b]):sum(num_per_box[:b+1])])
-                        
-                        enc_frame = np.array(img).copy()
-                        all_enc_boxes = torch.cat(boxes_list)
-                        all_enc_boxes = torch.cat((all_enc_boxes[np.sum(enc_colors,-1) == 0],all_enc_boxes[np.sum(enc_colors,-1) > 0]))
-                        enc_colors = np.concatenate((enc_colors[np.sum(enc_colors,-1) == 0],enc_colors[np.sum(enc_colors,-1) > 0]))
-                        enc_frames.append(utils.plot_tracking_results(enc_frame,all_enc_boxes,None,enc_colors,None,None))
-
-                        if len(used_object_queries) > 0:
-                            enc_colors = np.array([(np.array([0.,0.,0.])) for _ in range(self.num_queries)])
-                            enc_frames.append(utils.plot_tracking_results(enc_frame,all_enc_boxes,None,enc_colors,None,None))
-
-                        enc_frames = np.concatenate((enc_frames),axis=1)
-
-                        cv2.imwrite(str(self.output_dir / self.predictions_folder / 'enc_outputs' / (f'encoder_frame_{fp.stem}.png')),enc_frames)
-
-                        if self.enc_map is not None:
-                            #TODO update for future
-                            proposals_img = np.array(img)
-                            spatial_shapes = enc_outputs['spatial_shapes']
-
-                            fmaps_cum_size = torch.tensor([spatial_shape[0] * spatial_shape[1] for spatial_shape in spatial_shapes]).cumsum(0)
-
-                            proposals = topk_proposals[enc_outputs['pred_logits'][0,:,0].sigmoid() > 0.5].clone().cpu()
-                            topk_proposals = topk_proposals.cpu()
-
-                            for proposal in proposals:
-                                proposal_ind = torch.where(topk_proposals == proposal)[0][0]
-                                f = 0
-                                fmap = fmaps_cum_size[f]
-                                proposal_clone = proposal.clone()
-
-                                while proposal_clone >= fmap and f < len(fmaps_cum_size) - 1:
-                                    f += 1 
-                                    fmap = fmaps_cum_size[f]
-
-                                if f > 0:
-                                    proposal_clone -= fmaps_cum_size[f-1]
-
-                                y = torch.floor_divide(proposal_clone,spatial_shapes[f,1])
-                                x = torch.remainder(proposal_clone,spatial_shapes[f,1])
-
-                                self.enc_map[f][y,x] += 1
-                                
-                                small_mask = np.zeros(spatial_shapes[f].cpu().numpy(),dtype=np.uint8)
-                                small_mask[y,x] += 1
-
-                                resize_mask = cv2.resize(small_mask,self.target_size[::-1])
-
-                                y, x = np.where(resize_mask == 1)
-
-                                X = np.min(x) 
-                                Y = np.min(y)
-                                width = (np.max(x) - np.min(x)) 
-                                height = (np.max(y) - np.min(y)) 
-
-                                if len(used_object_queries) > 0:
-                                    proposals_img = cv2.rectangle(proposals_img,(X,Y),(int(X+width),int(Y+height)),color=self.all_colors[self.cells[self.track_indices == proposal_ind]-1],thickness=1)
-                                else:
-                                    proposals_img = cv2.rectangle(proposals_img,(X,Y),(int(X+width),int(Y+height)),color=enc_colors[proposal == topk_proposals][0],thickness=1)
-
-
-                            cv2.imwrite(str(self.output_dir / self.predictions_folder / 'enc_outputs' / (f'encoder_frame_{fp.stem}_proposals.png')),proposals_img)
-
-                    references = outputs['references'].detach()
-
-                    if references.shape[-1] == 2:
-                        assert self.args.use_dab == False
-                        references = torch.cat((references, torch.zeros(references.shape[:-1] + (6,),device=references.device)),axis=-1)
-
-                    aux_outputs = outputs['aux_outputs'] # output from the intermedaite layers of decoder
-                    aux_outputs = [{'pred_boxes':references[0]}] + aux_outputs # add the initial anchors / reference points
-                    aux_outputs.append({'pred_boxes':outputs['pred_boxes'].detach(),'pred_masks':outputs['pred_masks'].detach(),'pred_logits':outputs['pred_logits'].detach()}) # add the last layer of the decoder which is the final prediction
-
-                    img = np.array(img)
-
-                    cells_exit_ids = torch.tensor([[cidx,c] for cidx,c in enumerate(prevcells.astype(np.int64)) if c not in self.cells]) if prevcells is not None else None
-
-                    enc_oqs_indices = torch.where(outputs['enc_outputs']['pred_logits'][0,:,0].sigmoid() > 0.5)[0] + (len(keep) - self.num_queries)
-
-                    if self.track:
-                        previmg_copy = previmg.copy()
-                        img_box = img.copy()
-                        img_mask = img.copy()
-                        img_enc_oqs = img.copy()
-                    for a,aux_output in enumerate(aux_outputs):
-                        all_boxes = aux_output['pred_boxes'][0].detach()
-                        img_copy = img.copy()
-                        
-                        if self.track_indices is not None:
-                            tq_ind_only = self.track_indices < (len(keep) - self.num_queries)
-                            track_indices_tq_only = self.track_indices[tq_ind_only]
-                            div_track = self.div_track[tq_ind_only]                        
-                        else:
-                            track_indices_tq_only = None
-                        
-                        if a > 0:
-                            all_logits = aux_output['pred_logits'][0].detach()
-
-                            object_boxes = all_boxes[-self.num_queries:,:4]
-                            object_logits = all_logits[-self.num_queries:,0]
-                            object_indices = torch.where(object_logits > 0.5)[0]
-                            pred_object_boxes = object_boxes[object_indices]
-                            
-                            pred_enc_oqs_boxes = all_boxes[enc_oqs_indices]
-
-                            if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
-                                all_masks = aux_output['pred_masks'][0].detach()
-                                object_masks = all_masks[-self.num_queries:,0]
-                                pred_object_masks = object_masks[object_indices]
-                            else:
-                                pred_object_masks = None
-
-                            object_indices += (len(keep) - self.num_queries)
-
-                            if len(object_indices) > 0:
-                                img_object = utils.plot_tracking_results(img_copy,pred_object_boxes,pred_object_masks,self.all_colors[-object_indices.cpu()],None,None)
-                            else:
-                                img_object = utils.plot_tracking_results(img_copy,pred_enc_oqs_boxes,None,self.all_colors[-enc_oqs_indices.cpu()],None,None)
-                                # img_object = img_copy
-
-                        if track_indices_tq_only is not None:
-                            
-                            if a > 0: # initial reference points are all single boxes; this applies to the outputs of decoder
-                                if len(track_indices_tq_only) > 0:
-                                    track_boxes = all_boxes[track_indices_tq_only]
-                                    track_logits = all_logits[track_indices_tq_only]
-                                    if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
-                                        track_masks = all_masks[track_indices_tq_only]
-
-                                    unique_divs = np.unique(div_track[div_track != -1])
-                                    for unique_div in unique_divs:
-                                        div_ids = (div_track == unique_div).nonzero()[0]
-                                        track_boxes[div_ids[1],:4] = track_boxes[div_ids[0],4:]
-                                        track_logits[div_ids[1],:1] = track_logits[div_ids[0],1:]
-                                        if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
-                                            track_masks[div_ids[1],:1] = track_masks[div_ids[0],1:]
-
-                                    track_boxes = track_boxes[:,:4]
-                                    track_logits = track_logits[:,0]
-
-                                    if self.args.return_intermediate_masks or a == len(aux_outputs) - 1:
-                                        track_masks = track_masks[:,0]
-                                    else:
-                                        track_masks = None
-
-                                    track_box_colors = self.all_colors[self.cells-1]
-                                    new_cells = self.new_cells if self.track else None
-                                else:
-                                    track_boxes = torch.zeros((0,4),dtype=all_boxes.dtype,device=all_boxes.device)
-
-                            elif a == 0:
-                                track_masks = None
-                                track_boxes = all_boxes[np.arange(len(keep) - self.num_queries)]
-                                object_boxes = all_boxes[-self.num_queries:]
-                                track_box_colors = self.all_colors[prevcells-1] if prevcells is not None else self.all_colors[self.cells-1]
-                                object_box_colors = np.array([(np.array([0.,0.,0.])) for _ in range(self.num_queries)])
-                                div_track = np.ones((track_boxes.shape[0])) * -1
-                                new_cells = None
-
-                                pred_enc_oqs_boxes = all_boxes[enc_oqs_indices]
-
-                                all_black = object_box_colors.copy()
-
-                                if self.track:
-                                    assert track_boxes.shape[0] <= track_box_colors.shape[0]
-                                    previmg_track_anchor_boxes = utils.plot_tracking_results(previmg_copy,track_boxes,None,track_box_colors,div_track,new_cells)
-
-                                    all_colors = np.concatenate((object_box_colors,track_box_colors),axis=0)
-                                    all_boxes_rev = torch.cat((object_boxes,track_boxes),axis=0)
-                                    previmg_all_anchor_boxes = utils.plot_tracking_results(img_copy,all_boxes_rev,None,all_colors,None,None)
-
-                                else:
-                                    object_box_colors[-track_box_colors.shape[0]:] = track_box_colors
-                                    if self.two_stage:
-                                        object_boxes = torch.cat((object_boxes[track_box_colors.shape[0]:],object_boxes[:track_box_colors.shape[0]]))
-                                    else:
-                                        unused_oqs = np.array([oq_id for oq_id in range(self.num_queries) if oq_id not in track_indices_tq_only])
-                                        object_boxes = torch.cat((object_boxes[unused_oqs],object_boxes[track_indices_tq_only]))
-
-                                img_object_anchor_boxes_all = utils.plot_tracking_results(img_copy,object_boxes,None,object_box_colors,None,None)
-                                img_object_anchor_boxes_not_track_only = utils.plot_tracking_results(img_copy,object_boxes,None,all_black,None,None)
-
-                                oq_indices = []
-                                for q in range(len(keep)):
-                                    if q not in track_indices_tq_only:
-                                        if q < (len(keep) - self.num_queries):
-                                            oq_indices.append(q)
-                                        else:
-                                            oq_indices.append(-q)
-                                oq_colors = self.all_colors[oq_indices]
-                                oq_indices = [abs(oq_ind) for oq_ind in oq_indices]
-                                img_object_anchor_boxes_not_track_color_only = utils.plot_tracking_results(img_copy,all_boxes[oq_indices],None,oq_colors,None,None)
-
-                                img_enc_oqs = utils.plot_tracking_results(img_copy,pred_enc_oqs_boxes,None,self.all_colors[-enc_oqs_indices.cpu()],None,None)
-
-                                if not self.track:
-                                    img_object_anchor_boxes_track_only = utils.plot_tracking_results(img_copy,object_boxes[-len(track_indices_tq_only):],None,track_box_colors,None,None)
-                                    img_object_anchor_boxes = np.concatenate((img_object_anchor_boxes_all,img_object_anchor_boxes_not_track_only,img_object_anchor_boxes_track_only,img_object_anchor_boxes_not_track_color_only),axis=1)
-                                else:
-                                    img_object_anchor_boxes = np.concatenate((img_object_anchor_boxes_all,img_object_anchor_boxes_not_track_only,img_object_anchor_boxes_not_track_color_only,img_enc_oqs),axis=1)
-
-                                if i == 1:
-                                    all_prev_logits = prev_outputs['pred_logits'][0].detach().sigmoid()
-                                    all_prev_boxes = prev_outputs['pred_boxes'][0]
-                                    all_prev_masks = prev_outputs['pred_masks'][0,:,0]
-
-                                    prevkeep = all_prev_logits[:,0] > self.threshold
-                                    prev_boxes = all_prev_boxes[prevkeep]
-                                    prev_masks = all_prev_masks[prevkeep]
-                                    prev_colors = self.all_colors[prevcells-1]
-
-                                    first_img_box = utils.plot_tracking_results(previmg_copy,prev_boxes,None,prev_colors,None,None)
-                                    first_img_mask = utils.plot_tracking_results(previmg_copy,None,prev_masks,prev_colors,None,None)
-                                    first_img_box_and_mask = utils.plot_tracking_results(previmg_copy,prev_boxes,prev_masks,prev_colors,None,None)
-
-                                    img_object_anchor_boxes = np.concatenate((first_img_box,first_img_mask,first_img_box_and_mask,img_object_anchor_boxes),axis=1)
-
-                            img_track = utils.plot_tracking_results(img_copy,track_boxes,track_masks,track_box_colors,div_track,new_cells)
-
-                            if a == len(aux_outputs) - 1:
-                                img_box = utils.plot_tracking_results(img_box,track_boxes,None,track_box_colors,div_track,new_cells)
-                                img_mask = utils.plot_tracking_results(img_mask,None,track_masks,track_box_colors,div_track,new_cells)
-
-                        else:
-                            track_boxes = torch.zeros((0,4),dtype=all_boxes.dtype,device=all_boxes.device)
-                            img_track = img_copy
-                        
-                    
-                        if a == 0 and self.track:
-                            if track_indices_tq_only is not None:
-                                decoder_frame = np.concatenate((previmg,img,previmg_all_anchor_boxes,img_object_anchor_boxes,previmg_track_anchor_boxes,img_track),axis=1)
-                            else:
-                                decoder_frame = np.concatenate((previmg,img,img_track,previmg_all_anchor_boxes),axis=1)
-                        elif a == 0:
-                            decoder_frame = np.concatenate((img,img_track,img_object_anchor_boxes),axis=1)
-                        else:
-                            decoder_frame = np.concatenate((decoder_frame,img_track,img_object),axis=1)
-
-                        if a == len(aux_outputs)-1:
-                            decoder_frame = np.concatenate((decoder_frame,img_box,img_mask),axis=1)
-
-                        # Plot all predictions regardless of cls label
-                        if a == len(aux_outputs) - 1:
-                            img_copy = img.copy()
-                            
-                            color_queries = np.array([(np.array([0.,0.,0.])) for _ in range(self.num_queries)])
-
-                            if  cells_exit_ids is not None and cells_exit_ids.shape[0] > 0: # Plot the track query that left the chamber
-                                boxes_exit = all_boxes[cells_exit_ids[:,0],:4]
-                                boxes = torch.cat((all_boxes[-self.num_queries:,:4],boxes_exit,track_boxes))
-                                colors_prev = self.all_colors[cells_exit_ids[:,1] - 1] 
-                                colors_prev = colors_prev[None] if colors_prev.ndim == 1 else colors_prev
-                                
-                                all_colors = np.concatenate((color_queries,colors_prev,self.all_colors[self.cells-1]),axis=0)
-                                div_track_all = np.ones((boxes.shape[0])) * -1 # all boxes does not contain div boxes separated
-                                if len(track_boxes) > 0:
-                                    div_track_all[-len(track_boxes):] = div_track
-
-                                assert len(div_track_all) == len(boxes)
-
-                            else: # all cells / track queries stayed in the chamber
-                                boxes = torch.cat((all_boxes[-self.num_queries:,:4],track_boxes))
-                                all_colors = np.concatenate((color_queries,self.all_colors[self.cells-1]),axis=0)
-                                div_track_all = np.concatenate((np.ones((self.num_queries))*-1,div_track))
-
-                                assert len(div_track_all) == len(boxes)
-
-                            new_cell_thickness = np.zeros_like(div_track_all).astype(bool)
-                            if cells_exit_ids is not None and cells_exit_ids.shape[0] > 0:
-                                new_cell_thickness[self.num_queries:-track_boxes.shape[0]] = False
-                            img_final_box = utils.plot_tracking_results(img_copy,boxes,None,all_colors,div_track_all,new_cell_thickness)
-
-                            color_black = np.array([(np.array([0.,0.,0.])) for _ in range(boxes.shape[0])]) # plot all bounding boxes as black
-                            img_final_all_box = utils.plot_tracking_results(img_copy,boxes,None,color_black,None,None)
-
-                            if  cells_exit_ids is not None and cells_exit_ids.shape[0] > 0: # Plot the track query that left the chamber
-                                all_colors[len(color_queries):-len(self.cells)] = np.array([0.,0.,0.])
-                                img_final_all_box = utils.plot_tracking_results(img_copy,boxes,None,all_colors,None,None)
-
-                            oq_indices = np.array([q for q in range(len(keep)) if track_indices_tq_only is None or q not in track_indices_tq_only])
-                            oq_colors = self.all_colors[-oq_indices]
-                            img_oq_only_color = utils.plot_tracking_results(img_copy,all_boxes[oq_indices,:4],None,oq_colors,None,None)
-                            
-                            decoder_frame = np.concatenate((decoder_frame,img_final_box,img_final_all_box,img_oq_only_color),axis=1)
-
-                    if self.args.CoMOT:
-                        img_CoMOT_color = img.copy()
-                        pred_logits_aux = outputs['aux_outputs'][-2]['pred_logits'][0,-self.num_queries:,0].sigmoid().cpu().numpy()
-                        aux_object_ind = np.where(pred_logits_aux > 0.5)[0] + (len(keep) - self.num_queries)
-
-                        if len(aux_object_ind) > 0:
-                            aux_boxes = outputs['aux_outputs'][-2]['pred_boxes'][0,aux_object_ind,:4]
-
-                            if self.args.return_intermediate_masks:
-                                aux_masks = outputs['aux_outputs'][-2]['pred_masks'][0,aux_object_ind,0]
-                            else:
-                                aux_masks = None
-
-                            img_CoMOT_color = utils.plot_tracking_results(img_CoMOT_color,aux_boxes,aux_masks,self.all_colors[-aux_object_ind],None,None)
-
-                        decoder_frame = np.concatenate((decoder_frame,img_CoMOT_color),axis=1)
-
-                    else:
-
-                        if 'enc_outputs' in outputs:
-
-                            img_top_oq_last = img.copy()
-                            img_top_oq_first = img.copy()
- 
-                            top_oq_ind = np.where(outputs['enc_outputs']['pred_logits'][0,:,0].sigmoid().cpu().numpy() > 0.5)[0] + (len(keep) - self.num_queries)
-
-                            top_oq_boxes_last = outputs['aux_outputs'][-1]['pred_boxes'][0, + top_oq_ind,:4]
-                            top_oq_boxes_first = outputs['aux_outputs'][0]['pred_boxes'][0, + top_oq_ind,:4]
-
-                            img_top_oq_last = utils.plot_tracking_results(img_top_oq_last,top_oq_boxes_last,None,self.all_colors[-len(top_oq_ind):],None,None)
-                            img_top_oq_first = utils.plot_tracking_results(img_top_oq_first,top_oq_boxes_first,None,self.all_colors[-len(top_oq_ind):],None,None)
-
-                            decoder_frame = np.concatenate((decoder_frame,img_top_oq_first,img_top_oq_last),axis=1)
-
-
-                    method = 'object_detection' if not self.track else 'track'
-                    cv2.imwrite(str(self.output_dir / self.predictions_folder / 'decoder_bbox_outputs' / (f'{method}_decoder_frame_{fp.stem}.png')),decoder_frame)
-
-                else:
-                    if 'enc_outputs' in outputs and self.enc_map is not None:
-                        
-                        enc_outputs = outputs['enc_outputs']
-                        topk_proposals = enc_outputs['topk_proposals'][0]
-                        spatial_shapes = enc_outputs['spatial_shapes']
-
-                        fmaps_cum_size = torch.tensor([spatial_shape[0] * spatial_shape[1] for spatial_shape in spatial_shapes]).cumsum(0)
-
-                        # proposals = topk_proposals[enc_outputs['pred_logits'][0,topk_proposals,0].sigmoid() > 0.5].clone()
-
-                        for proposal in topk_proposals:
-                            f = 0
-                            fmap = fmaps_cum_size[f]
-
-                            while proposal >= fmap and f < len(fmaps_cum_size) - 1:
-                                f += 1 
-                                fmap = fmaps_cum_size[f]
-
-                            if f > 0:
-                                proposal -= fmaps_cum_size[f-1]
-
-                            y = torch.floor_divide(proposal,spatial_shapes[f,1])
-                            x = torch.remainder(proposal,spatial_shapes[f,1])
-
-                            self.enc_map[f][y,x] += 1
-
-                torch.cuda.empty_cache()
-                    
-                if sum(keep) == 0:
-                    prevcells = None
-
-                prev_outputs = outputs.copy()
-
-        if 'enc_outputs' in outputs:
-            spacer = 1
-            scale = self.target_size[0] / self.enc_map[0].shape[0]
-            enc_maps = []
-            max_value = 0
-            for e,enc_map in enumerate(self.enc_map):
-
-                enc_map = cv2.resize(enc_map,(self.target_size[1],self.target_size[0]),interpolation=cv2.INTER_NEAREST)
-                enc_map = np.repeat(enc_map[:,:,None],3,-1)
-                max_value = max(max_value,np.max(enc_map))
-                enc_maps.append(enc_map)
-                border = np.zeros((self.target_size[0],spacer,3),dtype=np.uint8)
-                border[:,:,0] = -1
-                enc_maps.append(border)
-
-            enc_maps = np.concatenate((enc_maps),axis=1)
-
-            img_empty = cv2.imread(str(self.output_dir.parents[4] / 'examples' / 'empty_chamber.png'))
-
-            enc_maps[enc_maps!=-1] = (enc_maps[enc_maps!=-1] / max_value) * 255
-            enc_maps[enc_maps==-1] = 255
-            enc_maps = enc_maps[:,:-spacer]
-
-            if img_empty is not None:
-                enc_maps = np.concatenate((img_empty,enc_maps[:,self.target_size[1]:self.target_size[1]+spacer],enc_maps),axis=1)
+            # If no objects are detected, skip
+            # if not self.two_stage and len(self.object_indices) > 0:
+            if True:
+                self.update_query_box_locations(outputs['pred_boxes'][0])
+
+            if self.img.ndim == 2:
+                self.img = np.repeat(self.img[:,:,None],3,-1)
+
+            if self.track:
+                color_frame = data_viz.plot_tracking_results(self.img,boxes,masks,self.all_colors[self.cells-1],self.div_track,self.new_cells)
             else:
-                enc_maps = np.concatenate((enc_maps[:,self.target_size[1]:self.target_size[1]+spacer],enc_maps),axis=1)
+                color_frame = data_viz.plot_tracking_results(self.img,boxes,masks,self.all_colors[:len(self.cells)],self.div_track,None)
 
-            cv2.imwrite(str(self.output_dir / self.predictions_folder / 'all_enc_queries_picked.png'),enc_maps.astype(np.uint8))
+            assert np.max(color_frame) <= 255 and np.min(color_frame) >= 0
 
-        if self.eval_ctc:
-            np.savetxt(self.output_dir / self.predictions_folder / 'res_track.txt',ctc_data,fmt='%d')
+            ### Need for paper
+            # Scale bar - don't delete until paper is publsihed
+            if i < 10 and self.fps[0].parts[-2] == '10':
+                blah = np.copy(color_frame)
+                # if i == 0:
+                #     blah[10:12,5:20] = 255
+                # cv2.imwrite(f'/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/moma/test/CTC/20/color_frames/frame{i:03d}.png',blah)
+                cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_pred.png',blah)
+                cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_img.png',self.img)
+
+            min = i * 5
+            hr = min // 60
+            rem_min = min % 60
+
+            color_frame = cv2.putText(
+                color_frame,
+                # text = f'{i:03d}', 
+                text = f'{hr:01d} hr', 
+                org=(0,10), 
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                fontScale = 0.4,
+                color = (255,255,255),
+                thickness=1,
+                )
+
+            # color_frame = np.concatenate((color_frame,np.zeros((color_frame.shape[0],20,3))),1)
+
+            color_frame = cv2.putText(
+                color_frame,
+                # text = f'{rem_min:02d} min', 
+                text = f'{min:03d} min', 
+                # org=(0,10), 
+                org=(0,20), 
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+                fontScale = 0.4,
+                color = (255,255,255),
+                thickness=1,
+                )
+
+            ### Need for paper
+
+            self.color_stack[i] = color_frame         
+
+            if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
+                for hook in hooks:
+                    hook.remove()
+
+                self.display_attn_maps(dec_attn_outputs)
+
+            if masks is not None:
+                ctc_data = self.save_ctc(ctc_data,masks)
+
+            if i == 0:
+                self.display_two_stage(outputs)
+
+            display_proposal_index_on_img = False
+
+            if self.display_all_aux_outputs and i in random_nbs:
+                self.display_aux_preds(outputs)
+                display_proposal_index_on_img = True
+            
+            if 'two_stage' in outputs:
+                self.save_enc_map(outputs,display_proposal_index_on_img)
+
+            torch.cuda.empty_cache()
+                
+            if len(self.all_indices) == 0:
+                self.prevcells = None
+
+            self.prev_outputs = outputs.copy()
+            self.previmg = self.img.copy()
+
+        start_time = time.time()
+        print(f'{time.time() - start_time} seconds')
+
+        if 'two_stage' in outputs:
+            self.display_enc_map()
+
+        if ctc_data is not None and self.masks:
+            np.savetxt(self.output_dir / 'res_track.txt',ctc_data,fmt='%d')
 
         if self.write_video:
-            crf = 20
-            verbose = 1
+            self.save_video()
 
-            if self.eval_ctc or self.args.dataset == '2D':
-                filename = self.output_dir / self.predictions_folder / (f'{self.videoname_list[r]}_movie.mp4')
-            else:
-                filename = self.output_dir / self.predictions_folder / (f'movie.mp4')                
+        if not self.two_stage:
+            self.save_object_query_box_locations(outputs)
 
-            print(filename)
-            height, width, _ = self.color_stack[0].shape
-            if height % 2 == 1:
-                height -= 1
-            if width % 2 == 1:
-                width -= 1
-            quiet = [] if verbose else ["-loglevel", "error", "-hide_banner"]
-            process = (
-                ffmpeg.input(
-                    "pipe:",
-                    format="rawvideo",
-                    pix_fmt="rgb24",
-                    s="{}x{}".format(width, height),
-                    r=7,
-                )
-                .output(
-                    str(filename),
-                    pix_fmt="yuv420p",
-                    vcodec="libx264",
-                    crf=crf,
-                    preset="veryslow",
-                )
-                .global_args(*quiet)
-                .overwrite_output()
-                .run_async(pipe_stdin=True)
-            )
 
-            # Write frames:
-            for frame in self.color_stack:
-                process.stdin.write(frame[:height, :width].astype(np.uint8).tobytes())
+    def save_ctc(self,ctc_data,masks):
 
-            # Close file stream:
-            process.stdin.close()
+        if len(self.all_indices) > 0:
 
-            # Wait for processing + close to complete:
-            process.wait()
+            label_mask = np.zeros(masks.shape[-2:],dtype=np.uint16)
+            
+            for m, cell in enumerate(self.cells):
+                assert  masks[m].sum() > 0
+                label_mask[masks[m] > 0] = cell
 
-        if self.display_object_query_boxes:
+        max_cellnb = ctc_data.shape[0]
 
-            scale = 8
-            wspacer = 5 * scale
-            hspacer = 20 * scale
+        ctc_cells_new = np.copy(self.cells)
+        mask_copy = np.copy(label_mask)
 
-            max_area = [np.max(boxes[:,2] * boxes[:,3]) for boxes in self.query_box_locations]
-            num_boxes_used = np.sum(np.array(max_area) > 0)
-            query_frames = np.ones((self.target_size[0]*scale + hspacer, (self.target_size[1]*scale + wspacer) * num_boxes_used,3),dtype=np.uint8) * 255
-            where_boxes = np.where(np.array(max_area) > 0)[0]
+        if len(self.prevcells) > 0:
+            for c,cell in enumerate(self.prevcells):
+                if cell in self.cells:
+                    ctc_cell = self.ctc_cells[c]
 
-            for j,ind in enumerate(where_boxes):
+                    # Cell Divided from previous frame
+                    if self.div_track[self.cells == cell] != -1:
+                        div_ind = self.div_track[self.cells == cell]
+                        div_cells = self.cells[self.div_track == div_ind]
+                        max_cellnb += 1
+                        new_cell_1 = np.array([max_cellnb,self.i,self.i,ctc_cell])[None]
+                        ctc_cells_new[self.cells == div_cells[0]] = max_cellnb 
+                        label_mask[mask_copy == div_cells[0]] = max_cellnb
+                        max_cellnb += 1
+                        new_cell_2 = np.array([max_cellnb,self.i,self.i,ctc_cell])[None]
+                        ctc_data = np.concatenate((ctc_data,new_cell_1,new_cell_2),axis=0)
+                        ctc_cells_new[self.cells == div_cells[1]] = max_cellnb
+                        label_mask[mask_copy == div_cells[1]] = max_cellnb
+
+                    # Cell was tracked from previous frame
+                    else:
+                        ctc_data[ctc_cell-1,2] = self.i
+                        ctc_cells_new[self.cells == cell] = self.ctc_cells[self.prevcells == cell]
+                        label_mask[mask_copy == cell] = ctc_cell
+
+        for c,cell in enumerate(self.cells):
+            if len(self.prevcells) == 0 or cell not in self.prevcells and self.div_track[c] == -1:
+                max_cellnb += 1
+                new_cell = np.array([max_cellnb,self.i,self.i,0])
+                ctc_data = np.concatenate((ctc_data,new_cell[None]),axis=0)
+
+                ctc_cells_new[self.cells == cell] = max_cellnb     
+                label_mask[mask_copy == cell] = max_cellnb
+
+        self.ctc_cells = ctc_cells_new
+
+        cv2.imwrite(str(self.output_dir / f'mask{self.i:03d}.tif'),label_mask)
+
+        return ctc_data
+        
+    def save_object_query_box_locations(self,outputs):
+
+        scale = 8 if self.args.dataset == 'moma' else 2
+        wspacer = 5 * scale
+        hspacer = 20 * scale
+
+        max_area = [np.max(boxes[:,2] * boxes[:,3]) for boxes in self.query_box_locations]
+        num_boxes_used = np.sum(np.array(max_area) > 0)
+        query_frames = np.ones((self.target_size[0]*scale + hspacer, (self.target_size[1]*scale + wspacer) * num_boxes_used,3),dtype=np.uint8) * 255
+        where_boxes = np.where(np.array(max_area) > 0)[0]
+
+        for j,ind in enumerate(where_boxes):
+
+            if self.args.dataset == 'moma':
                 img_empty = cv2.imread(str(self.output_dir.parents[1] / 'examples' / 'empty_chamber.png'))
                 img_empty = cv2.resize(img_empty,(self.target_size[1]*scale,self.target_size[0]*scale))
-            
-                for box in self.query_box_locations[ind][1:]:
-                    img_empty = cv2.circle(img_empty, (int(box[0]*scale),int(box[1]*scale)), radius=1*scale, color=(255,0,0), thickness=-1)
-
-                img_empty = np.concatenate((np.ones((hspacer,self.target_size[1]*scale,3),dtype=np.uint8)*255,img_empty),axis=0)
-                shift = 5 if ind + 1 >= 10 else 12
-                img_empty = cv2.putText(img_empty,f'{ind+1}',org=(shift*scale,15*scale),fontFace=cv2.FONT_HERSHEY_COMPLEX,fontScale=4,color=(0,0,0),thickness=4)
-                query_frames[:,j*(self.target_size[1]*scale+wspacer): j*(self.target_size[1]*scale+wspacer) + self.target_size[1]*scale] = img_empty
-
-            cv2.imwrite(str(self.output_dir / self.predictions_folder / (f'{method}_object_query_box_locations.png')),query_frames)
-
-            if self.use_dab:
-                height,width = self.target_size[0] * scale, self.target_size[1] * scale
-                boxes = aux_outputs[0]['pred_boxes'][0,:,:4].detach().cpu().numpy()
-
-                boxes[:,1::2] = boxes[:,1::2] * height
-                boxes[:,::2] = boxes[:,::2] * width
-
-                boxes[:,0] = boxes[:,0] - boxes[:,2] // 2
-                boxes[:,1] = boxes[:,1] - boxes[:,3] // 2
-
-                for j,ind in enumerate(where_boxes):
-
-                        bounding_box = boxes[ind]
-
-                        query_frames = cv2.rectangle(
-                        query_frames,
-                        (int(np.clip(bounding_box[0],0,width)) + j * (width + wspacer), int(np.clip(bounding_box[1],0,height))+hspacer),
-                        (int(np.clip(bounding_box[0] + bounding_box[2],0,width)) + j * (width + wspacer), int(np.clip(bounding_box[1] + bounding_box[3],0,height))+hspacer),
-                        color=tuple(np.array([50.,50.,50.])),
-                        thickness = 5)
-
-                cv2.imwrite(str(self.output_dir / self.predictions_folder / (f'{method}_object_query_box_locations_with_boxes.png')),query_frames)
-        
-
-
-@torch.no_grad()
-def print_worst(model, criterion, data_loader_train, data_loader_val, device, args, track=True):
-    model.eval()
-    model._tracking = True
-    criterion.eval()
-
-    if track:
-        save_folder = 'save_worst_predictions_track'
-
-        if args.use_prev_prev_frame:
-            save_folder += '_prev_prev' 
-
-    else:
-        save_folder = 'save_worst_predcitions_object_det'
-
-    if not args.no_data_aug:
-        save_folder += '_data_aug'
-
-    train_folder = 'train_outputs'
-    val_folder = 'val_outputs'
-
-    (args.output_dir / save_folder).mkdir(exist_ok=True)
-    (args.output_dir / save_folder / train_folder).mkdir(exist_ok=True)
-    (args.output_dir / save_folder / val_folder).mkdir(exist_ok=True)
-
-    folders = ['worst_loss','worst_score']
-
-    for folder in folders:
-        (args.output_dir / save_folder / train_folder / folder).mkdir(exist_ok=True)
-        (args.output_dir / save_folder / val_folder / folder).mkdir(exist_ok=True)
-
-        (args.output_dir / save_folder / train_folder / folder / 'standard').mkdir(exist_ok=True)
-        (args.output_dir / save_folder / val_folder / folder / 'standard').mkdir(exist_ok=True)
-
-        if args.two_stage:
-            (args.output_dir / save_folder / train_folder / folder / 'enc_outputs').mkdir(exist_ok=True)
-            (args.output_dir / save_folder / val_folder / folder / 'enc_outputs').mkdir(exist_ok=True)
-
-        if args.dn_track:
-            (args.output_dir / save_folder / train_folder / folder / 'dn_track').mkdir(exist_ok=True)
-            (args.output_dir / save_folder / val_folder / folder / 'dn_track').mkdir(exist_ok=True)
-
-        if args.dn_object:
-            (args.output_dir / save_folder / train_folder / folder / 'dn_object').mkdir(exist_ok=True)
-            (args.output_dir / save_folder / val_folder / folder / 'dn_object').mkdir(exist_ok=True)
-
-        if args.dn_enc:
-            (args.output_dir / save_folder / train_folder / folder / 'dn_enc').mkdir(exist_ok=True)
-            (args.output_dir / save_folder / val_folder / folder / 'dn_enc').mkdir(exist_ok=True)
-
-        if args.dn_track_group:
-            (args.output_dir / save_folder / train_folder / folder / 'dn_track_group').mkdir(exist_ok=True)
-            (args.output_dir / save_folder / val_folder / folder / 'dn_track_group').mkdir(exist_ok=True)
-
-    datasets = ['train','val']
-
-    for didx, data_loader in enumerate([data_loader_train,data_loader_val]):
-
-        store_loss = torch.zeros((len(data_loader)))
-        store_score = torch.zeros((len(data_loader)))
-
-        for idx, (samples, targets) in enumerate(data_loader):
-
-            # if idx > 100:
-            #     continue
-
-            samples = samples.to(device)
-            targets = [utils.nested_dict_to_device(t, device) for t in targets]
-
-            dataset_id = targets[0]['dataset_nb']
-            framenb = targets[0]['cur_target']['framenb']
-
-            # if not ((dataset_id == 73 and framenb == 10)):
-            #     continue
-
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,track=track)
-
-            cur_targets = [target['cur_target'] for target in targets]
-
-            groups = [0]
-
-            outputs, loss_dict, groups = calc_loss_for_training_methods('cur_target', outputs, groups, targets, criterion, args.epochs, args)
-
-            weight_dict = criterion.weight_dict
-
-            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-            store_loss[idx] = losses.item()
-
-            if targets[0]['track']:
-                acc_dict = utils.calc_track_acc(outputs,cur_targets,args)
-                if cur_targets[0]['empty']:
-                    score = 1.0 if acc_dict['overall_track_acc'][0,0,1] == 0 else 0.
-                else:
-                    score = acc_dict['overall_track_acc'][0,0,0]/acc_dict['overall_track_acc'][0,0,1]
-                print(f"{datasets[didx]} {idx}/{len(data_loader)} Dataset: {dataset_id:02d} Framenb: {framenb}  track: {score:.2f}")
-                store_score[idx] = score
             else:
-                acc_dict = utils.calc_bbox_acc(outputs,cur_targets,args)
-                if cur_targets[0]['empty']:
-                    score = 1.0 if acc_dict['mask_det_acc'][0,0,1] == 0 else 0.
-                else:
-                    score = acc_dict['mask_det_acc'][0,0,0]/acc_dict['mask_det_acc'][0,0,1]
-                score = acc_dict['mask_det_acc'][0,0,0]/acc_dict['mask_det_acc'][0,0,1]
-                print(f"{datasets[didx]} {idx}/{len(data_loader)} Dataset: {dataset_id:02d} Framenb: {framenb}  det: {acc_dict['bbox_det_acc'][0,0,0]/acc_dict['bbox_det_acc'][0,0,1]:.2f}  seg: {score:.2f}")
-                store_score[idx] = score
+                img_empty = np.ones((self.target_size[1]*scale,self.target_size[0]*scale,3),dtype=np.uint8) * 255
 
-        worst_loss_ind = torch.argsort(store_loss)[-100:].flip(0)
-        worst_score_ind = torch.argsort(store_score)[:50]
+            for box in self.query_box_locations[ind][1:]:
+                img_empty = cv2.circle(img_empty, (int(box[0]*scale),int(box[1]*scale)), radius=1*scale, color=(255,0,0), thickness=-1)
 
-        print('Saving worst predctions...')
+            img_empty = np.concatenate((np.ones((hspacer,self.target_size[1]*scale,3),dtype=np.uint8)*255,img_empty),axis=0)
+            shift = 5 if ind + 1 >= 10 else 12
+            img_empty = cv2.putText(img_empty,f'{ind+1}',org=(shift*scale,15*scale),fontFace=cv2.FONT_HERSHEY_COMPLEX,fontScale=4,color=(0,0,0),thickness=4)
+            query_frames[:,j*(self.target_size[1]*scale+wspacer): j*(self.target_size[1]*scale+wspacer) + self.target_size[1]*scale] = img_empty
 
-        for idx, (samples, targets) in enumerate(data_loader):
+        cv2.imwrite(str(self.output_dir / self.data_viz_folder / (f'{self.method}_object_query_box_locations.png')),query_frames)
+
+        if self.use_dab:
+            height,width = self.target_size[0] * scale, self.target_size[1] * scale
+            boxes = outputs['aux_outputs'][0]['pred_boxes'][0,:,:4].cpu().numpy()
+
+            boxes[:,1::2] = boxes[:,1::2] * height
+            boxes[:,::2] = boxes[:,::2] * width
+
+            boxes[:,0] = boxes[:,0] - boxes[:,2] // 2
+            boxes[:,1] = boxes[:,1] - boxes[:,3] // 2
+
+            for j,ind in enumerate(where_boxes):
+
+                bounding_box = boxes[ind]
+
+                query_frames = cv2.rectangle(
+                query_frames,
+                (int(np.clip(bounding_box[0],0,width)) + j * (width + wspacer), int(np.clip(bounding_box[1],0,height))+hspacer),
+                (int(np.clip(bounding_box[0] + bounding_box[2],0,width)) + j * (width + wspacer), int(np.clip(bounding_box[1] + bounding_box[3],0,height))+hspacer),
+                color=tuple(np.array([50.,50.,50.])),
+                thickness = 5)
+
+            cv2.imwrite(str(self.output_dir  / self.data_viz_folder / (f'{self.method}_object_query_box_locations_with_boxes.png')),query_frames)
+
+    def display_two_stage(self, outputs):
+
+        logits_topk = outputs['two_stage']['pred_logits'][0,:,0].sigmoid().cpu().numpy()
+        boxes_topk = outputs['two_stage']['pred_boxes'][0].cpu().numpy()
+
+        enc_colors = np.array([(np.array([0.,0.,0.])) for _ in range(self.num_queries)])
+
+        # If proposed enc object query is used, we want to use the same color that the final prediction
+        if self.track:
+            for o,index in enumerate(self.object_indices):
+                    enc_colors[index] = self.all_colors[self.cells[len(self.track_indices)+o]-1]
+        else:
+            enc_colors[:len(self.cells)] = self.all_colors[self.cells-1]
+
+        thresholds = [1,0.75,0.5,0.25,0]
+        boxes_list = []
+        for t in range(len(thresholds)-1):
+            boxes_list.append(boxes_topk[(logits_topk > thresholds[t+1]) * (logits_topk < thresholds[t])])
+
+        num_per_box = [box.shape[0] for box in boxes_list]
+        enc_frames = []
+        for b,boxes in enumerate(boxes_list):
+            enc_frame  = data_viz.plot_tracking_results(self.img,boxes,None,enc_colors[sum(num_per_box[:b]):sum(num_per_box[:b+1])],None,None)
+            enc_frame  = cv2.putText(enc_frame, text = f'{thresholds[b+1]}-', org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+            enc_frame  = cv2.putText(enc_frame, text = f'{thresholds[b]}', org=(0,20), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+            enc_frames.append(enc_frame)
+
+        enc_frames = np.concatenate((enc_frames),axis=1)
+
+        cv2.imwrite(str(self.output_dir / self.data_viz_folder / 'two_stage' / (f'encoder_frame_{self.fp.stem}.png')),enc_frames)
+
+        self.enc_colors = enc_colors
+
+    
+    def save_enc_map(self, outputs, display_proposal_index_on_img=False):
+
+        enc_outputs = outputs['two_stage']
+
+        proposals_img = self.img.copy()
+        final_proposal_pred = self.img.copy()
+
+        spatial_shapes = enc_outputs['spatial_shapes']
+        fmaps_cum_size = torch.tensor([spatial_shape[0] * spatial_shape[1] for spatial_shape in spatial_shapes]).cumsum(0)
+
+        if self.enc_map is None:
+            self.enc_map = [np.zeros((spatial_shape[0].item(),spatial_shape[1].item())) for spatial_shape in spatial_shapes]
+
+        topk_proposals = enc_outputs['topk_proposals'][0].cpu()
+        proposals = topk_proposals[enc_outputs['pred_logits'][0,:,0].sigmoid().cpu() > 0.5].clone().cpu()
+
+        for proposal in proposals:
+
+            proposal_clone = proposal.clone()
+
+            # Get the index of the feature map (multi-scale features maps --> multiple feature maps)
+            f = [i for i, fmap_size in enumerate(fmaps_cum_size) if proposal < fmap_size][0]
+
+            # Scale the index back to the correct feature map size
+            if f > 0:
+                proposal_clone -= fmaps_cum_size[f-1]
+
+            # Get x,y coordinates of the proposal in the feature map; the proposal index correspond to a flattened feature map
+            y = torch.floor_divide(proposal_clone,spatial_shapes[f,1])
+            x = torch.remainder(proposal_clone,spatial_shapes[f,1])
+
+            # Add the coordinate to the enc map which will be displayed at the end of the video
+            self.enc_map[f][y,x] += 1
+
+            if display_proposal_index_on_img:
             
-            if idx not in worst_loss_ind and idx not in worst_score_ind:
-                continue
+                # Overall proposal index onto the image
+                small_mask = np.zeros(spatial_shapes[f].cpu().numpy(),dtype=np.uint8)
+                small_mask[y,x] += 1
 
-            samples = samples.to(device)
-            targets = [utils.nested_dict_to_device(t, device) for t in targets]
+                resize_mask = cv2.resize(small_mask,self.target_size[::-1])
 
-            outputs, targets, features, memory, hs, prev_outputs = model(samples,targets,track=track)
+                y, x = np.where(resize_mask == 1)
 
-            training_methods =  outputs['training_methods'] # dn_object, dn_track, dn_enc
+                X = np.min(x) 
+                Y = np.min(y)
+                width = (np.max(x) - np.min(x)) 
+                height = (np.max(y) - np.min(y)) 
+                
+                proposal_ind = int(torch.where(topk_proposals == proposal)[0][0])
 
-            meta_data = {}
-            groups = [0]
+                proposals_img = cv2.rectangle(proposals_img,(X,Y),(int(X+width),int(Y+height)),color=self.enc_colors[proposal_ind],thickness=1)
 
-            for training_method in training_methods:
-                outputs_TM, loss_dict_TM, groups = calc_loss_for_training_methods(training_method, outputs, groups, targets, criterion, args.epochs, args)
+                pred_box = outputs['pred_boxes'][:,proposal_ind+self.num_TQs,:4].cpu().numpy()
 
-                meta_data[training_method] = {}
-                meta_data[training_method]['outputs'] = outputs_TM
-                meta_data[training_method]['loss_dict'] = loss_dict_TM
+                final_proposal_pred = data_viz.plot_tracking_results(final_proposal_pred,pred_box,None,colors=self.enc_colors[proposal_ind][None], new_cells = [proposal_ind+self.num_TQs in self.object_indices and self.track and self.i > 0], use_new_img=False)
 
-            outputs = meta_data['cur_target']['outputs'] 
-            loss_dict = meta_data['cur_target']['loss_dict']
+        if display_proposal_index_on_img:
 
-            weight_dict = criterion.weight_dict
+            enc_frames = cv2.imread(str(self.output_dir / self.data_viz_folder / 'two_stage' / (f'encoder_frame_{self.fp.stem}.png')))
+            enc_frames = np.concatenate((enc_frames, proposals_img,final_proposal_pred),axis=1)
 
-            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+            cv2.imwrite(str(self.output_dir / self.data_viz_folder / 'two_stage' / (f'encoder_frame_{self.fp.stem}.png')),enc_frames)
 
-            dataset_id = targets[0]['dataset_nb']
-            framenb = targets[0]['cur_target']['framenb']
 
-            if not np.round(losses.item(),3) == np.round(store_loss[idx],3):
-                print(idx, np.round(losses.item(),3),np.round(store_loss[idx],3))
-            # else:
-            #     print(f"{idx} loss: {np.round(store_loss[idx],3)} {f'({np.where(worst_loss_ind == idx)[0][0]})' if idx in worst_loss_ind else ''} score: {np.round(store_score[idx],3)} {f'({np.where(worst_score_ind == idx)[0][0]})' if idx in worst_score_ind else ''}) ")
+    def display_enc_map(self,save=True,last=False):
 
-            if idx in worst_loss_ind:
-                ind = np.where(worst_loss_ind == idx)[0][0]
-                data_viz.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir / save_folder, folder = Path(datasets[didx] + '_outputs') / 'worst_loss', filename = f'{ind+1:03d}_Loss_{store_loss[idx]:06.2f}_dataset_{dataset_id:02d}_framenb_{framenb}.png', args=args, meta_data=meta_data)
+        spacer = 1
+        enc_maps = []
+        max_value = 0
+
+        if last:
+            last_enc_maps = []
+
+        if self.all_videos_same_size:
+            for e,enc_map in enumerate(self.enc_map):
+                if save:
+                    cum_enc_map = enc_map
+                    if (self.output_dir.parent / 'two_stage' / f'enc_queries_{e:02d}.npy').exists():
+                        cum_enc_map = np.load(self.output_dir.parent / 'two_stage' / f'enc_queries_{e:02d}.npy')
+                        if cum_enc_map.shape != enc_map.shape:
+                            self.all_videos_same_size = False
+                            continue
+                        cum_enc_map += enc_map
+
+                    np.save(self.output_dir.parent / 'two_stage' / f'enc_queries_{e:02d}.npy',cum_enc_map)
+
+                if last:
+                    last_enc_maps += [np.load(self.output_dir.parent / 'two_stage' / f'enc_queries_{e:02d}.npy')]
+
+            if last:
+                self.enc_map = last_enc_maps
+
+        for enc_map in self.enc_map:
+
+            enc_map = cv2.resize(enc_map,(self.target_size[1],self.target_size[0]),interpolation=cv2.INTER_NEAREST)
+            enc_map = np.repeat(enc_map[:,:,None],3,-1)
+            max_value = max(max_value,np.max(enc_map))
+            enc_maps.append(enc_map)
+            border = np.zeros((self.target_size[0],spacer,3),dtype=np.uint8)
+            border[:,:,0] = -1
+            enc_maps.append(border)
+
+        enc_maps = np.concatenate((enc_maps),axis=1)
+
+        enc_maps[enc_maps!=-1] = (enc_maps[enc_maps!=-1] / max_value) * 255
+        enc_maps[enc_maps==-1] = 255
+        enc_maps = enc_maps[:,:-spacer]
+
+        enc_maps = np.concatenate((enc_maps[:,self.target_size[1]:self.target_size[1]+spacer],enc_maps),axis=1)
+
+        if not last:
+            cv2.imwrite(str(self.output_dir / self.data_viz_folder / 'enc_queries_picked.png'),enc_maps.astype(np.uint8))
+        else:
+            cv2.imwrite(str(self.output_dir.parent / 'two_stage' / 'all_enc_queries_picked.png'),enc_maps.astype(np.uint8))
+
+            nb_plots = len(self.enc_map)
+
+            fig, axs = plt.subplots(1, nb_plots, figsize=(18, 6))
+
+            max_value = max(map.max() for map in self.enc_map)
+
+            for pidx, map in enumerate(self.enc_map):
+
+                # Plotting the multi-scale features
+                cbar0 = axs[pidx].imshow(map, cmap='viridis', vmin=0, vmax=max_value)
+                axs[pidx].set_title(f'Multi-Scale Feature {pidx:02d}')
+
+                cbar = axs[pidx].imshow(map, cmap='viridis', vmin=0, vmax=max_value)
+                axs[pidx].set_title('Multi-Scale Feature 00')
+                axs[pidx].grid(True, which='both', color='black', linewidth=0.5)
+                axs[pidx].xaxis.set_major_locator(plt.MultipleLocator(1))
+                axs[pidx].yaxis.set_major_locator(plt.MultipleLocator(1))
+                axs[pidx].set_xlim(0, map.shape[1] - 1)
+                axs[pidx].set_ylim(0, map.shape[0] - 1)
+                axs[pidx].xaxis.set_major_locator(plt.MaxNLocator(10))
+                axs[pidx].yaxis.set_major_locator(plt.MaxNLocator(10))
+
+            # Adjust the spacing between plots
+            plt.subplots_adjust(wspace=0.1)
+
+            # Adding a single color bar to the right of the plots
+            fig.subplots_adjust(right=0.85)
+            cbar_ax = fig.add_axes([0.88, 0.15, 0.02, 0.7])
+            fig.colorbar(cbar0, cax=cbar_ax)
+
+            fig.savefig(self.output_dir.parent / 'two_stage' / 'heat_map.pdf')
+
+
+    def display_attn_maps(self,dec_attn_outputs):
+
+        for layer_index, dec_attn_output in enumerate(dec_attn_outputs):
+            dec_attn_weight_maps = dec_attn_output[1].cpu().numpy() # [output, attention_map]
+            num_cols, num_rows = dec_attn_weight_maps.shape[-2:]
+            num_heads = 1 if dec_attn_weight_maps.ndim == 3 else dec_attn_weight_maps.shape[1]
+            dec_attn_weight_maps = np.repeat(dec_attn_weight_maps[...,None],3,axis=-1)
+            for dec_attn_weight_map in dec_attn_weight_maps: # per batch
+                for h in range(num_heads):
+                    if num_heads > 1:
+                        dec_attn_weight_map_h = dec_attn_weight_map[h]
+                    else:
+                        h = 'averaged'
+                        dec_attn_weight_map_h = dec_attn_weight_map
+                    dec_attn_weight_map_color = np.zeros((num_cols+1,num_rows+1,3))
+                    dec_attn_weight_map_color[-num_cols:,-num_rows:] = dec_attn_weight_map_h
+                    # dec_attn_weight_map_color = ((dec_attn_weight_map_color / np.max(dec_attn_weight_map_color)) * 255).astype(np.uint8)
+                    dec_attn_weight_map_color = (dec_attn_weight_map_color * 255).astype(np.uint8)
+
+                    # Go through track queries
+                    for tidx in range(self.num_TQs):
+                        dec_attn_weight_map_color[tidx+1,0] = self.all_colors[self.prevcells[tidx]-1]
+                        dec_attn_weight_map_color[0,tidx+1] = self.all_colors[self.prevcells[tidx]-1]                                
+
+                    # color Track queries only
+                    if False:
+                        cv2.imwrite(str(self.output_dir / 'attn_weight_maps' / (f'self_attn_weight_map_{self.fp.stem}_layer_{layer_index}_head_{h}.png')),dec_attn_weight_map_color_resize)
+
+                    # Go through object queries
+                    for q in range(self.num_TQs, self.num_TQs + self.num_queries):
+                        dec_attn_weight_map_color[q+1,0] = self.all_colors[-q]
+                        dec_attn_weight_map_color[0,q+1] = self.all_colors[-q]
+                    
+                    cv2.imwrite(str(self.output_dir / 'attn_weight_maps' / (f'self_attn_map_{self.fp.stem}_layer_{layer_index}_head_{h}.png')),dec_attn_weight_map_color)
+
+                if num_heads > 1:
+                    dec_attn_weight_map_avg = (dec_attn_weight_map.mean(0) * 255).astype(np.uint8)
+
+                    dec_attn_weight_map_avg_color = dec_attn_weight_map_color
+                    dec_attn_weight_map_avg_color[-num_cols:,-num_rows:] = dec_attn_weight_map_avg
+
+                    cv2.imwrite(str(self.output_dir  / self.data_viz_folder / 'attn_weight_maps' / (f'self_attn_map_{self.fp.stem}_layer_{layer_index}_head_averaged.png')),dec_attn_weight_map_avg_color)
+
+
+    def display_aux_preds(self,outputs):
+
+        references = outputs['references']
+
+        if references.shape[-1] == 2:
+            references = torch.cat((references, torch.zeros(references.shape[:-1] + (6,),device=references.device)),axis=-1)
+
+        # the initial anchors / reference points + output from the intermedaite layers of decoder
+        ref_boxes = references[0]
+        ref_logits = outputs['two_stage']['pred_logits']
+
+        if len(self.track_indices) > 0:
+            self.decoder_frame = np.concatenate((self.previmg,self.img),axis=1)
+            self.get_track_preds(ref_boxes,None,ref_boxes=True)
+            self.get_object_preds(ref_logits,ref_boxes,text='QS',use_logits=True)
+        else:
+            self.decoder_frame = self.img
+            self.get_object_preds(ref_logits, ref_boxes,first_decoder_layer=True, text='QS')
+
+        if self.args.num_OD_layers:
+            OD_boxes = outputs['OD']['pred_boxes']
+            OD_logits = outputs['OD']['pred_logits']
+            OD_masks = None
+            if 'pred_masks' in outputs['OD']:
+                OD_masks = outputs['OD']['pred_masks']
+            self.get_object_preds(OD_logits,OD_boxes,OD_masks, text='OD 1',use_logits=True)
+
+        # add the last layer of the decoder which is the final prediction
+        aux_outputs = outputs['aux_outputs']
+        aux_outputs.append({'pred_boxes':outputs['pred_boxes'],'pred_logits':outputs['pred_logits']}) 
+        
+        # Add segmentation masks 
+        if 'pred_masks' in outputs:
+            aux_outputs[-1]['pred_masks'] = outputs['pred_masks'] # add mask
+
+        for a,aux_output in enumerate(aux_outputs):
+            aux_boxes = aux_output['pred_boxes']
+            aux_logits = aux_output['pred_logits']
+
+            aux_masks = None
+            if self.masks and self.return_intermediate_masks:
+                aux_masks = aux_output['pred_masks']
+
+            last_decoder_layer = a == len(aux_outputs) - 1
+
+            if len(self.track_indices) > 0:
+                self.get_track_preds(aux_boxes,aux_masks,last_decoder_layer=last_decoder_layer, text=f'Tr {a+1+self.args.num_OD_layers}')
+
+                if self.args.CoMOT or last_decoder_layer:
+                    use_logits = self.args.CoMOT_loss_ce
+                    self.get_object_preds(aux_logits,aux_boxes,aux_masks, CoMOT=self.args.CoMOT,text=f'OD {a+1+self.args.num_OD_layers}',use_logits=use_logits)                    
+
+            else:
+                self.get_object_preds(aux_logits,aux_boxes,aux_masks,last_decoder_layer=last_decoder_layer, text=f'OD {a+1+self.args.num_OD_layers}')
+
+        cv2.imwrite(str(self.output_dir / self.data_viz_folder / 'decoder_bbox_outputs' / (f'{self.method}_decoder_frame_{self.fp.stem}.png')),self.decoder_frame)
+
+    def get_object_preds(self,logits,boxes,masks=None,first_decoder_layer=False,last_decoder_layer=False, CoMOT=False, text='', use_logits=False):
+
+        object_boxes = boxes[0,-self.num_queries:].cpu().numpy()
+        if use_logits:
+            object_indices = np.where(logits[0,-self.num_queries:,0].cpu().numpy() > self.threshold)[0]
+        else:
+            if CoMOT:
+                object_indices = np.arange(len(self.cells)) # we assume the cell detected from QS are continually used to detect the cells #np.where(object_logits > self.threshold)[0]
+            else:
+                object_indices = self.object_indices
+        pred_object_boxes = object_boxes[object_indices]
+        object_colors = np.zeros((len(pred_object_boxes),3))
+
+        pred_object_masks = None
+        if masks is not None and (self.return_intermediate_masks or last_decoder_layer) and len(object_indices) > 0:
+            object_masks = masks[0,-self.num_queries:,0]
+            pred_object_masks = object_masks[object_indices].cpu().sigmoid().numpy()
+            pred_object_masks = cv2.resize(np.transpose(pred_object_masks,(1,2,0)),self.img_size) # regardless of cropping / resize, segmentation is 2x smaller than the original image                                
+            pred_object_masks = pred_object_masks[:,:,None] if pred_object_masks.ndim == 2 else pred_object_masks # cv2.resize will drop last dim if it is 1
+            pred_object_masks = np.transpose(pred_object_masks,(-1,0,1))
+            pred_object_masks = np.where(pred_object_masks > self.mask_threshold,True,False)
+
+        for i,object_index in enumerate(object_indices):
+            if object_index + self.num_TQs in self.object_indices:
+                cell_index = np.where(self.all_indices == object_index + self.num_TQs)[0]
+                cell = self.cells[cell_index]
+                object_colors[i] = self.all_colors[cell-1]
+            else:
+                ind = object_index + self.num_TQs
+                object_colors[i] = self.all_colors[-ind]
+
+        if first_decoder_layer:
+            all_object_colors = np.concatenate((np.array([[0,0,0] for _ in range(self.num_queries - len(object_indices))]),object_colors))
+            non_object_indices = np.array([i for i in range(self.num_queries) if i not in object_indices])
+            object_all_boxes = np.concatenate((object_boxes[non_object_indices],pred_object_boxes))
+            all_objects_no_label_colors = np.array([[0,0,0] for _ in range(self.num_queries)],dtype=float)
+            all_objects_no_label_frame = data_viz.plot_tracking_results(self.img,object_all_boxes,None,all_objects_no_label_colors,None,None)
+            all_objects_no_label_frame = cv2.putText(all_objects_no_label_frame,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+            all_objects_frame = data_viz.plot_tracking_results(self.img,object_all_boxes,None,all_object_colors,None,None)
+            all_objects_frame = cv2.putText(all_objects_frame,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+            self.decoder_frame = np.concatenate((self.decoder_frame,all_objects_no_label_frame,all_objects_frame),axis=1)
+
+        pred_objects_frame = data_viz.plot_tracking_results(self.img,pred_object_boxes,pred_object_masks,object_colors,None,None)
+        pred_objects_frame = cv2.putText(pred_objects_frame,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+        self.decoder_frame = np.concatenate((self.decoder_frame,pred_objects_frame),axis=1)
+
+        if last_decoder_layer:
+            img_box = data_viz.plot_tracking_results(self.img,pred_object_boxes,None,object_colors)
+            img_box = cv2.putText(img_box,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+            self.decoder_frame = np.concatenate((self.decoder_frame,img_box),axis=1)
+            if self.masks:
+                img_mask = data_viz.plot_tracking_results(self.img,None,pred_object_masks,object_colors)
+                img_mask = cv2.putText(img_mask,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+                self.decoder_frame = np.concatenate((self.decoder_frame,img_mask),axis=1)
+
+    def get_track_preds(self,boxes,masks=None,ref_boxes=False,last_decoder_layer=False, text=''):
             
-            if idx in worst_score_ind:
-                ind = np.where(worst_score_ind == idx)[0][0]
-                data_viz.plot_results(outputs, prev_outputs, targets,samples.tensors, args.output_dir / save_folder, folder = Path(datasets[didx] + '_outputs') / 'worst_score', filename = f'{ind+1:03d}_Score_{store_score[idx]:06.2f}_dataset_{dataset_id:02d}_framenb_{framenb}.png', args=args, meta_data=meta_data)
+        pred_all_masks = None
+        new_cells = None
+        div_track = None
 
-        print(f'Done save worst predictions for {datasets[didx]} dataset')
+        if ref_boxes:
+            pred_all_boxes = boxes.cpu().numpy()[0,np.arange(self.num_TQs)]
+            all_colors = self.all_colors[self.prevcells-1]
+            img = self.previmg
+        else:
+            pred_all_boxes = boxes[0,self.all_indices].cpu().numpy()
+            all_colors = self.all_colors[self.cells-1]
+            img = self.img
+
+            if masks is not None and (self.return_intermediate_masks or last_decoder_layer) and len(self.all_indices) > 0:
+                pred_all_masks = masks[0,self.all_indices].cpu().sigmoid().numpy()
+
+                unique_divs = np.unique(self.div_track[self.div_track != -1])
+                for unique_div in unique_divs:
+                    div_ids = (self.div_track == unique_div).nonzero()[0]
+                    pred_all_boxes[div_ids[1],:4] = pred_all_boxes[div_ids[0],4:]
+                    if self.masks and (self.return_intermediate_masks or last_decoder_layer) and len(self.all_indices) > 0:
+                        pred_all_masks[div_ids[1],:1] = pred_all_masks[div_ids[0],1:]
+
+                pred_all_boxes = pred_all_boxes[:,:4]
+
+                if self.masks and (self.return_intermediate_masks or self.last_decoder_layer) and len(self.all_indices) > 0:
+                    pred_all_masks = cv2.resize(np.transpose(pred_all_masks[:,0],(1,2,0)),self.img_size) # regardless of cropping / resize, segmentation is 2x smaller than the original image                                
+                    pred_all_masks = pred_all_masks[:,:,None] if pred_all_masks.ndim == 2 else pred_all_masks # cv2.resize will drop last dim if it is 1
+                    pred_all_masks = np.transpose(pred_all_masks,(-1,0,1))
+                    pred_all_masks = np.where(pred_all_masks > self.mask_threshold,True,False)
+
+                div_track = self.div_track
+                new_cells = self.new_cells
+
+        pred_objects_frame = data_viz.plot_tracking_results(img,pred_all_boxes,pred_all_masks,all_colors,div_track,new_cells)
+        pred_objects_frame = cv2.putText(pred_objects_frame,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+        self.decoder_frame = np.concatenate((self.decoder_frame,pred_objects_frame),axis=1)
+
+        if last_decoder_layer:
+            img_box = data_viz.plot_tracking_results(self.img,pred_all_boxes,None,all_colors,div_track)
+            img_box = cv2.putText(img_box,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+            self.decoder_frame = np.concatenate((self.decoder_frame,img_box),axis=1)
+            if self.masks:
+                img_mask = data_viz.plot_tracking_results(self.img,None,pred_all_masks,all_colors,div_track)
+                img_mask = cv2.putText(img_mask,text = text, org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+                self.decoder_frame = np.concatenate((self.decoder_frame,img_mask),axis=1)
+
+            all_boxes = boxes.cpu().numpy()[0,:,:4]
+        
+            # color_queries = np.array([(np.array([0.,0.,0.])) for _ in range(pred_boxes.shape[0])])
+            # color_queries[self.all_indices] = self.all_colors[self.cells-1]
+            color_queries = self.all_colors[self.cells-1]
+            # color_queries = color_queries[::-1]
+
+            div_track = self.div_track
+
+            # Get cells that exit the frame --> they get highlighted so it's easier to spot errors
+            cell_exit_ids = [[cidx,c] for cidx,c in enumerate(self.prevcells.astype(np.int64)) if c not in self.cells]
+
+            if len(cell_exit_ids) > 0:
+
+                for cell_exit_ind, cell_exit_id in cell_exit_ids:
+                    # color_queries[cell_exit_ind] = self.all_colors[cell_exit_id-1]
+
+                    color_queries = np.concatenate((self.all_colors[cell_exit_id-1][None],color_queries))
+                    div_track = np.concatenate((np.array([-1]),div_track))
+                    pred_all_boxes = np.concatenate((all_boxes[cell_exit_ind,:4][None],pred_all_boxes))
+
+                # pred_boxes = pred_boxes[color_queries.sum(1) > 0]
+                # div_track = div_track[color_queries.sum(1) > 0]
+                # color_queries = color_queries[color_queries.sum(1) > 0]
+
+                pred_all_boxes_and_exit_cells_frame = data_viz.plot_tracking_results(self.img,pred_all_boxes,None,color_queries,div_track)
+                pred_all_boxes_and_exit_cells_frame = cv2.putText(pred_all_boxes_and_exit_cells_frame,text = 'Exit', org=(0,10), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale = 0.4, color = (255,255,255), thickness=1)
+                
+                self.decoder_frame = np.concatenate((self.decoder_frame,pred_all_boxes_and_exit_cells_frame),axis=1)
+
+
+    def save_video(self):
+
+        crf = 20
+        verbose = 1
+
+        filename = self.output_dir / (f'movie_full.mp4') 
+
+        assert self.color_stack.max() <= 255.0 and self.color_stack.max() >= 0.0               
+
+        print(filename)
+        height, width, _ = self.color_stack[0].shape
+        if height % 2 == 1:
+            height -= 1
+        if width % 2 == 1:
+            width -= 1
+        quiet = [] if verbose else ["-loglevel", "error", "-hide_banner"]
+        process = (
+            ffmpeg.input(
+                "pipe:",
+                format="rawvideo",
+                pix_fmt="rgb24",
+                s="{}x{}".format(width, height),
+                r=7,
+            )
+            .output(
+                str(filename),
+                pix_fmt="yuv420p",
+                vcodec="libx264",
+                crf=crf,
+                preset="veryslow",
+            )
+            .global_args(*quiet)
+            .overwrite_output()
+            .run_async(pipe_stdin=True)
+        )
+
+        # Write frames:
+        for frame in self.color_stack:
+            process.stdin.write(frame[:height, :width].astype(np.uint8).tobytes())
+
+        # Close file stream:
+        process.stdin.close()
+
+        # Wait for processing + close to complete:
+        process.wait()

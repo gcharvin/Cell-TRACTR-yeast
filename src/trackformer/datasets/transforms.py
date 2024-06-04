@@ -13,7 +13,7 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
 
-from ..util.box_ops import box_xyxy_to_cxcywh
+from ..util.box_ops import box_xyxy_to_cxcywh, masks_to_boxes
 from ..util.misc import interpolate
 
 def crop(image, target, region, overflow_boxes=False):
@@ -28,11 +28,19 @@ def crop(image, target, region, overflow_boxes=False):
     # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
 
-    fields = ["labels", "area", "iscrowd", "ignore", "track_ids"]
+    fields = ["labels", "boxes", "area", "iscrowd", "ignore", "track_ids", "flexible_divisions"]
+    
+    if "masks" in target:
 
-    # orig_area = target["area"]
+        fields.append("masks")
+        area = target['masks'].sum(dim=(1,2))
+        target["area"] = area
 
-    if "boxes" in target:
+        cropped_boxes = masks_to_boxes(target['masks'])
+        target["boxes"] = cropped_boxes
+
+    else:
+
         boxes = target["boxes"]
         max_size = torch.as_tensor([w, h], dtype=torch.float32)
         cropped_boxes = boxes -  torch.as_tensor([j, i, j, i])
@@ -54,34 +62,22 @@ def crop(image, target, region, overflow_boxes=False):
             cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
             cropped_boxes = cropped_boxes.clamp(min=0)
 
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
-        target["boxes"] = cropped_boxes.reshape(-1, 4)
-        target["area"] = area
-        fields.append("boxes")
+            area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+            target["boxes"] = cropped_boxes.reshape(-1, 4)
+            target["area"] = area
 
-    if "masks" in target:
-        # FIXME should we update the area here if there are no boxes?
-        target['masks'] = target['masks'][:, i:i + h, j:j + w]
-        fields.append("masks")
+    keep = area > 10
 
-    # remove elements for which the boxes or masks that have zero area
-    if "boxes" in target or "masks" in target:
-        # favor boxes selection when defining which elements to keep
-        # this is compatible with previous implementation
-        if "boxes" in target:
-            cropped_boxes = target['boxes'].reshape(-1, 2, 2)
-            keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
-            
-            if 'masks' in target:
-                assert (keep == target['masks'].flatten(1).any(1).bool()).all()
-            # new area must be at least % of orginal area
-            # keep = target["area"] >= orig_area * 0.2
-        else:
-            keep = target['masks'].flatten(1).any(1)
+    if 'masks' in target:
+        area_boxes = ((target['boxes'][:,2] - target['boxes'][:,0]) * (target['boxes'][:,3] - target['boxes'][:,1]))
+        keep *= (area_boxes > 10)
 
+    if (~keep).sum() > 0:
         for field in fields:
             if field in target:
                 target[field] = target[field][keep]
+
+    assert target['boxes'].shape[0] == (target['boxes'][:,2] - target['boxes'][:,0] > 0).sum() == (target['boxes'][:,3] - target['boxes'][:,1] > 0).sum()
 
     return cropped_image, target
 
@@ -550,6 +546,9 @@ class Normalize:
 
                 if 'boxes_orig' in target:
                     target['boxes_orig'] = boxes.clone()
+
+                assert target['boxes'].shape[0] == (target['boxes'][:,2] > 0).sum() == (target['boxes'][:,3] > 0).sum()
+
         return image, target
 
 

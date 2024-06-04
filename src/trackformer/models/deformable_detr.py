@@ -11,16 +11,12 @@
 Deformable DETR model and criterion classes.
 """
 import copy
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
-import fvcore.nn.weight_init as weight_init
 
 from ..util import box_ops
-from ..util.misc import NestedTensor, inverse_sigmoid, nested_tensor_from_tensor_list,add_noise_to_boxes, MLP
-from .detr import PostProcess, SetCriterion
+from ..util.misc import NestedTensor, inverse_sigmoid, nested_tensor_from_tensor_list, MLP
 
 
 def _get_clones(module, N):
@@ -29,13 +25,11 @@ def _get_clones(module, N):
 
 class DeformableDETR():
     """ This is the Deformable DETR module that performs object detection """
-    def __init__(self, backbone, num_classes, num_queries, num_feature_levels,device,
+    def __init__(self, tracking, backbone, num_classes, num_queries, num_feature_levels,device,
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
-                 multi_frame_attention=False, multi_frame_encoding=False, merge_frame_features=False,                 
-                 use_dab=True, random_refpoints_xy=False,
-                  dn_object_l1 = 0, dn_object_l2 = 0, dn_label=0, refine_object_queries=False,
-                  use_div_ref_pts = False, share_bbox_layers=True,decoder_use_mask_as_ref=False,
-                  iterative_masks=False,use_img_for_mask=False):
+                 multi_frame_attention=False, use_dab=True, random_refpoints_xy=False, dn_object=False, 
+                 dn_object_FPs=False, dn_object_l1 = 0, dn_object_l2 = 0, refine_object_queries=False,
+                 share_bbox_layers=True,use_img_for_mask=False,masks=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -49,20 +43,14 @@ class DeformableDETR():
             two_stage: two-stage Deformable DETR
         """
         
+        self.tracking = tracking
+        self.masks = masks
         self.device = device
         self.num_queries = num_queries
         self.hidden_dim = self.d_model
-        self.decoder_use_mask_as_ref = decoder_use_mask_as_ref
-        self.decoder.decoder_use_mask_as_ref = decoder_use_mask_as_ref
-        self.iterative_masks = iterative_masks
-        # self.transformer = transformer
         self.overflow_boxes = overflow_boxes
         self.class_embed = nn.Linear(self.hidden_dim, num_classes + 2)
         self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 8, 3)
-        self.mask_embed = MLP(self.hidden_dim, self.hidden_dim, self.mask_dim*2, 3)
-        if two_stage:
-            self.enc_class_embed = nn.Linear(self.hidden_dim, num_classes + 1)
-            self.enc_bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
 
         # match interface with deformable DETR
@@ -74,18 +62,20 @@ class DeformableDETR():
         self.use_img_for_mask = use_img_for_mask
 
         # super().__init__(backbone, transformer, num_classes, num_queries, device, two_stage, aux_loss)
-        self.merge_frame_features = merge_frame_features
         self.multi_frame_attention = multi_frame_attention
-        self.multi_frame_encoding = multi_frame_encoding
         self.overflow_boxes = overflow_boxes
         self.num_feature_levels = num_feature_levels
         self.num_queries = num_queries
         self.share_bbox_layers = share_bbox_layers
 
-        self.dn_object_l1 = dn_object_l1
-        self.dn_object_l2 = dn_object_l2
 
-        self.dn_label = dn_label
+        self.dn_object = dn_object
+
+        if self.dn_object:
+            self.dn_object_FPs = dn_object_FPs
+            self.dn_object_l1 = dn_object_l1
+            self.dn_object_l2 = dn_object_l2
+            self.dn_object_embedding = nn.Embedding(1,self.hidden_dim)
 
         self.use_dab = use_dab
         self.random_refpoints_xy = random_refpoints_xy
@@ -108,11 +98,6 @@ class DeformableDETR():
                     self.refpoint_embed.weight.data[:, :2].requires_grad = False
         ### DAB-DETR
 
-        ### DN-DETR --> dn_objects
-        # This provides the content queries for the denoised objects. Only used during training
-        self.label_enc = nn.Embedding(num_classes + 10, self.hidden_dim) # according to DN-DETR you can just add extra unused classes here
-        ### DN-DETR --> dn_objects
-
         num_channels = backbone.num_channels[-num_feature_levels:]
         
         if num_feature_levels > 1:
@@ -124,7 +109,7 @@ class DeformableDETR():
                 in_channels = num_channels[i]
                 input_proj_list.append(nn.Sequential(
                     nn.Conv2d(in_channels, self.hidden_dim, kernel_size=1),
-                    nn.GroupNorm(self.hidden_dim // 9, self.hidden_dim),
+                    nn.GroupNorm(self.hidden_dim // 8, self.hidden_dim),
                 ))
             for _ in range(num_feature_levels - num_backbone_outs):
                 input_proj_list.append(nn.Sequential(
@@ -142,10 +127,6 @@ class DeformableDETR():
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
 
-        # prior_prob = 0.01
-        # bias_value = -math.log((1 - prior_prob) / prior_prob)
-        # self.class_embed.bias.data = torch.ones_like(self.class_embed.bias) * bias_value
-
         for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
@@ -156,68 +137,29 @@ class DeformableDETR():
         if two_stage:
             num_pred += 1
 
-        if use_div_ref_pts:
-            self.decoder.use_div_ref_pts = True
-
         if with_box_refine:
             nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0.)
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0.)
-            # self.class_embed = _get_clones(self.class_embed, num_pred)
-            if not self.share_bbox_layers:
-                self.mask_embed = _get_clones(self.mask_embed, num_pred)
-                self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
-            else:
-                self.mask_embed = nn.ModuleList([self.mask_embed for _ in range(num_pred)])
+            if self.share_bbox_layers:
+                self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
                 self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
+            else:
+                self.class_embed = _get_clones(self.class_embed, num_pred)    
+                self.bbox_embed = _get_clones(self.bbox_embed, num_pred)    
 
             # hack implementation for iterative bounding box refinement
             self.decoder.bbox_embed = self.bbox_embed
             self.decoder.class_embed = self.class_embed
-            self.decoder.mask_embed = self.mask_embed
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0.)
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0.)
-            # nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:4], -2.0)
-            # nn.init.constant_(self.bbox_embed.layers[-1].bias.data[6:], -2.0)
-            # self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
+
+            self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
-            self.mask_embed = nn.ModuleList([self.mask_embed for _ in range(num_pred)])
             self.decoder.bbox_embed = None
             self.decoder.class_embed = None
-            self.decoder.mask_embed = None
 
-        # if two_stage:
-        #     # self.enc_class_embed.bias.data = torch.ones_like(self.enc_class_embed.bias) * bias_value
-        #     # nn.init.constant_(self.enc_bbox_embed.layers[-1].weight.data, 0)
-        #     # nn.init.constant_(self.enc_bbox_embed.layers[-1].bias.data, 0)
-
-        #     self.enc_out_class_embed = self.class_embed
-        #     self.enc_out_bbox_embed = self.bbox_embed[-1]
-
-        #     if self.decoder_use_mask_as_ref:
-        #         self.enc_out_mask_embed = self.mask_embed[-1]
-
-        if self.merge_frame_features:
-            self.merge_features = nn.Conv2d(self.hidden_dim * 2, self.hidden_dim, kernel_size=1)
-            self.merge_features = _get_clones(self.merge_features, num_feature_levels)
-    
-        self.decoder_norm  = nn.LayerNorm(self.hidden_dim)
-
-    def forward_prediction_heads(self, output, l):
-        decoder_output = self.decoder_norm(output.transpose(0,1))
-        decoder_output = decoder_output.transpose(0, 1)
-        mask_embed = self.mask_embed[l](decoder_output)
-        outputs_class = self.class_embed(decoder_output)
-
-        outputs_mask_1 = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,:self.mask_dim], self.all_mask_features)
-        outputs_mask_2 = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,self.mask_dim:], self.all_mask_features)
-
-        outputs_mask = torch.stack((outputs_mask_1,outputs_mask_2),axis=2)
-
-        return outputs_mask, outputs_class
-
-
-    def forward(self, samples: NestedTensor, targets: list = None, output_target: str = None, prev_features=None, group_object=False, dn_object=False, dn_enc=False, add_object_queries_to_dn_track=False,return_features_only=False,track=True):
+    def forward(self, samples: NestedTensor, targets: list = None, target_name: str = 'cur_target'):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -234,45 +176,30 @@ class DeformableDETR():
         """
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
+            
         features, pos = self.backbone(samples)
 
         self.samples = samples
-
-        if return_features_only:
-            return features
 
         features_all = features
 
         features = features[-self.num_feature_levels:]
 
-        if prev_features is None:
-            prev_features = features
-        else:
-            prev_features = prev_features[-self.num_feature_levels:]
-
         src_list = []
-        mask_list = []
-        pos_list = []
-
-        frame_features = [prev_features, features]
-        if not self.multi_frame_attention:
-            frame_features = [features]
+        mask_list = [] # mask for image size smaller than target size
+        pos_list = [] # pos embeddings
+        frame_features = [features]
 
         for frame, frame_feat in enumerate(frame_features):
-            if self.multi_frame_attention and self.multi_frame_encoding:
+            if self.multi_frame_attention:
                 pos_list.extend([p[:, frame] for p in pos[-self.num_feature_levels:]])
             else:
                 pos_list.extend(pos[-self.num_feature_levels:])
 
             for l, feat in enumerate(frame_feat):
+
                 src, mask = feat.decompose()
-
-                if self.merge_frame_features:
-                    prev_src, _ = prev_features[l].decompose()
-                    src_list.append(self.merge_features[l](torch.cat([self.input_proj[l](src), self.input_proj[l](prev_src)], dim=1)))
-                else:
-                    src_list.append(self.input_proj[l](src))
-
+                src_list.append(self.input_proj[l](src))
                 mask_list.append(mask)
 
                 assert mask is not None
@@ -281,11 +208,7 @@ class DeformableDETR():
                 _len_srcs = len(frame_feat)
                 for l in range(_len_srcs, self.num_feature_levels):
                     if l == _len_srcs:
-
-                        if self.merge_frame_features:
-                            src = self.merge_features[l](torch.cat([self.input_proj[l](frame_feat[-1].tensors), self.input_proj[l](prev_features[-1].tensors)], dim=1))
-                        else:
-                            src = self.input_proj[l](frame_feat[-1].tensors)
+                        src = self.input_proj[l](frame_feat[-1].tensors)
                     else:
                         src = self.input_proj[l](src_list[-1])
 
@@ -295,13 +218,13 @@ class DeformableDETR():
                     pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
                     src_list.append(src)
                     mask_list.append(mask)
-                    if self.multi_frame_attention and self.multi_frame_encoding:
+                    if self.multi_frame_attention:
                         pos_list.append(pos_l[:, frame])
                     else:
                         pos_list.append(pos_l)
 
         bs = src.shape[0]
-        training_methods = []
+        training_methods = ['main']
         #### DAB-DETR
         query_attn_mask = None 
 
@@ -318,23 +241,29 @@ class DeformableDETR():
             num_queries = self.num_queries
 
             # Initialize the attn_mask
-            if targets is not None and len(targets[0]) > 0 and 'track_query_hs_embeds' in targets[0][output_target]:
-                num_track_queries = targets[0][output_target]['track_query_hs_embeds'].shape[0]
+            if targets is not None and len(targets[0]) > 0 and 'track_query_hs_embeds' in targets[0]['main'][target_name]:
+                num_track_queries = targets[0]['main'][target_name]['track_query_hs_embeds'].shape[0]
             else: 
                 num_track_queries = 0
 
             num_total_queries = num_queries + num_track_queries 
             query_attn_mask = torch.zeros((num_total_queries,num_total_queries)).bool().to(self.device)
 
+            if targets is not None and target_name == 'cur_target':
+                for target in targets:
+                    target['main']['start_query_ind'] = 0
+                    target['main']['end_query_ind'] = num_total_queries
+
             #### DN-DETR for noised object detection
-            if targets is not None and 'boxes' in targets[0][output_target] and dn_object and torch.tensor([target[output_target]['empty'] for target in targets]).sum() == 0: # If there is an empty chamber, skip all denoising
+            if self.dn_object and target_name == 'cur_target' and targets is not None and torch.tensor([target['main'][target_name]['empty'] for target in targets]).sum() == 0: # If there is an empty chamber, skip all denoising
                 training_methods.append('dn_object')
 
-                num_boxes = torch.tensor([len(target[output_target]['labels_orig']) - int(target[output_target]['empty']) for target in targets]).to(self.device)
+                num_boxes = torch.tensor([len(target['main'][target_name]['labels_orig']) - int(target['main'][target_name]['empty']) for target in targets]).to(self.device)
                 num_FPs = max(num_boxes) - num_boxes
 
-                if num_FPs.max() < 2:
-                    num_FPs += torch.randint(4,(1,)).to(self.device)
+                if self.dn_object_FPs:
+                    if num_FPs.max() < 2:
+                        num_FPs += torch.randint(4,(1,)).to(self.device)
 
                 num_dn_object_queries = max(num_boxes + num_FPs)
 
@@ -345,51 +274,60 @@ class DeformableDETR():
 
                 for t,target in enumerate(targets):
 
-                    random_mask = torch.randperm(target[output_target]['boxes_orig'].shape[0]).to(self.device)
+                    random_mask = torch.randperm(target['main'][target_name]['boxes_orig'].shape[0]).to(self.device)
 
-                    target['dn_object'] = {}
-                    target['dn_object']['boxes'] = target[output_target]['boxes_orig'].clone()[random_mask]
-                    target['dn_object']['labels'] = target[output_target]['labels_orig'].clone()[random_mask]
-                    target['dn_object']['track_ids'] = target[output_target]['track_ids_orig'].clone()[random_mask]
-                    target['dn_object']['flexible_division'] = target[output_target]['flexible_divisions_orig'].clone()[random_mask]
-                    target['dn_object']['framenb'] = target[output_target]['framenb']
-                    target['dn_object']['empty'] = target[output_target]['empty']
-                    target['dn_object']['track_queries_fal_pos_mask'] = torch.zeros((num_dn_object_queries)).bool().to(self.device)
-                    target['dn_object']['prev_target'] = target['prev_target'].copy()
-                    target['dn_object']['fut_target'] = target['fut_target'].copy()
+                    target['dn_object'] = {'training_method': 'dn_object', 'cur_target': {}}
 
-                    if 'masks' in targets[0]['cur_target']:
-                        target['dn_object']['masks'] = target[output_target]['masks_orig'].clone()
+                    target['dn_object']['man_track'] = target['main']['man_track'].clone()
+                    target['dn_object']['cur_target']['framenb'] = target['main'][target_name]['framenb']
+                    target['dn_object']['cur_target']['empty'] = target['main'][target_name]['empty']
+                    target['dn_object']['cur_target']['track_queries_fal_pos_mask'] = torch.zeros((num_dn_object_queries)).bool().to(self.device)
+
+                    target['dn_object']['prev_target'] = target['main']['prev_target'].copy()
+                    target['dn_object']['fut_target'] = target['main']['fut_target'].copy()
+
+                    dict_keys = ['boxes','labels','track_ids','flexible_divisions','is_touching_edge']
+
+                    if self.masks:
+                        dict_keys += ['masks']
+                    for dict_key in dict_keys: # ['labels','boxes','masks','track_ids','empty']
+                        for orig in ['','_orig']:
+                            if dict_key in target['main'][target_name]:
+                                target['dn_object']['cur_target'][dict_key + orig] = target['main'][target_name][dict_key + '_orig'].clone()[random_mask]
+
+                    target['dn_object']['cur_target']['track_query_match_ids'] = torch.arange(target['dn_object']['cur_target']['boxes'].shape[0],dtype=torch.int64).to(self.device)
 
                     l_1 = self.dn_object_l1
                     l_2 = self.dn_object_l2
 
-                    noised_boxes = add_noise_to_boxes(target['dn_object']['boxes'][:,:4].clone(),l_1,l_2)
-                    noised_labels = target['dn_object']['labels'][:,0].clone()
+                    noised_boxes = box_ops.add_noise_to_boxes(target['dn_object']['cur_target']['boxes'][:,:4].clone(),l_1,l_2)
 
                     if num_FPs[t] > 0:
-                        random_FP_mask = torch.randperm(min(num_FPs[t],target['dn_object']['boxes'].shape[0]))
-                        FP_boxes = target['dn_object']['boxes'][random_FP_mask,:4].clone()
+                        if self.dn_object_FPs:
+                            random_FP_mask = torch.randperm(min(num_FPs[t],target['dn_object']['cur_target']['boxes'].shape[0]))
+                            FP_boxes = target['dn_object']['cur_target']['boxes'][random_FP_mask,:4].clone()
 
-                        # If you use a batch size greater than 1, one image may have 5 cells and other has 1 cell. Therefore, you would need to have 4 denoised boxes for the 1 cell
-                        while num_FPs[t] > FP_boxes.shape[0]:
-                            random_FP_mask = torch.randperm(min(num_FPs[t] - FP_boxes.shape[0],target['dn_object']['boxes'].shape[0]))
-                            FP_boxes = torch.cat((FP_boxes,target['dn_object']['boxes'][random_FP_mask,:4].clone()))
+                            if num_FPs[t] > FP_boxes.shape[0]: # Only add one FP per cell in image, otherwise, just add empty boxes. don't want to overload with 100 boxes for one cell if there is a big mismatch between two images in a batch
+                                empty_boxes = torch.zeros((num_FPs[t].item() - FP_boxes.shape[0],4),dtype=FP_boxes.dtype).to(self.device)
+                                FP_boxes = torch.cat((FP_boxes,empty_boxes),0)
+                        else:
+                            FP_boxes = torch.zeros((num_FPs[t].item() - FP_boxes.shape[0],4),dtype=FP_boxes.dtype).to(self.device)
 
-                        FP_boxes = add_noise_to_boxes(FP_boxes,l_1*3,l_2*3)
+                        FP_boxes = box_ops.add_noise_to_boxes(FP_boxes,l_1*4,l_2*4)
                         noised_boxes = torch.cat((noised_boxes, FP_boxes),axis=0)
                         # No tracking is done here; just a formality so it works in the matcher.py code; but there are FPs as in empty tracking boxes
-                        target['dn_object']['track_queries_fal_pos_mask'][-num_FPs[t]:] = True
+                        target['dn_object']['cur_target']['track_queries_fal_pos_mask'][-num_FPs[t]:] = True
 
-                        noised_labels = torch.cat((noised_labels,torch.ones((num_FPs[t])).long().to(self.device)))
+                    target['dn_object']['cur_target']['num_FPs'] = num_FPs[t]
                     
                     # Also a formality so it works in the mathcer.py code
-                    target['dn_object']['track_queries_mask'] = torch.ones((num_dn_object_queries)).bool().to(self.device)
-                    target['dn_object']['num_queries'] = num_dn_object_queries
-                    target['dn_object']['noised_boxes'] = noised_boxes
-                    target['dn_object']['noised_labels'] = noised_labels
+                    target['dn_object']['cur_target']['track_queries_mask'] = torch.ones((num_dn_object_queries)).bool().to(self.device)
+                    target['dn_object']['cur_target']['num_queries'] = num_dn_object_queries
+                    target['dn_object']['cur_target']['noised_boxes'] = noised_boxes
+                    target['dn_object']['start_query_ind'] = num_total_queries
+                    target['dn_object']['end_query_ind'] = num_total_queries + num_dn_object_queries.item()
 
-                    label_embedding = self.label_enc(noised_labels)
+                    label_embedding = self.dn_object_embedding.weight.repeat(num_dn_object_queries,1)
                     query_embed_dn_object[t,:,:self.hidden_dim] = label_embedding
                     query_embed_dn_object[t,:,self.hidden_dim:] = noised_boxes      
 
@@ -411,65 +349,23 @@ class DeformableDETR():
             else:
                 query_embeds = self.query_embed.weight
 
-        hs, memory, init_reference, inter_references, enc_outputs, training_methods, init_masks_ref, outputs_mask, outputs_class = \
-            super().forward(features_all, src_list, mask_list, pos_list, query_embeds, targets, output_target, query_attn_mask, dn_enc, training_methods, add_object_queries_to_dn_track,track=track)
+        hs, memory, reference_points, outputs_class, outputs_bbox, enc_outputs, training_methods, OD_outputs = \
+            super().forward(features_all, src_list, mask_list, pos_list, query_embeds, targets, target_name, query_attn_mask, training_methods)
 
-        save_references = torch.cat((init_reference[None],inter_references[...,:init_reference.shape[-1]]),axis=0)
-
-        outputs_coords = []
-        for lvl in range(hs.shape[0]):
-            if self.decoder_use_mask_as_ref:
-
-                outputs_coord = self.bbox_embed[lvl](hs[lvl]).sigmoid()
-                assert torch.sum(torch.isnan(outputs_coord)) == 0, 'Nan in boxes from prediction'
-                assert torch.sum(outputs_coord < 0) == 0, 'Negative boxes in prediction'
-                
-            else:
-
-                if lvl == 0:
-                    reference = init_reference
-                else:
-                    reference = inter_references[lvl - 1]
-                reference = inverse_sigmoid(reference)
-                # outputs_class = self.class_embed[lvl](hs[lvl])
-                tmp = self.bbox_embed[lvl](hs[lvl])
-                if reference.shape[-1] == 4:
-                    tmp[:,:,:4] += reference
-                    tmp[:,:,4:] += reference
-                else:
-                    assert reference.shape[-1] == 2
-                    tmp[..., :2] += reference
-                    tmp[..., 4:6] += reference
-                outputs_coord = tmp.sigmoid()
-                # outputs_classes.append(outputs_class)
-
-                assert torch.sum(torch.isnan(outputs_coord)) == 0, 'Nan in boxes from prediction'
-                assert torch.sum(outputs_coord < 0) == 0, 'Negative boxes in prediction'
-                
-            outputs_coords.append(outputs_coord)
-
-        # outputs_class = torch.stack(outputs_classes)
-        outputs_coord = torch.stack(outputs_coords)
-
-        training_methods = ['cur_target'] + training_methods
-
-        out = {'pred_boxes': outputs_coord[-1],
+        out = {'pred_logits': outputs_class[-1],
+               'pred_boxes': outputs_bbox[-1],
                'hs_embed': hs[-1],
-               'references': save_references,
-               'training_methods': training_methods,}
-        
-        if outputs_mask is not None:
-            out['pred_masks'] = outputs_mask[-1]
-            out['pred_logits'] = outputs_class[-1]
+               'references': reference_points,
+               'training_methods': training_methods}
+
+        if OD_outputs:
+               out['OD'] = OD_outputs
 
         if self.aux_loss:
-            if self.decoder_use_mask_as_ref:
-                out['aux_outputs'] = self._set_aux_loss(outputs_coord, outputs_class, outputs_mask)
-            else:
-                out['aux_outputs'] = self._set_aux_loss(outputs_coord)
+            out['aux_outputs'] = self._set_aux_loss(outputs_bbox, outputs_class)
 
         if bool(enc_outputs):
-            out['enc_outputs'] = enc_outputs
+            out['two_stage'] = enc_outputs
 
         offset = 0
         memory_slices = []
@@ -491,58 +387,5 @@ class DeformableDETR():
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
 
-        if self.decoder_use_mask_as_ref:
-            assert outputs_class is not None and outputs_mask is not None
-            return [{'pred_boxes': a, 'pred_logits': b, 'pred_masks': c} for a, b, c in zip(outputs_coord[:-1], outputs_class[:-1], outputs_mask[:-1])]
-        else:
-            return [{'pred_boxes': a} for a in outputs_coord[:-1]]
-
-class DeformablePostProcess(PostProcess):
-    """ This module converts the model's output into the format expected by the coco api"""
-
-    @torch.no_grad()
-    def forward(self, outputs, target_sizes, results_mask=None):
-        """ Perform the computation
-        Parameters:
-            outputs: raw outputs of the model
-            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
-                          For evaluation, this must be the original image size (before any data augmentation)
-                          For visualization, this should be the image size after data augment, but before padding
-        """
-        out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
-
-        assert len(out_logits) == len(target_sizes)
-        assert target_sizes.shape[1] == 2
-
-        prob = out_logits.sigmoid()
-
-        ###
-        # topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), 100, dim=1)
-        # scores = topk_values
-
-        # topk_boxes = topk_indexes // out_logits.shape[2]
-        # labels = topk_indexes % out_logits.shape[2]
-
-        # boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        # boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
-        ###
-
-        scores, labels = prob.max(-1)
-        # scores, labels = prob[..., 0:1].max(-1)
-        boxes = torch.cat((box_ops.box_cxcywh_to_xyxy(out_bbox[:,:4]),box_ops.box_cxcywh_to_xyxy(out_bbox[:,4:])),axis=1)
-
-        # and from relative [0, 1] to absolute [0, height] coordinates
-        img_h, img_w = target_sizes.unbind(1)
-        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
-        boxes = boxes * scale_fct[:, None, :]
-
-        results = [
-            {'scores': s, 'scores_no_object': 1 - s, 'labels': l, 'boxes': b}
-            for s, l, b in zip(scores, labels, boxes)]
-
-        if results_mask is not None:
-            for i, mask in enumerate(results_mask):
-                for k, v in results[i].items():
-                    results[i][k] = v[mask]
-
-        return results
+        assert outputs_coord is not None and outputs_class is not None
+        return [{'pred_boxes': a, 'pred_logits': b} for a, b in zip(outputs_coord[:-1], outputs_class[:-1])]

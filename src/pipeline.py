@@ -1,5 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-import datetime
+
 import os
 import random
 import time
@@ -9,104 +9,49 @@ import numpy as np
 import sacred
 import torch
 import re
-from torch.utils.data import DataLoader, DistributedSampler
+import shutil 
 
 import trackformer.util.misc as utils
-from trackformer.engine import pipeline, print_worst
+from trackformer.engine import pipeline
 from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
-from trackformer.datasets import build_dataset
 
+dataset = 'moma'
+dataset = 'DynamicNuclearNet-tracking-v1_0'
 
-dataset_name = 'moma' #['moma','2D','DIC-C2DH-HeLa','Fluo-N2DH-SIM+']
-modelname = '231025_moma_flex_div_CoMOT_track_two_stage_dn_enc_dn_track_dn_track_group_dab_intermediate_mask_4_enc_4_dec_layers'
-modelpath = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname
+modelpath = Path('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results') / dataset
+datapath = Path('/projectnb/dunlop/ooconnor/MOT/data') / dataset / 'CTC' / 'test'
 
 ex = sacred.Experiment('pipeline')
 ex.add_config(modelpath.as_posix() + '/config.yaml')
-# ex.add_config('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/cfgs/train_' + dataset_name + '.yaml')
 
-def train(args: Namespace) -> None:
-
-    args.eval_ctc = True
-    args.flex_div = False
-    # args.use_img_for_mask = False
-    # args.CoMOT_loss_ce = True
-
-    # args.target_size = tuple(args.target_size)
-    dn_track = True
-    dn_object = True
-    dn_enc = False
-    args.enc_FN = 0
-
-    if not dn_track or args.eval_ctc:
-        args.dn_track = False
-    if not dn_object or args.eval_ctc:
-        args.dn_object = False
-    if not dn_enc or args.eval_ctc:
-        args.dn_enc = False
+def train(args: Namespace, modelpath, datapath) -> None:
 
     args.output_dir = Path(args.output_dir)
     print(args.output_dir)
-    args.resume = Path('/projectnb/dunlop/ooconnor/object_detection/cell-trackformer/results') / modelname / 'checkpoint.pth'
+    args.resume = modelpath / 'checkpoint.pth'
 
-    track = True
-    display_masks = True
-    
-    args.no_data_aug = True
-    display_worst = True
-    args.use_prev_prev_frame = False
-    args.hooks = True
+    dataset_name = args.dataset
+
+    if not datapath.exists():
+        datapath = datapath.parent / 'val'
+
+    args.output_dir = args.output_dir / datapath.name
+
+    args.hooks = False
     args.avg_attn_weight_maps = False
 
-    run_movie = False
-    use_NMS = True
-
-    # args.init_boxes_from_masks = True
-
-    datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data') / dataset_name / 'test' / 'CTC'
-    # datapath = Path('/projectnb/dunlop/ooconnor/object_detection/data' + f'/{dataset_name}' + '/CTC_coco/')
-
-    if args.eval_ctc:
-        if '2D' in dataset_name:
-            args.output_dir = args.output_dir
-        else:
-            args.output_dir = args.output_dir / 'test' / 'CTC'
-        args.output_dir.parent.mkdir(exist_ok=True)
-        args.output_dir.mkdir(exist_ok=True)
-        track = True
-        display_masks = True
-        run_movie = True
-        display_worst = False
-        display_all_aux_outputs = True
-
-    if dataset_name == '2D':
-        display_all_aux_outputs = False
-    
-    args.batch_size = 1
-
-    print(args)
-
-    args.output_dir.mkdir(exist_ok=True)
-
-    if display_worst:
-        (args.output_dir / 'val_outputs').mkdir(exist_ok=True)
-        (args.output_dir / 'train_outputs').mkdir(exist_ok=True)
+    if dataset_name != 'moma':
+        args.display_decoder_aux = False
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
-
-    if not args.deformable:
-        assert args.num_feature_levels == 1
         
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
-
     os.environ['PYTHONHASHSEED'] = str(seed)
-    # os.environ['NCCL_DEBUG'] = 'INFO'
-    # os.environ["NCCL_TREE_THRESHOLD"] = "0"
 
     np.random.seed(seed)
     random.seed(seed)
@@ -116,167 +61,58 @@ def train(args: Namespace) -> None:
 
     model, criterion = build_model(args)
     model.to(device)
+    model.train_model = False
+    model.eval()
+    args.eval_only = True
+    criterion.eval_only = True
 
     model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
+
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('NUM TRAINABLE MODEL PARAMS:', n_parameters)
 
-    if str(args.resume).startswith('https'):
-        checkpoint = torch.hub.load_state_dict_from_url(
-            args.resume, map_location='cpu', check_hash=True)
-    else:
-        checkpoint = torch.load(args.resume, map_location='cpu')
-
-    model_state_dict = model_without_ddp.state_dict()
-    checkpoint_state_dict = checkpoint['model']
-    checkpoint_state_dict = {k.replace('detr.', ''): v for k, v in checkpoint['model'].items()}
-
-    for k, v in checkpoint_state_dict.items():
-        if k not in model_state_dict:
-            print(f'Where is {k} {tuple(v.shape)}?')
-
-    resume_state_dict = {}
-    for k, v in model_state_dict.items():
-        if k not in checkpoint_state_dict:
-            resume_value = v
-            print(f'Load {k} {tuple(v.shape)} from scratch.')
-        elif v.shape != checkpoint_state_dict[k].shape:
-            checkpoint_value = checkpoint_state_dict[k]
-            num_dims = len(checkpoint_value.shape)
-
-            if 'norm' in k:
-                resume_value = checkpoint_value.repeat(2)
-            elif 'multihead_attn' in k or 'self_attn' in k:
-                resume_value = checkpoint_value.repeat(num_dims * (2, ))
-            elif 'reference_points' in k and checkpoint_value.shape[0] * 2 == v.shape[0]:
-                resume_value = v
-                resume_value[:2] = checkpoint_value.clone()
-            elif 'linear1' in k or 'query_embed' in k:
-                resume_state_dict[k] = v
-                print(f'Load {k} {tuple(v.shape)} from scratch.')
-                continue
-            elif 'linear2' in k or 'input_proj' in k:
-                resume_value = checkpoint_value.repeat((2,) + (num_dims - 1) * (1, ))
-            elif 'class_embed' in k:
-                resume_value = checkpoint_value[list(range(0, 20))]
-            else:
-                raise NotImplementedError(f"No rule for {k} with shape {v.shape}.")
-
-            print(f"Load {k} {tuple(v.shape)} from resume model "
-                    f"{tuple(checkpoint_value.shape)}.")
-        elif args.resume_shift_neuron and 'class_embed' in k:
-            checkpoint_value = checkpoint_state_dict[k]
-            resume_value = checkpoint_value.clone()
-            resume_value[:-1] = checkpoint_value[1:].clone()
-            resume_value[-2] = checkpoint_value[0].clone()
-            print(f"Load {k} {tuple(v.shape)} from resume model and "
-                    "shift class embed neurons to start with label=0 at neuron=0.")
-        else:
-            resume_value = checkpoint_state_dict[k]
-
-        resume_state_dict[k] = resume_value
-
-    if args.masks and args.load_mask_head_from_model is not None:
-        checkpoint_mask_head = torch.load(
-            args.load_mask_head_from_model, map_location='cpu')
-
-        for k, v in resume_state_dict.items():
-
-            if (('bbox_attention' in k or 'mask_head' in k)
-                and v.shape == checkpoint_mask_head['model'][k].shape):
-                print(f'Load {k} {tuple(v.shape)} from mask head model.')
-                resume_state_dict[k] = checkpoint_mask_head['model'][k]
-
-    model_without_ddp.load_state_dict(resume_state_dict)
-
-    if run_movie:
-        start_time = time.time()
-        model.evaluate_dataset_with_no_data_aug = False
-        folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if re.findall('\d\d$',folderpath.name)]
-        if args.eval_ctc or '2D' in args.dataase_name:
-
-            if '2D' in dataset_name:
-                (args.output_dir / 'pred').mkdir(exist_ok=True)
-
-            for f,folderpath in enumerate(folderpaths):
-
-                fps = sorted(list(folderpath.glob("*.tif")))
-
-                if '2D' in dataset_name:
-
-                    if f == len(folderpaths)-1:
-                        continue
-
-                    fut_fps = sorted(list(folderpaths[f+1].glob("*.tif")))
-
-                    if f < len(folderpaths) and int(re.findall('\d+',fut_fps[-1].name)[-1]) > int(re.findall('\d+',fps[-1].name)[-1]):
-                        continue
-                    
-                    output_dir_fol = args.output_dir / 'pred' / folderpath.name
-
-                else:
-                    output_dir_fol = args.output_dir / folderpath.name
-
-                output_dir_fol.mkdir(exist_ok=True)
-
-                Pipeline = pipeline(model, fps, device, output_dir_fol, args, track, use_NMS=use_NMS, display_masks=display_masks,display_all_aux_outputs=display_all_aux_outputs)
-                Pipeline.forward()
-
-        else:
-            fps = [sorted(list(folderpath.iterdir())) for folderpath in folderpaths]
-
-            Pipeline = pipeline(model, fps, device, args.output_dir, args, track, use_NMS=use_NMS, display_masks=display_masks)
-            Pipeline.forward()
-
-        print(round((start_time - time.time())/60,2))
-    
-    if display_worst:
-
-        model.eval_prev_prev_frame = args.use_prev_prev_frame
-        model.no_data_aug = args.no_data_aug
-        
-        dataset_train = build_dataset(split='train', args=args)
-        dataset_val = build_dataset(split='val', args=args)
-
-        if args.distributed:
-            sampler_train = DistributedSampler(dataset_train, shuffle=False)
-            sampler_val = DistributedSampler(dataset_val, shuffle=False)
-        else:
-            sampler_train = torch.utils.data.SequentialSampler(dataset_train)
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-        data_loader_train = DataLoader(
-            dataset_train,
-            batch_size = 1,
-            sampler=sampler_train,
-            collate_fn=utils.collate_fn,
-            num_workers=args.num_workers)
-            
-        data_loader_val = DataLoader(
-            dataset_val, 
-            batch_size = 1,
-            sampler=sampler_val,
-            drop_last=False,
-            collate_fn=utils.collate_fn,
-            num_workers=args.num_workers)
-
-        print_worst(model,criterion,data_loader_train,data_loader_val,device,args,track)
+    model_without_ddp = utils.load_model(model_without_ddp,args) # If eval_only, optimizer will not be loaded (only relevant for training)
 
 
+    folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if re.findall('\d\d$',folderpath.name)]
+    folderpaths = [fp for fp in folderpaths if int(fp.stem) in [10]]
+
+    if not args.tracking or not args.masks:
+        raise NotImplementedError
+
+    (args.output_dir.parent).mkdir(exist_ok=True)
+    (args.output_dir).mkdir(exist_ok=True)
+    args.output_dir = args.output_dir / 'CTC'
+    (args.output_dir).mkdir(exist_ok=True)
+
+    start_time = time.time()
+    total_frames = 0
+
+    for f,folderpath in enumerate(folderpaths):
+
+        fps = sorted(list(folderpath.glob("*.tif")))
+        total_frames += len(fps)
+
+        Pipeline = pipeline(model, fps, args)
+        Pipeline.forward()
+
+        if f == len(folderpaths) - 1 and Pipeline.all_videos_same_size:
+            Pipeline.display_enc_map(save=False,last=True)
+        elif not Pipeline.all_videos_same_size:
+            shutil.rmtree(args.output_dir / 'two_stage')
+
+    total_time = time.time() - start_time
+    fps = total_frames / total_time
+
+    # with open(str(args.output_dir.parent / 'FPS.txt'), 'w') as file:
+    #     file.write(f"Frames per second (FPS): {fps:2f}\n")
 
 @ex.main
 def load_config(_config, _run):
     """ We use sacred only for config loading from YAML files. """
     sacred.commands.print_config(_run)
 
-
 if __name__ == '__main__':
-    # TODO: hierachical Namespacing for nested dict
     config = ex.run_commandline().config
     args = nested_dict_to_namespace(config)
-    # args.train = Namespace(**config['train'])
-    train(args)
+    train(args,modelpath,datapath)
