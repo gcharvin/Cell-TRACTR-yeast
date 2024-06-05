@@ -19,9 +19,13 @@ You need to update 2 variables
 
 ## Visual
 
-A microscopy video of bacteria growing in the mothermachine analyzed by XXX
+A time-lapse microscopy video of bacteria growing in the mother machine analyzed by XXX. The raw images used to generate this movie was taken from the test set within the [mother machine dataset](https://zenodo.org/records/11237127)
 
 ![[Video]](https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExZHd5cW4yZHFzYTI4NTcwbXI1aXp6Y2p5MWNzMzRteHl0a3NnN2NlMSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/7wWaj433Fsyf085Oy0/giphy.gif)
+
+A time-lapse microscopy video of mammalian cells growing on well plates.  The raw images used to generate this movie was taken from the test set within the [DeepCell dataset (DynamicNuclearNet Tracking)](https://datasets.deepcell.org/data)
+
+![Video](https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjExMjFzbXBkZmFpYnZsNjdpbmlvZjY1cGFpdGc0NnNuZWoyOHg4bWN3YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/fhTdHoCSARZjrRpyyn/giphy.gif)
 
 ## License
 For open source projects, say how it is licensed.
