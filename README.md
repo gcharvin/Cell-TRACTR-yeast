@@ -6,7 +6,18 @@ This repository provides the implementation of [XXX](link to paper) paper by Owe
 
 ## Installation
 
-We refer to our docs/INSTALL.md for detailed installation instructions
+Clone and enter this repository:
+
+git clone https://gitlab.com/dunloplab/deeplearning/cell-trackformer.git
+```
+cd cell-trackformer
+Install packages for Python 3.10:
+```
+
+pip3 install -r requirements.txt
+Install PyTorch 1.13.1 and cuda 11.6 from [here](https://pytorch.org/get-started/previous-versions/#v1131).
+Install pycocotools (with fixed ignore flag): ```pip3 install -U 'git+https://github.com/timmeinhardt/cocoapi.git#subdirectory=PythonAPI'```
+Install MultiScaleDeformableAttention package: ```python src/trackformer/models/ops/setup.py build --build-base=src/trackformer/models/ops/ install```
 
 ## Train XXX
 
@@ -21,7 +32,7 @@ You need to update 2 variables
 
 A time-lapse microscopy video of bacteria growing in the mother machine analyzed by XXX. The raw images used to generate this movie was taken from the test set within the [mother machine dataset](https://zenodo.org/records/11237127)
 
-![[Video]](https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExZHd5cW4yZHFzYTI4NTcwbXI1aXp6Y2p5MWNzMzRteHl0a3NnN2NlMSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/7wWaj433Fsyf085Oy0/giphy.gif)
+![[Video]](https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExd2VrOW16djJnYzJ4cWhsd2F0cjNtNzVnazgzNjZuMjhucmdoNGkwYiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/cwNDVhxqTPYMYMxd75/giphy.gif)
 
 A time-lapse microscopy video of mammalian cells growing on well plates.  The raw images used to generate this movie was taken from the test set within the DeepCell dataset - [DynamicNuclearNet Tracking](https://datasets.deepcell.org/data)
 
