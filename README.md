@@ -9,14 +9,18 @@ This repository provides the implementation of [XXX](link to paper) paper by Owe
 Clone and enter this repository:
 
 git clone https://gitlab.com/dunloplab/deeplearning/cell-trackformer.git
-```
-cd cell-trackformer
-Install packages for Python 3.10:
-```
 
-pip3 install -r requirements.txt
+```cd cell-trackformer```
+
+Install packages for Python 3.10:
+
+
+```pip3 install -r requirements.txt```
+
 Install PyTorch 1.13.1 and cuda 11.6 from [here](https://pytorch.org/get-started/previous-versions/#v1131).
+
 Install pycocotools (with fixed ignore flag): ```pip3 install -U 'git+https://github.com/timmeinhardt/cocoapi.git#subdirectory=PythonAPI'```
+
 Install MultiScaleDeformableAttention package: ```python src/trackformer/models/ops/setup.py build --build-base=src/trackformer/models/ops/ install```
 
 ## Train XXX
