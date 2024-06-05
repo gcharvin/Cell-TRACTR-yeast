@@ -8,7 +8,7 @@ This repository provides the implementation of [XXX](link to paper) paper by Owe
 
 Clone and enter this repository:
 
-git clone https://gitlab.com/dunloplab/deeplearning/cell-trackformer.git
+```git clone https://gitlab.com/dunloplab/deeplearning/cell-trackformer.git```
 
 ```cd cell-trackformer```
 
