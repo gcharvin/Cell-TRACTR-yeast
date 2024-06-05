@@ -21,7 +21,7 @@ You need to update 2 variables
 
 A microscopy video of bacteria growing in the mothermachine analyzed by XXX
 
-![[Video]](https://giphy.com/gifs/7wWaj433Fsyf085Oy0)
+![[Video]](https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExZHd5cW4yZHFzYTI4NTcwbXI1aXp6Y2p5MWNzMzRteHl0a3NnN2NlMSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/7wWaj433Fsyf085Oy0/giphy.gif)
 
 ## License
 For open source projects, say how it is licensed.
