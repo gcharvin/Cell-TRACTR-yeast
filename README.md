@@ -14,8 +14,11 @@ Clone and enter this repository:
 
 Install packages for Python 3.10:
 
-
 ```pip3 install -r requirements.txt```
+
+Install ffmpeg
+
+```conda install -c conda-forge ffmpeg```
 
 Install PyTorch 1.13.1 and cuda 11.6 from [here](https://pytorch.org/get-started/previous-versions/#v1131).
 
