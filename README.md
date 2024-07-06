@@ -46,4 +46,5 @@ A time-lapse microscopy video of mammalian cells growing on 96-well plates.  The
 ![Video](https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjExMjFzbXBkZmFpYnZsNjdpbmlvZjY1cGFpdGc0NnNuZWoyOHg4bWN3YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/fhTdHoCSARZjrRpyyn/giphy.gif)
 
 ## License
-For open source projects, say how it is licensed.
+
+Cell-TRACTR is released under the [Apache 2.0 License](LICENSE).
