@@ -8,7 +8,7 @@ This repository provides the implementation of [Cell-TRACTR](link to paper) pape
 
 Clone and enter this repository:
 
-```git clone https://gitlab.com/dunloplab/deeplearning/Cell-TRACTR.git```
+```git clone https://gitlab.com/dunloplab/Cell-TRACTR.git```
 
 ```cd Cell-TRACTR```
 
