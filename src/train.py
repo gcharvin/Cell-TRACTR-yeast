@@ -15,25 +15,24 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
-dataset = 'DynamicNuclearNet-tracking-v1_0' #['moma','2D', 'DynamicNuclearNet-tracking-v1_0']
-datapath = Path('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results')
+dataset = 'moma' #['moma','2D', 'DynamicNuclearNet-tracking-v1_0']
+respath = Path('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results')
 
 ex = sacred.Experiment('train')
 
 def train() -> None:
     
-    if (datapath / dataset / 'checkpoint.pth').exists():
-        ex.add_config(str(datapath / dataset / 'config.yaml'))
+    if (respath / dataset / 'checkpoint.pth').exists():
+        ex.add_config(str(respath / dataset / 'config.yaml'))
     else:
-        ex.add_config(datapath / dataset / 'cfgs' / ('train_' + dataset + '.yaml'))
+        ex.add_config(respath / dataset / 'cfgs' / ('train_' + dataset + '.yaml'))
 
     config = ex.run_commandline().config
     args = utils.nested_dict_to_namespace(config)
 
-    if (datapath / dataset / 'config.yaml').exists():
-        args.resume = datapath / 'checkpoint.pth'
+    if (respath / dataset / 'config.yaml').exists():
+        args.resume = respath / 'checkpoint.pth'
 
-    args.output_dir = datapath / dataset
     args.output_dir.mkdir(exist_ok=True)
 
     if args.dn_track or args.dn_object:
