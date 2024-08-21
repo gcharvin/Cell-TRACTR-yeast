@@ -150,7 +150,7 @@ dataset: moma
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/moma
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results
 data_dir: /projectnb/dunlop/ooconnor/MOT/data
 # device to use for training / testing
 device: cuda
