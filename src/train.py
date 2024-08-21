@@ -16,7 +16,7 @@ from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
 dataset = 'moma' #['moma','2D', 'DynamicNuclearNet-tracking-v1_0']
-respath = Path('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results')
+respath = Path('/projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results')
 
 ex = sacred.Experiment('train')
 
