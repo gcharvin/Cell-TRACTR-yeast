@@ -15,7 +15,7 @@ target_size: (256,32)
 # Number of object queries
 num_queries: 30
 # Flexible divisions
-flex_div: false
+flex_div: true
 # Tracking 2 sequential frames - use prev_prev, prev and cur frame (detection 1 frame and track for 2 frames - 3 frames total)
 use_prev_prev_frame: true
 # For 2D data, image will be randomly cropped around objects
@@ -150,7 +150,7 @@ dataset: moma
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/moma
 data_dir: /projectnb/dunlop/ooconnor/MOT/data
 # device to use for training / testing
 device: cuda
