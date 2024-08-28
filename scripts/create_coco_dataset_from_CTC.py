@@ -7,7 +7,8 @@ import utils_coco as utils
 import re
 from skimage.measure import label
 
-dataset = 'DynamicNuclearNet-tracking-v1_0' # ['moma',''2D','DynamicNuclearNet-tracking-v1_0']
+dataset = 'DynamicNuclearNet-tracking-v1_0' # ['moma','DynamicNuclearNet-tracking-v1_0']
+datapath = Path('/projectnb/dunlop/ooconnor/MOT/data') / dataset / 'COCO'
 
 if dataset == 'moma':
     min_area = 0
@@ -21,11 +22,10 @@ else:
 if min_area > 0:
     raise NotImplementedError # 'Need to fix divisions if cell removed had just divided'
 
-licenses = [{'id': 1,'name': 'MIT license', 'url':'add later'}]
+licenses = [{'id': 1,'name': 'MIT license'}]
 categories = [{'id': 1, 'name': 'cell'}]
 info = utils.get_info(dataset)
 
-datapath = Path('/projectnb/dunlop/ooconnor/MOT/data') / dataset / 'COCO'
 datapath.mkdir(exist_ok=True)
 folders = ['train','val']
 utils.create_folders(datapath,folders)
