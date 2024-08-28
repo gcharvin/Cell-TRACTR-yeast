@@ -992,6 +992,9 @@ def get_total_time(args):
     with open(str(args.output_dir / "training_time.txt"), 'r') as file:
         for line in file:
             if line.strip():  # Check if line is not empty
+                if "Total time:" in line:
+                    return str(total_time)
+                
                 _, time_str = line.split(': ')
                 hours, minutes, seconds = map(int, time_str.split(':'))
                 total_time += datetime.timedelta(hours=hours, minutes=minutes, seconds=seconds)
