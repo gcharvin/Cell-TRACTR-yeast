@@ -15,25 +15,26 @@ from trackformer.datasets import build_dataset
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
-dataset = 'moma' #['moma','2D', 'DynamicNuclearNet-tracking-v1_0']
-respath = Path('/projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results')
+filepath = Path(__file__)
+yaml_file_paths = (filepath.parents[1] / 'cfgs').glob("*.yaml")
+yaml_files = [yaml_file.stem.split('train_')[1] for yaml_file in yaml_file_paths]
 
 ex = sacred.Experiment('train')
 
-def train() -> None:
+def train(respath, dataset) -> None:
     
-    if (respath / dataset / 'checkpoint.pth').exists():
-        ex.add_config(str(respath / dataset / 'config.yaml'))
+    if (respath / 'checkpoint.pth').exists():
+        ex.add_config(str(respath / 'config.yaml'))
     else:
-        ex.add_config(respath / dataset / 'cfgs' / ('train_' + dataset + '.yaml'))
+        ex.add_config(str(filepath.parents[1] / 'cfgs' / ('train_' + dataset + '.yaml')))
 
     config = ex.run_commandline().config
     args = utils.nested_dict_to_namespace(config)
 
-    if (respath / dataset / 'config.yaml').exists():
-        args.resume = respath / 'checkpoint.pth'
+    if (respath / 'config.yaml').exists():
+        args.resume = str(respath / 'checkpoint.pth')
 
-    args.output_dir.mkdir(exist_ok=True)
+    Path(args.output_dir).mkdir(exist_ok=True)
 
     if args.dn_track or args.dn_object:
         assert args.use_dab, f'DAB-DETR is needed to use denoised boxes for tracking / object detection. args.use_dab is currently set to {args.use_dab}'
@@ -148,6 +149,8 @@ def train() -> None:
         evaluate(model, criterion, data_loader_val, device, args.output_dir, args, 0)
         return
     
+    assert args.start_epoch < args.epochs + 1
+    
     print("Start training")
     model.train_model = True # detr_tracking script will process multiple sequential frames
 
@@ -201,6 +204,9 @@ def train() -> None:
     total_time = utils.get_total_time(args)
     print('Training time {}'.format(total_time))
 
+@ex.config
+def my_config():
+    dataset = yaml_files[0]  # Default dataset
 
 @ex.main
 def load_config(_config, _run):
@@ -208,4 +214,13 @@ def load_config(_config, _run):
     sacred.commands.print_config(_run)
 
 if __name__ == '__main__':
-    train()
+    # Parse the dataset from the command line
+    args = ex.run_commandline().config
+    dataset = args['dataset']
+
+    respath = filepath.parents[1] / 'results' / dataset
+
+    respath.mkdir(exist_ok=True)
+    ex.add_config(str(respath / 'config.yaml'))
+
+    train(respath, dataset)
