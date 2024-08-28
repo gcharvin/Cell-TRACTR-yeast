@@ -37,7 +37,9 @@ Both of these dataset are formatted the same as the Cell Tracking Challenge (CTC
 You may use your own custom dataset. Ensure your dataset is formatted in the CTC format. Your directory should have the same structure below with a train and val folder and optional test folder:
 
 ```data/moma/CTC/train```
+
 ```data/moma/CTC/val```
+
 ```data/moma/CTC/test```
 
 You need a train and val folder for training. A test folder may be used for inference.
@@ -45,8 +47,11 @@ You need a train and val folder for training. A test folder may be used for infe
 Then you need to use the ```create_coco_dataset_from_CTC.py``` script to convert the CTC formatted dataset into the COCO format. Since Cell-TRACTR processes multiple frames at once, videos with less than will not be included in the dataset used to train Cell-TRACTR. A COCO folder will be created with the structure shown below:
 
 ```data/moma/COCO/annotations```
+
 ```data/moma/COCO/man_track```
+
 ```data/moma/COCO/train```
+
 ```data/moma/COCO/val```
 
 
@@ -54,13 +59,13 @@ Then you need to use the ```create_coco_dataset_from_CTC.py``` script to convert
 
 You can train the model using the train.py script located in the src directory. There are a few ways to run the script, depending on the dataset you want to use:
 
-1. Default Mode 
+1. **Default Mode**
 
 ```python Cell-TRACTR/src/train.py```
 
 If you don't specify a dataset, the script will automatically look for YAML configuration files in the cfgs folder. It will pick the first available configuration file and use that dataset for training.
 
-2. Specifying a Dataset: You can also explicitly specify a dataset using the dataset argument. For example:
+2. **Specifying a Dataset:** You can also explicitly specify a dataset using the dataset argument. For example:
 
 ```python Cell-TRACTR/src/train.py with dataset='moma'```
 
@@ -74,13 +79,13 @@ Additional Notes:
 
 To run inference using the trained model, you can execute the pipeline.py script located in the src directory. The script can be run in several ways, depending on the dataset and configuration you want to use:
 
-1. Default Inference
+1. **Default Inference**
 
 ```python Cell-TRACTR/src/pipeline.py```
 
 If you don't specify a dataset, the script will look for YAML configuration files in the cfgs folder and use the first available configuration file by default. It will then perform inference using the model trained on that dataset.
 
-2. Specifying a Dataset for Inference: You can also explicitly specify a dataset using the dataset argument. For example:
+2. **Specifying a Dataset for Inference:** You can also explicitly specify a dataset using the dataset argument. For example:
 
 ```python Cell-TRACTR/src/pipeline.py with dataset='moma'```
 
