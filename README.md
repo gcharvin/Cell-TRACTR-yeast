@@ -28,25 +28,26 @@ Install MultiScaleDeformableAttention package: ```python src/Cell-TRACTR/models/
 
 ## Formatting Datasets
 
-The "moma" or mother machine dataset using in the paper can be found [here](https://zenodo.org/records/11237127).
+The mother machine dataset (moma) used in this paper can be found [here](https://zenodo.org/records/11237127).
 
 The DeepCell dataset (DynamicNuclearNet-tracking-v1_0) can be found [here](https://datasets.deepcell.org/).
 
-Both of these dataset are formatted of the Cell Tracking Challenge (CTC). More details on CTC formatting can be found [here](https://public.celltrackingchallenge.net/documents/Naming%20and%20file%20content%20conventions.pdf)
+Both of these dataset are formatted the same as the Cell Tracking Challenge (CTC). More details on CTC formatting can be found [here](https://public.celltrackingchallenge.net/documents/Naming%20and%20file%20content%20conventions.pdf)
 
-You may use your own custom dataset. Ensure your dataset is formatted in the CTC format. Your directory should have the same structure below with a train and val folder:
+You may use your own custom dataset. Ensure your dataset is formatted in the CTC format. Your directory should have the same structure below with a train and val folder and optional test folder:
 
-data/moma/CTC/train
-data/moma/CTC/val
+```data/moma/CTC/train```
+```data/moma/CTC/val```
+```data/moma/CTC/test```
 
 You need a train and val folder for training. A test folder may be used for inference.
 
-Then you need to use the create_coco_dataset_from_CTC.py script to convert the CTC formatted dataset into the COCO format. Since Cell-TRACTR processes multiple frames at once, only frames that are at least 4 in a row will get processed into the new dataset. A COCO folder will be created with the structure shown below:
+Then you need to use the ```create_coco_dataset_from_CTC.py``` script to convert the CTC formatted dataset into the COCO format. Since Cell-TRACTR processes multiple frames at once, videos with less than will not be included in the dataset used to train Cell-TRACTR. A COCO folder will be created with the structure shown below:
 
-data/moma/COCO/annotations
-data/moma/COCO/man_track
-data/moma/COCO/train
-data/moma/COCO/val
+```data/moma/COCO/annotations```
+```data/moma/COCO/man_track```
+```data/moma/COCO/train```
+```data/moma/COCO/val```
 
 
 ## Train Cell-TRACTR
