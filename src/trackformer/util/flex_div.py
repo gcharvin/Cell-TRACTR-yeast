@@ -473,7 +473,7 @@ def update_object_detection(
                         man_track[track_id_1_ind,1] += 1
                         man_track[track_id_2_ind,1] += 1
 
-                        # Check to see if a division occurs in the futre frame. A cell could have left the FOV
+                        # Check to see if a division occurs in the future frame. A cell could have left the FOV
                         if man_track[track_id_1_ind,2] < man_track[track_id_1_ind,1] or man_track[track_id_2_ind,2] < man_track[track_id_2_ind,1]:
                             man_track[track_id_mot_ind,2] = torch.max(man_track[track_id_1_ind,2],man_track[track_id_2_ind,2])
                             man_track[track_id_1_ind,1:] = -1
