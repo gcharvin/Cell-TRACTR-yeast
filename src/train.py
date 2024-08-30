@@ -221,6 +221,5 @@ if __name__ == '__main__':
     respath = filepath.parents[1] / 'results' / dataset
 
     respath.mkdir(exist_ok=True)
-    ex.add_config(str(respath / 'config.yaml'))
 
     train(respath, dataset)
