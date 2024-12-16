@@ -67,7 +67,6 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             'image_id': torch.tensor(self.ids[image_id]),
             'annotations': annotations,
             'framenb': torch.tensor(framenb),
-            # 'dataset_nb': torch.tensor(int(annotations[0]['dataset_name'])),
             'dataset': self.dataset_type,
             'target_size': self.target_size,
         }
