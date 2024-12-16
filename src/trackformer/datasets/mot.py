@@ -24,7 +24,7 @@ class MOT(CocoDetection):
         man_track_paths = list((self.root.parents[1] / 'man_track').glob('*.txt'))
 
         img_fps = list((self.root).glob('*.tif'))
-        dataset_ctcs = list(set([int(re.findall('\d+',img_fp.stem)[0]) for img_fp in img_fps]))
+        dataset_ctcs = list(set([int(re.findall('\d+',img_fp.stem)[-2]) for img_fp in img_fps]))
 
         man_track_paths = [man_track_path for man_track_path in man_track_paths if int(man_track_path.stem) in dataset_ctcs]
 
@@ -72,18 +72,18 @@ class MOT(CocoDetection):
         np.random.seed(idx + self.current_epoch)
 
         fn = self.coco.imgs[idx]['file_name']
-        dataset_nb = re.findall('\d+',fn)[:-1]
+        dataset_nb = re.findall('\d+',fn)[-2]
 
         if idx < 2:
             idx = 2
 
         prev_prev_fn = self.coco.imgs[idx-2]['file_name']
-        prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[:-1]
+        prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[-2]
         
         while prev_prev_dataset_nb != dataset_nb:
             idx += 1
             prev_prev_fn = self.coco.imgs[idx-2]['file_name']
-            prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[:-1]
+            prev_prev_dataset_nb = re.findall('\d+',prev_prev_fn)[-2]
             
         if idx == len(self.coco.imgs) -1:
             idx -= 1
@@ -91,15 +91,16 @@ class MOT(CocoDetection):
         # If flexible divisions isn't being used, we don't need the future frame
         if self.flex_div:
             fut_fn = self.coco.imgs[idx+1]['file_name']
-            fut_dataset_nb = re.findall('\d+',fut_fn)[:-1]
+            fut_dataset_nb = re.findall('\d+',fut_fn)[-2]
 
             if fut_dataset_nb != dataset_nb:
                 idx -= 1
 
         fn = self.coco.imgs[idx]['file_name']
         framenb = int(re.findall('\d+',fn)[-1])
+        man_track_id = self.coco.imgs[idx]['man_track_id']
 
-        man_track = np.loadtxt(self.root.parents[1] / 'man_track' / self.root.parts[-2] / (dataset_nb[0] + '.txt'),dtype=np.int16)
+        man_track = np.loadtxt(self.root.parents[1] / 'man_track' / self.root.parts[-2] / (str(man_track_id) + '.txt'),dtype=np.int16)
 
         # We remove cells that disappear and reappear
         divisions = np.unique(man_track[:,-1])
@@ -112,7 +113,7 @@ class MOT(CocoDetection):
         main_target = target['main']
         main_target['man_track'] = torch.from_numpy(man_track).long()
 
-        target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
+        target['dataset_nb'] = torch.tensor(int(dataset_nb))
 
         self.RandomCrop.region = None
     
