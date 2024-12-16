@@ -55,7 +55,10 @@ class MOT(CocoDetection):
         self.dataset_type = dataset
 
     def set_target_size(self,target_size):
-        self.target_size = torch.tensor(list(map(int,re.findall('\d+',target_size))))
+        if target_size is not None:
+            self.target_size = torch.tensor(list(map(int,re.findall('\d+',target_size))))
+        else:
+            self.target_size = None
         self.RandomCrop = T.RandomCrop(self.target_size)
 
     def __getitem__(self, idx):
