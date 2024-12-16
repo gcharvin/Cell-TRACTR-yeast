@@ -23,16 +23,17 @@ ex = sacred.Experiment('train')
 
 def train(respath, dataset) -> None:
     
-    if (respath / 'checkpoint.pth').exists():
-        ex.add_config(str(respath / 'config.yaml'))
-    else:
-        ex.add_config(str(filepath.parents[1] / 'cfgs' / ('train_' + dataset + '.yaml')))
+    # if (respath / 'checkpoint.pth').exists():
+    #     ex.add_config(str(respath / 'config.yaml'))
+    # else:
+    
+    ex.add_config(str(filepath.parents[1] / 'cfgs' / ('train_' + dataset + '.yaml')))
 
     config = ex.run_commandline().config
     args = utils.nested_dict_to_namespace(config)
 
-    if (respath / 'config.yaml').exists():
-        args.resume = str(respath / 'checkpoint.pth')
+    # if (respath / 'config.yaml').exists():
+    #     args.resume = str(respath / 'checkpoint.pth')
 
     Path(args.output_dir).mkdir(exist_ok=True)
 
@@ -206,7 +207,7 @@ def train(respath, dataset) -> None:
 
 @ex.config
 def my_config():
-    dataset = yaml_files[0]  # Default dataset
+    dataset = yaml_files[1]  # Default dataset
 
 @ex.main
 def load_config(_config, _run):
