@@ -371,19 +371,20 @@ class data_visualizer():
 
             img_gt = self.preprocess_img(target,target_name.replace('target','image')) 
 
-            boxes_gt = target['main'][target_name]['boxes'].cpu().numpy()
-            track_ids = target['main'][target_name]['track_ids'].cpu().numpy()
-            boxes_gt = self.bbox_cxcy_to_xyxy(boxes_gt)
-
-            if use_masks:
-                masks_gt = target['main'][target_name]['masks'].cpu().numpy()
-
-            for idx,bounding_box in enumerate(boxes_gt):
-                color=self.colors[track_ids[idx]-self.min_track_ids[i]]
-                img_gt = self.draw_bbox(img_gt,bounding_box[:4],color)
+            if not target['main'][target_name]['empty']:
+                boxes_gt = target['main'][target_name]['boxes'].cpu().numpy()
+                track_ids = target['main'][target_name]['track_ids'].cpu().numpy()
+                boxes_gt = self.bbox_cxcy_to_xyxy(boxes_gt)
 
                 if use_masks:
-                    img_gt = self.draw_mask(img_gt,masks_gt[idx,0],color)
+                    masks_gt = target['main'][target_name]['masks'].cpu().numpy()
+
+                for idx,bounding_box in enumerate(boxes_gt):
+                    color=self.colors[track_ids[idx]-self.min_track_ids[i]]
+                    img_gt = self.draw_bbox(img_gt,bounding_box[:4],color)
+
+                    if use_masks:
+                        img_gt = self.draw_mask(img_gt,masks_gt[idx,0],color)
 
             img = np.concatenate((img,img_gt),1)
 
