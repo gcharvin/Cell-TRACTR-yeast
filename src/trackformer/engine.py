@@ -538,46 +538,46 @@ class pipeline():
 
             assert np.max(color_frame) <= 255 and np.min(color_frame) >= 0
 
-            ### Need for paper
-            # Scale bar - don't delete until paper is publsihed
-            if i < 10 and self.fps[0].parts[-2] == '10':
-                blah = np.copy(color_frame)
-                # if i == 0:
-                #     blah[10:12,5:20] = 255
-                # cv2.imwrite(f'/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/moma/test/CTC/20/color_frames/frame{i:03d}.png',blah)
-                cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_pred.png',blah)
-                cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_img.png',self.img)
+            # ### Need for paper
+            # # Scale bar - don't delete until paper is publsihed
+            # if i < 10 and self.fps[0].parts[-2] == '10':
+            #     blah = np.copy(color_frame)
+            #     # if i == 0:
+            #     #     blah[10:12,5:20] = 255
+            #     # cv2.imwrite(f'/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/moma/test/CTC/20/color_frames/frame{i:03d}.png',blah)
+            #     cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_pred.png',blah)
+            #     cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_img.png',self.img)
 
-            min = i * 5
-            hr = min // 60
-            rem_min = min % 60
+            # min = i * 5
+            # hr = min // 60
+            # rem_min = min % 60
 
-            color_frame = cv2.putText(
-                color_frame,
-                # text = f'{i:03d}', 
-                text = f'{hr:01d} hr', 
-                org=(0,10), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = 0.4,
-                color = (255,255,255),
-                thickness=1,
-                )
+            # color_frame = cv2.putText(
+            #     color_frame,
+            #     # text = f'{i:03d}', 
+            #     text = f'{hr:01d} hr', 
+            #     org=(0,10), 
+            #     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+            #     fontScale = 0.4,
+            #     color = (255,255,255),
+            #     thickness=1,
+            #     )
 
-            # color_frame = np.concatenate((color_frame,np.zeros((color_frame.shape[0],20,3))),1)
+            # # color_frame = np.concatenate((color_frame,np.zeros((color_frame.shape[0],20,3))),1)
 
-            color_frame = cv2.putText(
-                color_frame,
-                # text = f'{rem_min:02d} min', 
-                text = f'{min:03d} min', 
-                # org=(0,10), 
-                org=(0,20), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = 0.4,
-                color = (255,255,255),
-                thickness=1,
-                )
+            # color_frame = cv2.putText(
+            #     color_frame,
+            #     # text = f'{rem_min:02d} min', 
+            #     text = f'{min:03d} min', 
+            #     # org=(0,10), 
+            #     org=(0,20), 
+            #     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+            #     fontScale = 0.4,
+            #     color = (255,255,255),
+            #     thickness=1,
+            #     )
 
-            ### Need for paper
+            # ### Need for paper
 
             self.color_stack[i] = color_frame         
 
