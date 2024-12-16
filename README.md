@@ -24,7 +24,7 @@ Install PyTorch 1.13.1 and cuda 11.6 from [here](https://pytorch.org/get-started
 
 Install pycocotools (with fixed ignore flag): ```pip3 install -U 'git+https://github.com/timmeinhardt/cocoapi.git#subdirectory=PythonAPI'```
 
-Install MultiScaleDeformableAttention package: ```python src/Cell-TRACTR/models/ops/setup.py build --build-base=src/Cell-TRACTR/models/ops/ install```
+Install MultiScaleDeformableAttention package: ```python src/trackformer/models/ops/setup.py build --build-base=src/trackformer/models/ops/ install```
 
 ## Formatting Datasets
 
