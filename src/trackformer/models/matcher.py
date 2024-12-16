@@ -72,7 +72,13 @@ class HungarianMatcher(nn.Module):
         batch_size, num_queries = outputs["pred_logits"].shape[:2]
 
         if sum([target[training_method][target_name]['empty'] for target in targets]) == batch_size:
-            return [(torch.tensor([]).long(),torch.tensor([]).long()) for _ in range(batch_size)], targets
+
+            ind = [(torch.tensor([]).long(),torch.tensor([]).long()) for _ in range(batch_size)]
+
+            # Automatically save the original index matching; it gets updated when divided cells need to track to the next frame
+            for i,target in zip(ind,targets):
+                target[training_method][target_name]['indices'] = i
+            return ind, targets
 
         # We flatten to compute the cost matrices in a batch
         #
