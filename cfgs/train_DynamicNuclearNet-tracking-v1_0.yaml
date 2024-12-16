@@ -11,7 +11,7 @@ overwrite_lrs: false
 overwrite_lr_scheduler: false
 batch_size: 1
 weight_decay: 0.0001
-epochs: 1
+epochs: 24
 lr_drop: 20
 target_size: (584,600)
 # Number of object queries
@@ -152,7 +152,7 @@ dataset: DynamicNuclearNet-tracking-v1_0
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/DynamicNuclearNet-tracking-v1_0-measure-memory-1-4-resolution
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/DynamicNuclearNet-tracking-v1_0
 data_dir: /projectnb/dunlop/ooconnor/MOT/data
 # device to use for training / testing
 device: cuda

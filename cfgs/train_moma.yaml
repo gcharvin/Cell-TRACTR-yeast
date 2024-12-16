@@ -38,7 +38,7 @@ freeze_detr: false
 load_mask_head_from_model: null
 # Backbone
 # Name of the convolutional backbone to use. ('resnet18, resnet34, resnet50', 'resnet101')
-backbone: resnet50
+backbone: resnet18
 # If true, we replace stride with dilation in the last convolutional block (DC5)
 dilation: false
 # Type of positional embedding to use on top of the image features. ('sine', 'learned')
@@ -147,21 +147,21 @@ focal_loss: true
 focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
-dataset: moma-resize
+dataset: moma
 # Number of plots
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR_OG/results/moma-pretrain-no-flex-div-v2
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/moma
 data_dir: /projectnb/dunlop/ooconnor/MOT/data
 # device to use for training / testing
 device: cuda
 seed: 42
 # resume from checkpoint
-resume: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR_OG/results/moma-pretrain-no-flex-div-v2/checkpoint.pth #/projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/pretrain-object-detection/checkpoint.pth 
-resume_optim: true
+resume: ''
 resume_shift_neuron: False
 # resume optimization from checkpoint
+resume_optim: true
 start_epoch: 1
 eval_only: false
 num_workers: 0
