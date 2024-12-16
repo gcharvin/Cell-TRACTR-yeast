@@ -74,7 +74,7 @@ def train(args: Namespace, datapath) -> None:
 
     folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if re.findall('\d\d$',folderpath.name)]
 
-    if not args.tracking or not args.masks:
+    if not args.masks:
         raise NotImplementedError
 
     (args.output_dir.parent).mkdir(exist_ok=True)

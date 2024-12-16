@@ -1,4 +1,6 @@
 tracking: true
+freeze_backbone: false
+freeze_backbone_and_encoder: False
 lr: 0.0002
 lr_backbone_names: ['backbone.0']
 lr_backbone: 0.00002
@@ -9,7 +11,7 @@ overwrite_lrs: false
 overwrite_lr_scheduler: false
 batch_size: 1
 weight_decay: 0.0001
-epochs: 24
+epochs: 1
 lr_drop: 20
 target_size: (584,600)
 # Number of object queries
@@ -36,7 +38,7 @@ freeze_detr: false
 load_mask_head_from_model: null
 # Backbone
 # Name of the convolutional backbone to use. ('resnet50', 'resnet101')
-backbone: resnet18
+backbone: resnet50
 # If true, we replace stride with dilation in the last convolutional block (DC5)
 dilation: false
 # Type of positional embedding to use on top of the image features. ('sine', 'learned')
@@ -45,9 +47,9 @@ position_embedding: sine
 num_feature_levels: 3
 # Transformer
 # Number of encoding layers in the transformer
-enc_layers: 1
+enc_layers: 4
 # Number of decoding layers in the transformer
-dec_layers: 3
+dec_layers: 4
 # Number of decoding layers in transformer used for object detection. Rest of layers will be used for tracking
 num_OD_layers: 1
 # Intermediate size of the feedforward layers in the transformer blocks
@@ -103,7 +105,7 @@ multi_frame_attention_separate_encoder: false
 overflow_boxes: true
 # Segmentation
 masks: true
-mask_dim: 144
+mask_dim: 288
 enc_masks: true
 use_img_for_mask: false
 # Matcher - matching cost
@@ -150,7 +152,7 @@ dataset: DynamicNuclearNet-tracking-v1_0
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/DynamicNuclearNet-tracking-v1_0
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/DynamicNuclearNet-tracking-v1_0-measure-memory-1-4-resolution
 data_dir: /projectnb/dunlop/ooconnor/MOT/data
 # device to use for training / testing
 device: cuda
@@ -166,7 +168,7 @@ num_workers: 0
 val_interval: 5
 debug: false
 # epoch interval for model saving. if 0 only save last and best models
-save_model_interval: false
+save_model_interval: 5
 # distributed training parameters
 # number of distributed processes
 world_size: 1
@@ -175,7 +177,7 @@ dist_url: env://
 cls_threshold: 0.5
 iou_threshold: 0.5
 # Data Viz
-data_viz: True
+data_viz: false
 # Data Viz - show all 
 display_all: False
 hooks: False

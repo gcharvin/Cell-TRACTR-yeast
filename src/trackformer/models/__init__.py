@@ -36,7 +36,9 @@ def build_model(args):
         'two_stage': args.two_stage,
         'multi_frame_attention': args.multi_frame_attention,
         'use_img_for_mask': args.use_img_for_mask,
-        'masks': args.masks,}
+        'masks': args.masks,
+        'freeze_backbone': args.freeze_backbone,
+        'freeze_backbone_and_encoder': args.freeze_backbone_and_encoder,}
     
     tracking_kwargs = {
         'matcher': matcher,

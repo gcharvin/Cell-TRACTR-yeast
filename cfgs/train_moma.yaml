@@ -1,4 +1,6 @@
 tracking: true
+freeze_backbone: False
+freeze_backbone_and_encoder: False
 lr: 0.0002
 lr_backbone_names: ['backbone.0']
 lr_backbone: 0.00002
@@ -15,7 +17,7 @@ target_size: (256,32)
 # Number of object queries
 num_queries: 30
 # Flexible divisions
-flex_div: true
+flex_div: false
 # Tracking 2 sequential frames - use prev_prev, prev and cur frame (detection 1 frame and track for 2 frames - 3 frames total)
 use_prev_prev_frame: true
 # For 2D data, image will be randomly cropped around objects
@@ -36,7 +38,7 @@ freeze_detr: false
 load_mask_head_from_model: null
 # Backbone
 # Name of the convolutional backbone to use. ('resnet18, resnet34, resnet50', 'resnet101')
-backbone: resnet18
+backbone: resnet50
 # If true, we replace stride with dilation in the last convolutional block (DC5)
 dilation: false
 # Type of positional embedding to use on top of the image features. ('sine', 'learned')
@@ -145,21 +147,21 @@ focal_loss: true
 focal_alpha: 0.25
 focal_gamma: 2
 # Dataset
-dataset: moma
+dataset: moma-resize
 # Number of plots
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/moma
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR_OG/results/moma-pretrain-no-flex-div-v2
 data_dir: /projectnb/dunlop/ooconnor/MOT/data
 # device to use for training / testing
 device: cuda
 seed: 42
 # resume from checkpoint
-resume: ''
+resume: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR_OG/results/moma-pretrain-no-flex-div-v2/checkpoint.pth #/projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/pretrain-object-detection/checkpoint.pth 
+resume_optim: true
 resume_shift_neuron: False
 # resume optimization from checkpoint
-resume_optim: true
 start_epoch: 1
 eval_only: false
 num_workers: 0
@@ -175,8 +177,8 @@ dist_url: env://
 cls_threshold: 0.5
 iou_threshold: 0.5
 # Data Viz
-data_viz: True
+data_viz: False
 # Data Viz - show all 
-display_all: True
+display_all: False
 hooks: False
 avg_attn_weight_maps: True

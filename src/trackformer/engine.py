@@ -504,16 +504,17 @@ class pipeline():
                 if self.masks:
                     masks, boxes = self.post_process_masks(masks, boxes)
 
-                # 'hs_embed' is used as the content embedding for the track queries
-                targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.all_indices] # For div_indices, hs_embeds will be the same; no update
+                if self.track:
+                    # 'hs_embed' is used as the content embedding for the track queries
+                    targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.all_indices] # For div_indices, hs_embeds will be the same; no update
 
-                # 'track_query_boxes' are used as the positional embeddings for the track queries
-                # You can use the bounding box or mask as a positional embedding; default is to use the mask
-                if self.args.init_boxes_from_masks:
-                    boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks),cxcywh=True).to(self.device)
-                    targets[0]['main']['cur_target']['track_query_boxes'] = boxes_encoded_from_masks
-                else:
-                    targets[0]['main']['cur_target']['track_query_boxes'] = boxes
+                    # 'track_query_boxes' are used as the positional embeddings for the track queries
+                    # You can use the bounding box or mask as a positional embedding; default is to use the mask
+                    if self.args.init_boxes_from_masks:
+                        boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks),cxcywh=True).to(self.device)
+                        targets[0]['main']['cur_target']['track_query_boxes'] = boxes_encoded_from_masks
+                    else:
+                        targets[0]['main']['cur_target']['track_query_boxes'] = boxes
 
                 boxes = boxes.cpu().numpy()
 

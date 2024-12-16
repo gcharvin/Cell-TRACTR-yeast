@@ -29,7 +29,7 @@ class DeformableDETR():
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, use_dab=True, random_refpoints_xy=False, dn_object=False, 
                  dn_object_FPs=False, dn_object_l1 = 0, dn_object_l2 = 0, refine_object_queries=False,
-                 share_bbox_layers=True,use_img_for_mask=False,masks=False):
+                 share_bbox_layers=True,use_img_for_mask=False,masks=False,freeze_backbone=False,freeze_backbone_and_encoder=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -158,6 +158,16 @@ class DeformableDETR():
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.decoder.bbox_embed = None
             self.decoder.class_embed = None
+
+        if freeze_backbone_and_encoder:
+            for name, param in self.named_parameters():
+                if 'decoder' not in name:
+                    param.requires_grad_(False)
+
+        if freeze_backbone:
+            for name, param in self.named_parameters():
+                if 'backbone' in name:
+                    param.requires_grad_(False)  
 
     def forward(self, samples: NestedTensor, targets: list = None, target_name: str = 'cur_target'):
         """ The forward expects a NestedTensor, which consists of:
