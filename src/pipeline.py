@@ -17,8 +17,8 @@ from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
 
 filepath = Path(__file__)
-yaml_file_paths = (filepath.parents[1] / 'cfgs').glob("*.yaml")
-yaml_files = [yaml_file.stem.split('_')[1] for yaml_file in yaml_file_paths]
+res_paths = (filepath.parents[1] / 'results').iterdir()
+res_names = [res_path.name for res_path in res_paths if res_path.is_dir()]
 
 ex = sacred.Experiment('pipeline')
 
@@ -106,7 +106,8 @@ def train(args: Namespace, datapath) -> None:
 
 @ex.config
 def my_config():
-    dataset = yaml_files[0]  # Default dataset
+    res_name = res_names[0]  # Default dataset
+    dataset = 'moma'
 
 @ex.main
 def load_config(_config, _run):
@@ -115,8 +116,10 @@ def load_config(_config, _run):
 
 if __name__ == '__main__':
     args = ex.run_commandline().config
+   
+    res_name = args['res_name']
     dataset = args['dataset']
-    respath = filepath.parents[1] / 'results' / dataset
+    respath = filepath.parents[1] / 'results' / res_name
 
     ex.add_config(str(respath / 'config.yaml'))
     args = ex.run_commandline().config
@@ -124,6 +127,6 @@ if __name__ == '__main__':
 
     args.output_dir = Path(args.output_dir)
     args.data_dir = Path(args.data_dir)
-    datapath = args.data_dir / dataset / 'CTC' / 'test'
+    datapath = args.data_dir / 'CTC_datasets' / dataset / 'CTC' / 'test'
 
     train(args,datapath)
