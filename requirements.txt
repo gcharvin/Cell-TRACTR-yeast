@@ -10,3 +10,7 @@ scipy
 cython
 matplotlib
 opencv-python
+ffmpeg-python
+scikit-image
+fvcore
+ninja

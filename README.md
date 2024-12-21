@@ -6,13 +6,23 @@ This repository provides the implementation of [Cell-TRACTR](https://www.biorxiv
 
 ## Installation
 
+Since Cell-TRACTR uses the MultiScaleDeformableAttention package, a GPU is required to train or run inference.
+
 Clone and enter this repository:
 
 ```git clone https://gitlab.com/dunloplab/Cell-TRACTR.git```
 
 ```cd Cell-TRACTR```
 
-Install packages for Python 3.10:
+Create conda env:
+
+```conda create -n cell-tractr python=3.10```
+
+Activate env:
+
+```conda activate cell-tractr```
+
+Install packages:
 
 ```pip3 install -r requirements.txt```
 
@@ -20,11 +30,13 @@ Install ffmpeg
 
 ```conda install -c conda-forge ffmpeg```
 
-Install PyTorch 1.13.1 and cuda 11.6 from [here](https://pytorch.org/get-started/previous-versions/#v1131).
+Install PyTorch 1.13.1 and cuda 11.6 from [here](https://pytorch.org/get-started/previous-versions/#v1131). You may choose other versions of PyTorch. Just ensure they are compatible.
 
 Install pycocotools (with fixed ignore flag): ```pip3 install -U 'git+https://github.com/timmeinhardt/cocoapi.git#subdirectory=PythonAPI'```
 
-Install MultiScaleDeformableAttention package: ```python src/trackformer/models/ops/setup.py build --build-base=src/trackformer/models/ops/ install```
+Install MultiScaleDeformableAttention package: ```pip install -e src/trackformer/models/ops```
+
+For installation issues with MultiScaleDeformableAttention, refer to [Deformalbe DETR](https://github.com/fundamentalvision/Deformable-DETR)
 
 ## Formatting Datasets
 
@@ -53,6 +65,10 @@ Then you need to use the ```create_coco_dataset_from_CTC.py``` script to convert
 ```data/moma/COCO/train```
 
 ```data/moma/COCO/val```
+
+## Weights
+
+The weights to both pretrained models are availabe on [zenodo](https://zenodo.org/records/14509424).
 
 
 ## Train Cell-TRACTR

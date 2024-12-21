@@ -207,7 +207,7 @@ def train(respath, dataset) -> None:
 
 @ex.config
 def my_config():
-    dataset = yaml_files[1]  # Default dataset
+    dataset = yaml_files[0]  # Default dataset
 
 @ex.main
 def load_config(_config, _run):
