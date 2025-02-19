@@ -2,7 +2,7 @@
 import torch
 
 from .backbone import build_backbone
-from .deformable_detr import DeformableDETR
+from .deformable_detr import DeformableDETRclass
 from .detr import SetCriterion
 from .detr_segmentation import (DeformableDETRSegm, DeformableDETRSegmTracking)
 from .detr_tracking import DeformableDETRTracking
@@ -36,26 +36,36 @@ def build_model(args):
         'two_stage': args.two_stage,
         'multi_frame_attention': args.multi_frame_attention,
         'use_img_for_mask': args.use_img_for_mask,
-        'masks': args.masks,}
+        'masks': args.masks,
+        'freeze_backbone_and_encoder': args.freeze_backbone_and_encoder,
+        'freeze_backbone': args.freeze_backbone}
     
+    if args.dn_track and not args.tracking:
+        print('You are not tracking but have dn_track set to True; this is set to False by default')
+    
+    if args.dn_track_group and not args.tracking:
+        print('You are not tracking but have dn_track_group set to True; this is set to False by default')
+
     tracking_kwargs = {
         'matcher': matcher,
         'backprop_prev_frame': args.backprop_prev_frame,
-        'dn_track': args.dn_track,
+        'dn_track': args.dn_track and args.tracking,
         'dn_track_l1': args.dn_track_l1,
         'dn_track_l2': args.dn_track_l2,
         'dn_enc':args.dn_enc,
         'refine_div_track_queries': args.refine_div_track_queries,
+        'refine_track_queries': args.refine_track_queries,
         'flex_div': args.flex_div,
         'use_prev_prev_frame': args.use_prev_prev_frame,
         'num_queries': args.num_queries,
-        'dn_track_group': args.dn_track_group,
+        'dn_track_group': args.dn_track_group and args.tracking,
         'tgt_noise': args.tgt_noise}
 
     mask_kwargs = {
         'freeze_detr': args.freeze_detr,
         'return_intermediate_masks': args.return_intermediate_masks,
-        'mask_dim': args.mask_dim,}
+        'mask_dim': args.mask_dim,
+        'use_ROIAlign_mask': args.use_ROIAlign_mask}
 
     if args.deformable:
         args.feature_channels = backbone.num_channels
@@ -104,7 +114,7 @@ def build_model(args):
             if args.masks:
                 model = DeformableDETRSegm(mask_kwargs, detr_kwargs, transformer_kwargs)
             else:
-                model = DeformableDETR(detr_kwargs, transformer_kwargs)
+                model = DeformableDETRclass(detr_kwargs, transformer_kwargs)
     else:
         raise NotImplementedError
 
@@ -127,7 +137,6 @@ def build_model(args):
         training_methods.append('dn_enc')
     if args.CoMOT:
         training_methods.append('CoMOT')
-
 
     weight_dict_TM = {}
 
@@ -153,7 +162,7 @@ def build_model(args):
         if args.two_stage:
             aux_weight_dict.update({f'two_stage_{k.replace("main_","")}': v for k, v in weight_dict.items()})
 
-        if args.two_stage:
+        if args.two_stage and args.tracking:
             aux_weight_dict.update({f'OD_{k.replace("main_","")}': v for k, v in weight_dict.items()})
 
         weight_dict.update(aux_weight_dict)

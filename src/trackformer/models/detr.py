@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..util import box_ops
-from ..util.misc import dice_loss, nested_tensor_from_tensor_list, sigmoid_focal_loss, add_new_targets_from_main
+from ..util.misc import dice_loss, nested_tensor_from_tensor_list, sigmoid_focal_loss, add_new_targets_from_main, sample_points_optimized_batch,roi_align_regions, point_sample
 from ..util.flex_div import update_early_or_late_track_divisions, update_object_detection
 
 class SetCriterion(nn.Module):
@@ -165,8 +165,9 @@ class SetCriterion(nn.Module):
 
         target_masks = [t[training_method][target_name]["masks"][i] for t, (_, i) in zip(targets, indices) if not t[training_method][target_name]['empty']]
 
-        target_masks = torch.cat(target_masks,axis=0).to(self.device)
+        target_masks = torch.cat(target_masks,axis=0).to(self.device).float()
         target_masks,_ = nested_tensor_from_tensor_list(target_masks).decompose()
+        # target_masks = target_masks[None,...] if target_masks.ndim == 4 else target_boxes
 
         src_masks = src_masks[src_idx]
 
@@ -174,23 +175,24 @@ class SetCriterion(nn.Module):
         target_masks = target_masks[keep_non_empty_chambers]
         src_masks = src_masks[keep_non_empty_chambers]
 
-        # upsample predictions to the target size
-        # src_masks = F.interpolate(src_masks, size=target_masks.shape[-2:],mode="bilinear", align_corners=False)
-        target_masks = F.interpolate(target_masks.float(), size=src_masks.shape[-2:],mode="area")
-        # src_masks = F.interpolate(src_masks, size=target_masks.shape[-2:]) # This is a deterministic way to interpolate
+        if not self.args.use_ROIAlign_mask:
+            # downsample ground truths to prediction size to preserve computation
+            target_masks = F.interpolate(target_masks.float(), size=src_masks.shape[-2:],mode="area")
 
         division_ind = target_masks[:,1].sum(-1).sum(-1) > 0
 
         weights_mask = torch.ones((src_masks.shape)).to(self.device)
         weights_mask[division_ind] *= self.args.div_loss_coef # increase weight for divisions prev to current        
         weights_mask[~division_ind,1] = 0 # You don't care about the second prediction if the cell did not divide
-        weights_mask[target_masks > 0.5] *= self.args.mask_weight_target_cell_coef
 
-        for t,target in enumerate(targets):
-            if not target[training_method][target_name]['empty']:
-                one_target_mask = target[training_method][target_name]["masks"][indices[t][1]]
-                one_target_mask = F.interpolate(one_target_mask.float(), size=src_masks.shape[-2:],mode="area")
-                weights_mask[self.sizes[t]:self.sizes[t+1],:,one_target_mask.sum((0,1)) > 0] *= self.args.mask_weight_all_cells_coef
+        if not self.args.use_ROIAlign_mask:
+            weights_mask[target_masks > 0.5] *= self.args.mask_weight_target_cell_coef
+
+            for t,target in enumerate(targets):
+                if not target[training_method][target_name]['empty']:
+                    one_target_mask = target[training_method][target_name]["masks"][indices[t][1]]
+                    one_target_mask = F.interpolate(one_target_mask.float(), size=src_masks.shape[-2:],mode="area")
+                    weights_mask[self.sizes[t]:self.sizes[t+1],:,one_target_mask.sum((0,1)) > 0] *= self.args.mask_weight_all_cells_coef
 
         is_touching_edge = torch.cat([t[training_method][target_name]['is_touching_edge'][i] for t, (_,i) in zip(targets, indices) if not t[training_method][target_name]['empty']])
         weights_mask[is_touching_edge[keep_non_empty_chambers]] *= self.args.touching_edge_loss_coef
@@ -202,6 +204,26 @@ class SetCriterion(nn.Module):
             target_masks = torch.cat((target_masks[:,0],target_masks[division_ind,1]))
             src_masks = torch.cat((src_masks[:,0],src_masks[division_ind,1]))
             weights_mask = torch.cat((weights_mask[:,0],weights_mask[division_ind,1]))
+        else:
+            target_masks = target_masks[:,0]
+            src_masks = src_masks[:,0]
+            weights_mask = weights_mask[:,0]
+
+        if self.args.use_ROIAlign_mask:
+            batch_out_boxes = outputs['roi_boxes']
+            batch_out_boxes = batch_out_boxes[src_idx]
+            batch_out_boxes = batch_out_boxes[keep_non_empty_chambers]
+            batch_out_boxes = torch.cat((batch_out_boxes[:,0],batch_out_boxes[division_ind,1]))
+            batch_out_boxes[:,0] = torch.arange(batch_out_boxes.shape[0],dtype=batch_out_boxes.dtype,device=batch_out_boxes.device)
+            target_masks = roi_align_regions(target_masks[:,None], batch_out_boxes)[:,0]
+
+            weights_mask[target_masks > 0.5] *= self.args.mask_weight_target_cell_coef
+
+        if self.args.use_point_sampling_mask_loss:
+            point_coords = sample_points_optimized_batch(target_masks, N = 100)
+            target_masks = point_sample(target_masks[:,None], point_coords, align_corners=False,).squeeze(1)
+            weights_mask = point_sample(weights_mask[:,None], point_coords, align_corners=False,).squeeze(1)
+            src_masks = point_sample(src_masks[:,None], point_coords, align_corners=False,).squeeze(1)
 
         weights_mask = weights_mask.flatten(1)
         src_masks = src_masks.flatten(1)
@@ -212,8 +234,6 @@ class SetCriterion(nn.Module):
             alpha=self.focal_alpha, gamma=self.focal_gamma, mask=True),
             training_method + "_loss_dice": dice_loss(src_masks.sigmoid(), target_masks, num_boxes)
         }
-
-        # print(time.time() - start)
 
         return losses
  
@@ -254,15 +274,14 @@ class SetCriterion(nn.Module):
             targets = update_early_or_late_track_divisions(outputs,targets,training_method, 'prev_target','cur_target','fut_target')
 
         indices, targets = self.matcher(outputs, targets, training_method, 'cur_target')
+        num_object_queries = (~targets[0]['main']['cur_target']['track_queries_mask']).sum().item()
 
         if self.args.flex_div and training_method in ['main','dn_object']:
             
-            if training_method == 'main':
-                num_queries = self.args.num_queries          
-            else:
-                num_queries = targets[0]['dn_object']['cur_target']['num_queries']
+            if training_method != 'main':
+                num_object_queries = targets[0]['dn_object']['cur_target']['num_queries']
 
-            targets, indices = update_object_detection(outputs,targets,indices,num_queries,training_method,'prev_target','cur_target','fut_target')
+            targets, indices = update_object_detection(outputs,targets,indices,num_object_queries,training_method,'prev_target','cur_target','fut_target')
 
         for t,target in enumerate(targets):
             target[training_method]['cur_target']['indices'] = indices[t]
@@ -292,19 +311,19 @@ class SetCriterion(nn.Module):
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
 
-            if self.args.CoMOT and training_method == 'main' and outputs['pred_logits'].shape[1] > self.args.num_queries:
+            if self.args.CoMOT and training_method == 'main' and outputs['pred_logits'].shape[1] > num_object_queries:
                 CoMOT = True
-                targets = add_new_targets_from_main(targets,'CoMOT','cur_target')
+                targets = add_new_targets_from_main(targets,'CoMOT','cur_target', self.args.tracking)
 
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                if target[training_method]['cur_target']['track_queries_TP_mask'].sum() > 0:
+                if self.args.tracking and target[training_method]['cur_target']['track_queries_TP_mask'].sum() > 0:
                     assert target[training_method]['cur_target']['track_queries_TP_mask'].sum() == len(target[training_method]['cur_target']['track_query_match_ids'])
 
                 if CoMOT:
                     aux_outputs['CoMOT_loss_ce'] = self.args.CoMOT_loss_ce
                     aux_outputs['CoMOT'] = True
 
-                if training_method != 'dn_object': # this does not work for flex div and dn_object; if remove flex_div then dn_objects works fine
+                if not self.args.flex_div or training_method != 'dn_object': # this does not work for flex div and dn_object; if remove flex_div then dn_objects works fine
                     indices,targets = self.matcher(aux_outputs, targets, training_method, 'cur_target')
 
                 for loss in self.losses:
@@ -319,10 +338,10 @@ class SetCriterion(nn.Module):
 
                     aux_outputs_without_track = {}
                     for key in ['pred_logits', 'pred_boxes']:
-                        aux_outputs_without_track[key] = aux_outputs[key][:,-self.args.num_queries:].clone()
+                        aux_outputs_without_track[key] = aux_outputs[key][:,-num_object_queries:].clone()
 
                     if 'pred_masks' in aux_outputs:
-                        aux_outputs_without_track['pred_masks'] = aux_outputs['pred_masks'][:,-self.args.num_queries:].clone()
+                        aux_outputs_without_track['pred_masks'] = aux_outputs['pred_masks'][:,-num_object_queries:].clone()
 
                     indices,targets = self.matcher(aux_outputs_without_track, targets, 'CoMOT', 'cur_target')
                     aux_outputs['CoMOT_indices'] = indices
@@ -335,9 +354,9 @@ class SetCriterion(nn.Module):
                         l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                         losses.update(l_dict)
 
-        if 'two_stage' in outputs:# and sum(sizes) > 0:
+        if 'two_stage' in outputs and not self.args.freeze_backbone_and_encoder:
             enc_outputs = outputs['two_stage']
-            targets = add_new_targets_from_main(targets,'two_stage','cur_target')
+            targets = add_new_targets_from_main(targets,'two_stage','cur_target',self.args.tracking)
 
             indices, targets = self.matcher(enc_outputs, targets,'two_stage','cur_target')
             outputs['two_stage']['indices'] = indices
@@ -352,13 +371,12 @@ class SetCriterion(nn.Module):
 
         if 'OD' in outputs:
             OD_outputs = outputs['OD']
-            targets = add_new_targets_from_main(targets,'OD','cur_target')
+            targets = add_new_targets_from_main(targets,'OD','cur_target',self.args.tracking)
             
             indices, targets = self.matcher(OD_outputs, targets,'OD','cur_target')
 
             if False:#self.args.flex_div: # was not able to implement flexible division for object detection in the  first layer
-                num_queries = self.args.num_queries          
-                targets, indices = update_object_detection(OD_outputs,targets,indices,num_queries,'OD','prev_target','cur_target','fut_target')
+                targets, indices = update_object_detection(OD_outputs,targets,indices,num_object_queries,'OD','prev_target','cur_target','fut_target')
 
             outputs['OD']['indices'] = indices
             

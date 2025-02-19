@@ -6,6 +6,8 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 """
 
 from collections import Counter
+from pathlib import Path
+import json
 
 import torch
 import torch.utils.data
@@ -21,7 +23,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
     def __init__(self,  img_folder, ann_file, transforms, norm_transforms,
                  return_masks=False, overflow_boxes=False, remove_no_obj_imgs=False,
-                 min_num_objects=0, crop=False, shift=False):
+                 min_num_objects=0, crop=False, batch_size=1,args=None):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self._norm_transforms = norm_transforms
@@ -29,7 +31,8 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         self.img_folder = img_folder
         self.ann_file = ann_file
         self.crop = crop
-        self.shift = shift
+        self.batch_size = batch_size
+        self.args = args
 
         self.edge_distance = 5 
 
@@ -42,6 +45,32 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         
         if min_num_objects:
             self.ids = [i for i in self.ids if counter[i] >= min_num_objects]
+
+        counts_path = Path(self.img_folder.parents[1] / 'counts.json')
+        dataset = img_folder.parent.name
+
+        if counts_path.exists():
+            # Open and load the JSON file
+            with open(counts_path, 'r') as file:
+                source_counts = json.load(file)
+                source_counts = source_counts[dataset]
+
+            min_count = min(source_counts.values())
+            max_weight_factor = 10
+
+            # Calculate weights inversely proportional to source counts, with a cap
+            source_weights = {source: min(max_weight_factor * (min_count / count), 1.0) for source, count in source_counts.items()}
+            # source_weights['omnipose'] = 0
+
+            weights = np.zeros((len(self.ids)))
+            for ann in self.coco.loadAnns(self.coco.getAnnIds()):
+                if ann['image_id'] in self.ids:
+                    weights[ann['image_id']] = source_weights[ann['dataset_name']]
+
+        else:
+            weights = np.ones((len(self.ids)))
+
+        self.weights = list(weights)
 
     def is_touching_edge(self, target):
 
@@ -67,7 +96,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             'image_id': torch.tensor(self.ids[image_id]),
             'annotations': annotations,
             'framenb': torch.tensor(framenb),
-            'dataset_nb': torch.tensor(int(annotations[0]['dataset_name'])),
+            # 'dataset_nb': torch.tensor(int(annotations[0]['dataset_name'])),
             'dataset': self.dataset_type,
             'target_size': self.target_size,
         }
@@ -76,6 +105,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             target['ctc_counter'] = torch.tensor(annotations[0]['ctc_counter'])
 
         img_w_raw,img_h_raw = img_raw.size
+        self.img_w_raw, self.img_h_raw = img_raw.size
         h,w = self.target_size[0].item(), self.target_size[1].item()
 
         # Calculate padding
@@ -90,24 +120,26 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         
         if self.crop and self.RandomCrop.region is None:
 
-            if self.shift:
+            if self.tracking and self.shift and not annotations[0]['empty']:
                 bbox_areas = torch.tensor([ann['bbox'][2] * ann['bbox'][3] for ann in annotations])
-                self.shift_value = torch.sqrt(bbox_areas).mean() / 2
+                self.shift_value = torch.sqrt(bbox_areas).mean()
                 self.shift_value = self.shift_value * np.power(100 / bbox_areas.shape[0],1/3)
 
                 self.img_w, self.img_h = img_w, img_h
                 self.num_cells = bbox_areas.shape[0]
 
             if img_w > self.target_size[1] or img_h > self.target_size[0]:
-                bbox_centers = torch.tensor([[ann['bbox'][0] + ann['bbox'][2]//2, ann['bbox'][1] + ann['bbox'][3]//2] for ann in annotations])
+
+                if not annotations[0]['empty']:
+                    bbox_centers = torch.tensor([[ann['bbox'][0] + ann['bbox'][2]//2, ann['bbox'][1] + ann['bbox'][3]//2] for ann in annotations])
                 
-                if torch.rand(1) < 0.9:
+                if torch.rand(1) < 0.9 and not annotations[0]['empty']:
 
                     random_index = torch.randint(0, len(bbox_centers), (1,))[0]
                     bbox_center = bbox_centers[random_index]
                     i,j = bbox_center[0].item() - h//2, bbox_center[1].item() - w//2
 
-                    if torch.rand(1) < 0.2:
+                    if torch.rand(1) < 0.2 and self.shift:
                         i += torch.randint(-self.target_size[1]//2,self.target_size[1]//2,(1,)).item()
                         j += torch.randint(-self.target_size[0]//2,self.target_size[0]//2,(1,)).item()
                         self.shift_value /= 2
@@ -136,8 +168,22 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
             self.RandomCrop.region = [j,i,h,w]
 
-        img = img.crop((0, 0, img_w_raw, img_h_raw))
+        # If batch size is 1, we don't need to pad images
+        if self.batch_size == 1:
+            if img_w > img_w_raw:
+                img = img.crop((0, 0, img_w_raw, img_h))
 
+                if self.crop:
+                    self.RandomCrop.region[3] = img_w_raw
+                    assert self.RandomCrop.region[1] == 0
+
+            if img_h > img_h_raw:  
+                img = img.crop((0, 0, img.size[0], img_h_raw))
+
+                if self.crop:
+                    self.RandomCrop.region[2] = img_h_raw
+                    assert self.RandomCrop.region[0] == 0
+        
         img, target = self.prepare(img, target, self.RandomCrop)
 
         if self._transforms is not None:
@@ -220,13 +266,13 @@ class ConvertCocoPolysToMask(object):
 
         target["boxes"] = boxes
 
-        if 'segmentation' in anno[0]:
+        if self.return_masks and 'segmentation' in anno[0]:
             if not empty:
                 segmentations = [[obj["segmentation"]] for obj in anno]
                 masks = convert_coco_poly_to_mask(segmentations, h, w, RandomCrop.region)
             else:
                 masks = torch.zeros_like(torchvision.transforms.ToTensor()(image)[0])
-                masks = torch.zeros((image.size[1],image.size[0]),dtype=torch.float32,device=boxes.device)
+                masks = torch.zeros((1,image.size[1],image.size[0]),dtype=torch.float32,device=boxes.device)
             target["masks"] = masks
 
         # for conversion to coco api
@@ -248,7 +294,7 @@ class ConvertCocoPolysToMask(object):
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["empty"] = torch.tensor(empty)
 
-        if target['dataset'] == '2D':
+        if RandomCrop.region is not None and (h > target['target_size'][0] or w > target['target_size'][1]):
             image, target = RandomCrop(image, target)
             
         assert target['boxes'].shape[0] == target['flexible_divisions'].shape[0]

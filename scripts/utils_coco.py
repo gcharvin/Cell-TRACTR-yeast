@@ -8,46 +8,54 @@ import re
 
 random.seed(24)
 
-def get_info(dataset):
-    if dataset == 'moma':
-        info = {
-            'contributor': 'Dunlop Lab (Owen OConnor)',
-            'date_created':'2022',
-            'description':'E. Coli growing in mother machine',
-            'version': '1.0',
-            'year': '2024'
-            }
-    elif dataset == '2D':
-        info = {
-            'contributor': 'Simon van Vliet',
-            'paper':'Spatially Correlated Gene Expression in Bacterial Groups: The Role of Lineage History, Spatial Gradients, and Cell-Cell Interactions (2018 van Vliet et al.)',
-            'description':'E. Coli and Salmonella growing on agarose pads',
-            'version': '1.0',
-            'year': '2024'
-            }
-    elif dataset == 'DynamicNuclearNet-tracking-v1_0':
-        info = {
-            'contributor': 'Van Valen Lab',
-            'paper':'Caliban: Accurate cell tracking and lineage construction in live-cell imaging experiments with deep learning (2023 M. Schwartz et al.)',
-            'version': '1.0',
-            'year': '2024'
-            }
+def get_info(datasets):
+    info = {}
+    for dataset in datasets:
+        if dataset == 'moma':
+            info[dataset] = {
+                'contributor': 'Dunlop Lab (Owen OConnor)',
+                'date_created':'2022',
+                'description':'E. Coli growing in mother machine',
+                'version': '1.0',
+                'year': '2024'
+                }
+        elif dataset == '2D':
+            info[dataset] = {
+                'contributor': 'Simon van Vliet',
+                'paper':'Spatially Correlated Gene Expression in Bacterial Groups: The Role of Lineage History, Spatial Gradients, and Cell-Cell Interactions (2018 van Vliet et al.)',
+                'description':'E. Coli and Salmonella growing on agarose pads',
+                'version': '1.0',
+                'year': '2024'
+                }
+        elif dataset == 'DynamicNuclearNet-tracking-v1_0':
+            info[dataset] = {
+                'contributor': 'Van Valen Lab',
+                'paper':'Caliban: Accurate cell tracking and lineage construction in live-cell imaging experiments with deep learning (2023 M. Schwartz et al.)',
+                'version': '1.0',
+                'year': '2024'
+                }
+        else:
+            raise NotImplementedError
         
     return info
 
-def create_folders(datapath,folders):
+def create_folders(datapath,folders,track,clear_old_data=False):
 
     # Create annotations folder
     (datapath / 'annotations').mkdir(exist_ok=True)
-    (datapath / 'man_track').mkdir(exist_ok=True)
+
+    if track:
+        (datapath / 'man_track').mkdir(exist_ok=True)
 
     # Create train and val folder to store images and ground truths
     for folder in folders:
+        if track:
+            (datapath / 'man_track' / folder).mkdir(exist_ok=True)
 
-        (datapath / 'man_track' / folder).mkdir(exist_ok=True)
-        man_track_paths = (datapath / 'man_track' / folder).glob('*.txt')
-        for man_track_path in man_track_paths:
-            man_track_path.unlink()
+            if clear_old_data:
+                man_track_paths = (datapath / 'man_track' / folder).glob('*.txt')
+                for man_track_path in man_track_paths:
+                    man_track_path.unlink()
 
         (datapath / 'annotations' / folder).mkdir(exist_ok=True)
         (datapath / folder).mkdir(exist_ok=True)
@@ -55,15 +63,16 @@ def create_folders(datapath,folders):
             (datapath / folder / img_type).mkdir(exist_ok=True)
 
     # Remove all data (images + json file) from folders
-    for folder in folders:
-        for img_type in ['img','gt']:
-            delete_fps = (datapath / folder / img_type).glob('*.tif')
-            for delete_fp in delete_fps:
-                delete_fp.unlink()
+    if clear_old_data:
+        for folder in folders:
+            for img_type in ['img','gt']:
+                delete_fps = (datapath / folder / img_type).glob('*.tif')
+                for delete_fp in delete_fps:
+                    delete_fp.unlink()
 
-        json_paths = (datapath / 'annotations' / folder).glob('*.json')
-        for json_path in json_paths:
-            json_path.unlink()
+            json_paths = (datapath / 'annotations' / folder).glob('*.json')
+            for json_path in json_paths:
+                json_path.unlink()
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -100,8 +109,9 @@ def polygonFromMask(seg):
 
 
 class reader():
-    def __init__(self,dataset,target_size,resize,min_area):
+    def __init__(self,track,target_size,resize,min_area):
 
+        self.track = track
         self.target_size = target_size
         self.min_area = min_area
         self.resize = resize
@@ -113,6 +123,7 @@ class reader():
         self.remove_min = False
 
         self.max_num_of_cells = 0
+        self.swap = {}
     
     def load_track_file(self,track_file):
         self.track_file_orig = track_file
@@ -132,8 +143,10 @@ class reader():
 
         for fp in fps:
 
-            gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{fp.name[1:]}')
-
+            if self.track:
+                gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{fp.name[1:]}')
+            else:
+                gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'SEG' / (f'man_seg{fp.name[1:]}')
             # Read inputs and outputs
             gts.append(cv2.imread(str(gt_fp),cv2.IMREAD_UNCHANGED).astype(np.uint16))
 
@@ -257,15 +270,39 @@ class reader():
             new_cellnb = self.swap_cellnbs[cellnb]
 
         return new_cellnb
+    
+    def read_all_gts(self, fps):
+
+        gts = []
+
+        for fp in fps:
+            nb = re.findall('\d+',fp.stem)[-1]
+            dataset_nb = fp.parts[-2]
+
+            if self.track:
+                gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{nb}.tif')
+            else:
+                gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'SEG' / (f'man_seg{nb}.tif')
+
+            gt = cv2.imread(str(gt_fp),cv2.IMREAD_ANYDEPTH).astype(np.uint16)
+
+            gts.append(gt)
+
+        self.gts = np.stack(gts)
 
     def read_gt(self,fp,counter):
 
         nb = re.findall('\d+',fp.stem)[-1]
         framenb = int(nb)
         self.framenb = framenb
-        dataset_nb = fp.parts[-2]
-        gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{fp.name}')
+        # dataset_nb = fp.parts[-2]
 
+        # if self.track:
+        #     gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'TRA' / (f'man_track{nb}.tif')
+        # else:
+        #     gt_fp = fp.parents[1] / (dataset_nb + '_GT') / 'SEG' / (f'man_seg{nb}.tif')
+
+        # gt = cv2.imread(str(gt_fp),cv2.IMREAD_ANYDEPTH).astype(np.uint16)
         gt = self.gts[counter]
 
         skip = []
@@ -505,19 +542,71 @@ class reader():
             gt = gt_resized
 
         else:
-            cellnbs = np.unique(gt)
+            cellnbs = np.unique(self.gts[counter])
             cellnbs = cellnbs[cellnbs != 0]
             for cellnb in cellnbs:
-                mask_cellnb = ((gt == cellnb)*255).astype(np.uint8)
+                mask_cellnb = ((self.gts[counter] == cellnb)*255).astype(np.uint8)
 
                 contours, _ = cv2.findContours(mask_cellnb, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                top_contour = sorted(contours, key=len, reverse=True)[0]  
+
                 
-                if sum([contour.size >= 6 for contour in contours]) == 0 or (mask_cellnb > 127).sum() < self.min_area:
-                    gt[mask_cellnb.astype(bool)] = 0
+                if top_contour.size < 6 or (mask_cellnb > 127).sum() < self.min_area:
 
-        self.prev_gt = gt
+                    cellid, start, end, mother = self.track_file_orig[self.track_file_orig[:,0] == cellnb][0]
+                    self.gts[counter,mask_cellnb.astype(bool)] = 0
 
-        return gt
+                    new_cellnb = np.max(self.track_file_orig[:,0]) + 1
+
+                    # Cell existed for one frame
+                    if framenb == start and framenb == end:
+                        # If division occured remove division
+                        if mother != 0:
+                            dau_cells = self.track_file_orig[self.track_file_orig[:,-1] == mother,0]
+                            for dau_cell in dau_cells:
+                                self.track_file_orig[self.track_file_orig[:,0] == dau_cell, -1] = 0
+
+                                if dau_cell != cellnb:
+                                    dau_cellid, dau_start, dau_end, _ = self.track_file_orig[self.track_file_orig[:,0] == dau_cell][0]
+                                    self.track_file_orig[self.track_file_orig[:,0] == mother, 2] = dau_end
+
+                                    dau_dau_cells = self.track_file_orig[self.track_file_orig[:,-1] == dau_cell,0]
+
+                                    for dau_dau_cell in dau_dau_cells:
+                                        self.track_file_orig[self.track_file_orig[:,0] == dau_dau_cell,-1] = mother
+
+                                    self.swap[dau_cell] = mother
+
+                        self.track_file_orig = self.track_file_orig[self.track_file_orig[:,0] != cellnb]
+
+                        # if cellnb in self.swap:
+                        #     del self.swap[cellnb]
+
+                    elif framenb > start and framenb < end:
+                        new_row = np.array([[new_cellnb,framenb+1,end,0]])
+                        self.track_file_orig = np.concatenate((self.track_file_orig,new_row),axis=0)
+                        self.track_file_orig[self.track_file_orig[:,0] == cellnb,2] = framenb - 1
+                        self.gts[framenb+1:][self.gts[framenb+1:] == cellnb] = new_cellnb
+
+                    elif framenb == start and framenb < end:
+                        self.track_file_orig[self.track_file_orig[:,0] == cellnb,1] = framenb + 1
+
+                        if mother != 0:
+                            raise NotImplementedError
+
+                    elif framenb > start and framenb == end:
+                        self.track_file_orig[self.track_file_orig[:,0] == cellnb,2] = framenb - 1
+
+                        dau_cells = self.track_file_orig[self.track_file_orig[:,-1] == cellnb]
+
+                        if len(dau_cells) != 0:
+                            raise NotImplementedError
+                    else:
+                        raise NotImplementedError
+
+        self.prev_gt = self.gts[counter]
+
+        return self.gts[counter]
     
 
     def clean_track_file(self,savepath,dataset_name,fps,CTC_coco_folder,f,ctc_counter,ann_length,annotations):
@@ -582,7 +671,7 @@ class reader():
 
         return annotations
 
-def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
+def create_anno(mask,cellnb,image_id,annotation_id,dataset_name,dataset_num):
    
     mask_sc = mask == cellnb 
 
@@ -632,6 +721,7 @@ def create_anno(mask,cellnb,image_id,annotation_id,dataset_name):
         'category_id': 1,
         'track_id': cellnb if cellnb > 0 else [],
         'dataset_name': dataset_name,
+        'dataset_num': dataset_num,
         'ignore': 0,
         'iscrowd': 0,
         'empty': empty,

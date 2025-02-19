@@ -22,6 +22,8 @@ class data_visualizer():
         self.mask_threshold = mask_threshold
         self.colors = colors
         self.display_edge_cells = False
+        self.tracking = args.tracking
+        self.args = args
 
         self.enc_thresholds = [0, 0.1 ,0.3 ,0.5 , 0.8, 1.0]
 
@@ -66,11 +68,27 @@ class data_visualizer():
         
         return img
     
-    def draw_mask(self,img,mask,color=None):
+    def draw_mask(self,img,mask,color=None, roi_box=None):
 
-        if mask.shape != (self.height,self.width):
-            mask = cv2.resize(mask,(self.width,self.height))
-        mask = np.repeat(mask[...,None],3,axis=-1)
+        if roi_box is not None and self.args.use_ROIAlign_mask:
+            x0, y0, x1, y1 = roi_box.astype(int)
+            y1 = min(y1,self.height)
+            x1 = min(x1,self.width)
+            width = x1 - x0
+            height = y1 - y0
+
+            init_mask = np.zeros((self.height,self.width))
+
+            if width > 0 and height > 0:
+                roi_mask = cv2.resize(mask,(width,height))
+                init_mask[y0:y1, x0:x1] = roi_mask
+
+            mask = np.repeat(init_mask[...,None],3,axis=-1)
+
+        else:
+            if mask.shape != (self.height,self.width):
+                mask = cv2.resize(mask,(self.width,self.height))
+            mask = np.repeat(mask[...,None],3,axis=-1)
 
         if np.min(mask) < 0: 
             mean = 0
@@ -90,11 +108,15 @@ class data_visualizer():
     def filter_pred_masks(self,pred_masks):
 
         if pred_masks.shape[0] > 0:
-            masks_filt = np.zeros((pred_masks.shape))
-            argmax = np.argmax(pred_masks,axis=0)
-            for m in range(pred_masks.shape[0]):
-                masks_filt[m,argmax==m] = pred_masks[m,argmax==m]
-            masks_filt = masks_filt > self.mask_threshold
+            if self.args.use_ROIAlign_mask:
+                masks_filt = pred_masks > self.mask_threshold
+            else:
+                masks_filt = np.zeros((pred_masks.shape))
+                argmax = np.argmax(pred_masks,axis=0)
+                for m in range(pred_masks.shape[0]):
+                    masks_filt[m,argmax==m] = pred_masks[m,argmax==m]
+                masks_filt = masks_filt > self.mask_threshold
+
             pred_masks = (masks_filt*255).astype(np.uint8)
 
         return pred_masks
@@ -118,9 +140,14 @@ class data_visualizer():
 
         for target in targets:
 
-            target_names = ['prev_prev_target','prev_target','cur_target']
-            if 'fut_target' in target:
-                target_names += 'fut_target'
+            if self.tracking:
+                target_names = ['prev_prev_target','prev_target','cur_target']
+
+                if 'fut_target' in target:
+                    target_names += 'fut_target'
+
+            else:
+                target_names = ['cur_target']
             
             empty = torch.tensor([target['main'][name]['empty'] for name in target_names]).sum().item()
 
@@ -187,12 +214,18 @@ class data_visualizer():
         pred_boxes = pred_boxes_all[keep]
         pred_logits = pred_logits_all[keep]
 
-        div_keep = keep * (pred_logits_all[:,1] > self.cls_threshold) * (target['main'][target_name]['track_queries_mask'].cpu().numpy())
-
         if use_masks:
             pred_masks_all = out['pred_masks'][i].sigmoid().detach().cpu().numpy()
+            div_keep = keep * (pred_logits_all[:,1] > self.cls_threshold) * (target['main'][target_name]['track_queries_mask'].cpu().numpy())
 
             filter_pred_masks = np.concatenate((pred_masks_all[keep,0],pred_masks_all[div_keep,1]))
+
+            if self.args.use_ROIAlign_mask:
+                roi_boxes_all = out['roi_boxes'][i,:,:,1:].detach().cpu().numpy()
+                roi_boxes = roi_boxes_all[keep]
+            else:
+                roi_box = None
+            
             filter_pred_masks = self.filter_pred_masks(filter_pred_masks)
 
             pred_masks_all[keep,0] = filter_pred_masks[:keep.sum()]
@@ -230,14 +263,20 @@ class data_visualizer():
             img_pred_raw = self.draw_bbox(img_pred_raw,pred_bbox[:4],color,pred_logit,flex_div=flex_div,edge=edge)
 
             if use_masks:
-                img_pred_raw = self.draw_mask(img_pred_raw,pred_masks[idx,0],color)    
+                if self.args.use_ROIAlign_mask:
+                    roi_box = roi_boxes[idx,0]
+
+                img_pred_raw = self.draw_mask(img_pred_raw,pred_masks[idx,0],color,roi_box)    
 
             if pred_logits[idx,1] > self.cls_threshold and target['main'][target_name]['track_queries_mask'][ind]:
                 pred_logit = f'{pred_logits[idx,1]:.2f}' if self.display_all else None
                 img_pred_raw = self.draw_bbox(img_pred_raw,pred_bbox[4:],color,pred_logit,flex_div=flex_div,edge=edge)
 
+
                 if use_masks:
-                    img_pred_raw = self.draw_mask(img_pred_raw,pred_masks[idx,1],color)
+                    if self.args.use_ROIAlign_mask:
+                        roi_box = roi_boxes[idx,1]
+                    img_pred_raw = self.draw_mask(img_pred_raw,pred_masks[idx,1],color, roi_box)
 
         res = img_pred_raw
 
@@ -254,7 +293,11 @@ class data_visualizer():
 
             if use_masks:
                 pred_match_masks = pred_masks_all[indices[0]]
-                pred_match_masks = pred_match_masks[None] if pred_match_masks.ndim ==3 else pred_match_masks
+                pred_match_masks = pred_match_masks[None] if pred_match_masks.ndim == 3 else pred_match_masks
+
+                if self.args.use_ROIAlign_mask:
+                    roi_boxes_match = roi_boxes_all[indices[0]]
+                    roi_boxes_match = roi_boxes_match[None] if roi_boxes_match.ndim == 2 else roi_boxes_match
 
             indices_unique = np.unique(indices[0].numpy())
 
@@ -268,6 +311,8 @@ class data_visualizer():
 
                     if use_masks:
                         pred_match_masks[ind,:1] = pred_match_masks[ind,1:]
+                        if use_ROIAlign_mask:
+                            roi_boxes_match[ind,0] = roi_boxes_match[ind,1]
 
             for idx,pred_match_bbox in enumerate(pred_match_bboxes):
 
@@ -283,7 +328,9 @@ class data_visualizer():
                 img_pred_match = self.draw_bbox(img_pred_match,pred_match_bbox[:4],color,pred_logit,flex_div=flex_div,edge=edge)
                 
                 if use_masks:
-                    img_pred_match = self.draw_mask(img_pred_match,pred_match_masks[idx,0],color)   
+                    if self.args.use_ROIAlign_mask:
+                        roi_box = roi_boxes_match[idx,0]
+                    img_pred_match = self.draw_mask(img_pred_match,pred_match_masks[idx,0],color,roi_box)   
 
                 # For current target, we don't separate divided cells but for prev target, we do
                 if target_name == 'cur_target' and pred_match_logits[idx,1] > self.cls_threshold and target['main'][target_name]['boxes'][indices[1][idx],-1] > 0:
@@ -291,7 +338,9 @@ class data_visualizer():
                     img_pred_match = self.draw_bbox(img_pred_match,pred_match_bbox[4:],color,pred_logit,flex_div=flex_div,edge=edge)
 
                     if use_masks:
-                        img_pred_match = self.draw_mask(img_pred_match,pred_match_masks[idx,1],color)
+                        if self.args.use_ROIAlign_mask:
+                            roi_box = roi_boxes_match[idx,1]
+                        img_pred_match = self.draw_mask(img_pred_match,pred_match_masks[idx,1],color,roi_box)
 
             res = np.concatenate((res,img_pred_match),1)
 
@@ -347,6 +396,13 @@ class data_visualizer():
             enc_pred_masks = enc_pred_masks_topk[keep]
             enc_pred_masks = self.filter_pred_masks(enc_pred_masks)
 
+            if self.args.use_ROIAlign_mask:
+                roi_boxes_topk = two_stage_outputs['roi_boxes'][i,:,0,1:].detach().cpu().numpy()
+                enc_roi_boxes = roi_boxes_topk[keep]
+                raise NotImplementedError
+            else:
+                roi_box = None
+
         indices = target['main'][target_name]['indices']
         track_ids = target['main'][target_name]['track_ids'][indices[1]].cpu().numpy()
 
@@ -365,25 +421,29 @@ class data_visualizer():
             img = self.draw_bbox(img,enc_pred_box[:4],color,enc_pred_logit)
 
             if use_masks:
-                img = self.draw_mask(img,enc_pred_masks[idx],color)
+                if self.args.use_ROIAlign_mask:
+                    roi_box = enc_roi_boxes[idx]
+                img = self.draw_mask(img,enc_pred_masks[idx],color,roi_box)
 
         if target['main'][target_name]['track_queries_mask'].sum() == 0:
+            roi_box = None # GT masks do not require roi boxes
 
             img_gt = self.preprocess_img(target,target_name.replace('target','image')) 
 
-            boxes_gt = target['main'][target_name]['boxes'].cpu().numpy()
-            track_ids = target['main'][target_name]['track_ids'].cpu().numpy()
-            boxes_gt = self.bbox_cxcy_to_xyxy(boxes_gt)
-
-            if use_masks:
-                masks_gt = target['main'][target_name]['masks'].cpu().numpy()
-
-            for idx,bounding_box in enumerate(boxes_gt):
-                color=self.colors[track_ids[idx]-self.min_track_ids[i]]
-                img_gt = self.draw_bbox(img_gt,bounding_box[:4],color)
+            if not target['main'][target_name]['empty']:
+                boxes_gt = target['main'][target_name]['boxes'].cpu().numpy()
+                track_ids = target['main'][target_name]['track_ids'].cpu().numpy()
+                boxes_gt = self.bbox_cxcy_to_xyxy(boxes_gt)
 
                 if use_masks:
-                    img_gt = self.draw_mask(img_gt,masks_gt[idx,0],color)
+                    masks_gt = target['main'][target_name]['masks'].cpu().numpy()
+
+                for idx,bounding_box in enumerate(boxes_gt):
+                    color=self.colors[track_ids[idx]-self.min_track_ids[i]]
+                    img_gt = self.draw_bbox(img_gt,bounding_box[:4],color)
+
+                    if use_masks:
+                        img_gt = self.draw_mask(img_gt,masks_gt[idx,0],color,roi_box)
 
             img = np.concatenate((img,img_gt),1)
 
@@ -409,6 +469,13 @@ class data_visualizer():
         if use_masks and 'pred_masks' in aux_outputs[-1]:
             pred_masks_all = aux_outputs[-1]['pred_masks'].detach().cpu().numpy()[i,-self.num_queries:]
             pred_masks = pred_masks_all[keep]
+
+            if self.args.use_ROIAlign_mask:
+                roi_boxes_all = aux_outputs[-1]['roi_boxes'][i,-self.num_queries,:,1:].detach().cpu().numpy()
+                roi_boxes = roi_boxes_all[keep]
+            else:
+                roi_box = None
+
             pred_masks = self.filter_pred_masks(pred_masks)
             pred_masks_all[keep] = pred_masks
 
@@ -431,12 +498,16 @@ class data_visualizer():
             if aux_outputs[-1]['CoMOT_loss_ce'] and idx in keep_ind:
                 CoMOT_raw = self.draw_bbox(CoMOT_raw,pred_box[:4],color,pred_logit)
                 if use_masks and 'pred_masks' in aux_outputs[-1]:
-                    CoMOT_raw = self.draw_mask(CoMOT_raw,pred_masks_all[idx,0],color)
+                    if self.args.use_ROIAlign_mask:
+                        roi_box = roi_boxes_all[idx,0]
+                    CoMOT_raw = self.draw_mask(CoMOT_raw,pred_masks_all[idx,0],color,roi_box)
 
             if idx in CoMOT_indices[0]:
                 CoMOT_match = self.draw_bbox(CoMOT_match,pred_box[:4],color,pred_logit)
                 if use_masks and 'pred_masks' in aux_outputs[-1]:
-                    CoMOT_match = self.draw_mask(CoMOT_match,pred_masks_all[idx,0],color)        
+                    if self.args.use_ROIAlign_mask:
+                        roi_box = roi_boxes_all[idx,0]
+                    CoMOT_match = self.draw_mask(CoMOT_match,pred_masks_all[idx,0],color,roi_box)        
             
         CoMOT_res = np.concatenate((CoMOT_res,CoMOT_match),1)
         
@@ -466,7 +537,7 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
     alpha = 0.3
     use_masks = 'pred_masks' in outputs['main']
     # box_converter = box_cxcy_to_xyxy(height,width)
-    colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)]) # Assume max 1000 cells in one chamber
+    colors = np.array([tuple((255*np.random.random(3))) for _ in range(100000)]) #
     colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
     # colors = [tuple((255*np.random.random(3))) for _ in range(600)]
     # colors[:6] = [np.array(255.,0.,0.),np.array(0.,255.,0.),np.array(0.,0.,255.),np.array(255.,255.,0.),np.array(255.,0.,255.),np.array(0.,255.,255.),]
@@ -475,7 +546,7 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
     min_track_ids, max_track_ids = viz.get_min_max_track_id(targets)
     
     training_methods = list(outputs.keys())
-    training_methods = [training_method for training_method in training_methods if training_method not in ['main','two_stageSS']]
+    training_methods = [training_method for training_method in training_methods if training_method not in ['main','two_stage']]
 
     for training_method in training_methods:
 
@@ -549,6 +620,11 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                     pred_masks = viz.filter_pred_masks(pred_masks)
                     pred_masks_all[keep] = pred_masks
 
+                    if args.use_ROIAlign_mask:
+                        roi_boxes_all = outputs_TM['roi_boxes'][i,:,:,1:].detach().cpu().numpy()
+                    else:
+                        roi_box = None
+
                 indices = targets_TM[i]['indices']
 
                 for idx,pred_box in enumerate(pred_boxes_all):
@@ -571,7 +647,9 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                         img_pred = viz.draw_bbox(img_pred,pred_box[:4],color,pred_logit,flex_div=flex_div,edge=edge)
 
                         if use_masks:
-                            img_pred = viz.draw_mask(img_pred,pred_masks_all[idx,0],color)
+                            if args.use_ROIAlign_mask:
+                                roi_box = roi_boxes_all[idx,0]                            
+                            img_pred = viz.draw_mask(img_pred,pred_masks_all[idx,0],color,roi_box)
 
                         if pred_logits_all[idx,1] > cls_threshold:
 
@@ -579,7 +657,9 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                             img_pred = viz.draw_bbox(img_pred,pred_box[4:],color,pred_logit,flex_div=flex_div,edge=edge)
 
                             if use_masks:
-                                img_pred = viz.draw_mask(img_pred,pred_masks_all[idx,1],color)     
+                                if args.use_ROIAlign_mask:
+                                    roi_box = roi_boxes_all[idx,1]     
+                                img_pred = viz.draw_mask(img_pred,pred_masks_all[idx,1],color,roi_box)     
 
                 img_gt = img.copy()
 
@@ -617,7 +697,7 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                     orig_track_ids = target['target_og']['cur_target']['track_ids'].cpu().numpy()
 
                     orig_img_gt = img.copy()
-                    man_track = target['target_og']['man_track']
+
 
                     for idx,orig_gt_box in enumerate(orig_gt_boxes):
 
@@ -627,8 +707,10 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                             
                         orig_track_id = orig_track_ids[idx]
 
-                        if man_track[orig_track_id-1,1] == target['target_og']['cur_target']['framenb'] and  man_track[orig_track_id-1,-1] > 0:
-                            orig_track_id = man_track[orig_track_id-1,-1]
+                        if args.tracking:
+                            man_track = target['target_og']['man_track']
+                            if man_track[orig_track_id-1,1] == target['target_og']['cur_target']['framenb'] and  man_track[orig_track_id-1,-1] > 0:
+                                orig_track_id = man_track[orig_track_id-1,-1]
 
                         color = colors[orig_track_id - min_track_id]
 
@@ -682,6 +764,11 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                 if use_masks:
                     pred_masks_all = outputs[training_method]['pred_masks'][t,:,0].detach().cpu().numpy()
                 
+                    if args.use_ROIAlign_mask:
+                        roi_boxes_all = outputs['training_method']['roi_boxes'][i,:,0,1:].detach().cpu().numpy()
+                    else:
+                        roi_box = None
+
                 OD_img = viz.preprocess_img(target,'cur_image')  
 
                 for idx,pred_box in enumerate(pred_boxes_all):
@@ -704,7 +791,9 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                         OD_img = viz.draw_bbox(OD_img,pred_box,color,pred_logit,flex_div=flex_div,edge=edge)
 
                         if use_masks:
-                            OD_img = viz.draw_mask(OD_img,pred_masks_all[idx],color)                           
+                            if args.use_ROIAlign_mask:
+                                roi_box = roi_boxes_all[idx]
+                            OD_img = viz.draw_mask(OD_img,pred_masks_all[idx],color,roi_box)                           
 
                 OD_frames.append(OD_img)
 
@@ -790,6 +879,11 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
 
                     pred_masks_all[keep] = pred_masks
 
+                    if args.use_ROIAlign_mask:
+                        roi_boxes_all = outputs_TM['roi_boxes'][i,:,0,1:].detach().cpu().numpy()
+                    else:
+                        roi_box = None
+
                 for idx,(enc_box,enc_box_noised,pred_box) in enumerate(zip(enc_boxes,enc_boxes_noised,pred_boxes_all)):
                         
                     if idx in indices[0]:
@@ -813,13 +907,17 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                         img_pred_thresh = viz.draw_bbox(img_pred_thresh,pred_box[:4],color,pred_logit)
 
                         if use_masks:
-                            img_pred_thresh = viz.draw_mask(img_pred_thresh,pred_masks_all[idx],color)
+                            if use_ROIAlign_mask:
+                                roi_box = roi_boxes_all[idx]
+                            img_pred_thresh = viz.draw_mask(img_pred_thresh,pred_masks_all[idx],color,roi_box)
 
                     if idx in indices[0]:
                         img_pred_match = viz.draw_bbox(img_pred_match,pred_box[:4],color,pred_logit)
 
                         if use_masks:
-                            img_pred_match = viz.draw_mask(img_pred_match,pred_masks_all[idx],color)
+                            if use_ROIAlign_mask:
+                                roi_box = roi_boxes_all[idx]
+                            img_pred_match = viz.draw_mask(img_pred_match,pred_masks_all[idx],color,roi_box)
 
                 if args.display_all:
                     dn_encs.append(np.concatenate((img,img_enc_boxes,img_enc_boxes_match,img_enc_boxes_noised,img_enc_boxes_noised_match,img_pred_thresh,img_pred_match,img_gt),axis=1))
@@ -903,6 +1001,11 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                     pred_masks_all = outputs_TM['pred_masks'][i].detach().cpu().sigmoid().numpy()
                     pred_masks = pred_masks_all[keep]
 
+                    if args.use_ROIAlign_mask:
+                        roi_boxes_all = outputs_TM['roi_boxes'][i,:,:,1:].detach().cpu().numpy()
+                    else:
+                        roi_box = None
+
                     if sum(keep) > 0:
                         pred_masks = viz.filter_pred_masks(pred_masks)
 
@@ -913,8 +1016,12 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
 
 
                 pred_boxes_TP = pred_boxes_all[indices[0]]
-                pred_masks_TP = pred_masks_all[indices[0]]
                 pred_logits_TP = pred_logits_all[indices[0]]
+
+                if use_masks:
+                    pred_masks_TP = pred_masks_all[indices[0]]
+                    if use_ROIAlign_mask:
+                        roi_boxes_all_TP = roi_boxes_all[indices[0]]
 
                 for idx,pred_box in enumerate(pred_boxes_TP):
                     
@@ -934,14 +1041,19 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                         cur_img_pred = viz.draw_bbox(cur_img_pred,pred_box[:4],color,pred_logit,flex_div=flex_div,edge=edge)
 
                         if use_masks:
-                            cur_img_pred = viz.draw_mask(cur_img_pred,pred_masks_TP[idx,0].squeeze(),color)
+                            if args.use_ROIAlign_mask:
+                                roi_box = roi_boxes_all_TP[idx,0]
+                            cur_img_pred = viz.draw_mask(cur_img_pred,pred_masks_TP[idx,0].squeeze(),color,roi_box)
 
                 indices_FP = np.array([idx for idx in range(pred_boxes_all.shape[0]) if idx not in indices[0]])
 
                 if len(indices_FP) > 0:
                     pred_boxes_FP = pred_boxes_all[indices_FP]
-                    pred_masks_FP = pred_masks_all[indices_FP]
                     pred_logits_FP = pred_logits_all[indices_FP]
+                    if use_masks:
+                        pred_masks_FP = pred_masks_all[indices_FP]
+                        if args.use_ROIAlign_mask:
+                            roi_boxes_all_FP = roi_boxes_all[indices_FP]
 
                     for idx,pred_box in enumerate(pred_boxes_FP):
                         color = (0,0,0)
@@ -952,7 +1064,9 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                             cur_img_pred = viz.draw_bbox(cur_img_pred,pred_box[:4],color,pred_logit,flex_div=flex_div,edge=edge)
 
                             if use_masks:
-                                cur_img_pred = viz.draw_mask(cur_img_pred,pred_masks_FP[idx,0].squeeze(),color)
+                                if args.use_ROIAlign_mask:
+                                    roi_box = roi_boxes_all_FP[idx,0]
+                                cur_img_pred = viz.draw_mask(cur_img_pred,pred_masks_FP[idx,0].squeeze(),color,roi_box)
 
                 if args.display_all:
                     orig_gt_boxes = targets[i]['target_og']['cur_target']['boxes'].cpu().numpy()
@@ -965,7 +1079,8 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                     orig_track_ids = targets[i]['target_og']['cur_target']['track_ids'].cpu().numpy()
 
                     orig_img_gt = cur_img.copy()
-                    man_track = targets[i]['target_og']['man_track']
+                    if args.tracking:
+                        man_track = targets[i]['target_og']['man_track']
 
                     for idx,orig_gt_box in enumerate(orig_gt_boxes):
 
@@ -999,16 +1114,18 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
         two_stage_res = np.zeros((height,0,3))
 
         if prev_prev_outputs is not None:
-            prev_prev_res = viz.display_main_pred(prev_prev_outputs,target,i,'prev_prev_target')
-            res = np.concatenate((res,prev_prev_res),1)
+            if args.display_all:
+                prev_prev_res = viz.display_main_pred(prev_prev_outputs,target,i,'prev_prev_target')
+                res = np.concatenate((res,prev_prev_res),1)
 
             if 'two_stage' in prev_prev_outputs:
                 prev_prev_two_stage_res = viz.display_two_stage(prev_prev_outputs,target,i,'prev_prev_target')
                 two_stage_res = np.concatenate((two_stage_res,prev_prev_two_stage_res),1)
 
         if prev_outputs is not None:
-            prev_res = viz.display_main_pred(prev_outputs,target,i,'prev_target', 'prev_prev_target')
-            res = np.concatenate((res,prev_res),1)
+            if args.display_all:
+                prev_res = viz.display_main_pred(prev_outputs,target,i,'prev_target', 'prev_prev_target')
+                res = np.concatenate((res,prev_res),1)
 
             if 'two_stage' in prev_outputs:
                 prev_two_stage_res = viz.display_two_stage(prev_outputs,target,i,'prev_target')
@@ -1030,9 +1147,13 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
         if print_gt:
     
             gt_dict = {}
-            target_names = ['prev_prev','prev','cur','prev_flex','cur_flex']
-            if 'fut_target' in target:
-                target_names += ['fut']
+
+            if args.tracking:
+                target_names = ['prev_prev','prev','cur','prev_flex','cur_flex']
+                if 'fut_target' in target:
+                    target_names += ['fut']
+            else:
+                target_names = ['cur','cur_flex']
 
             for t in target_names:
 
@@ -1047,8 +1168,9 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                         image_name = t + '_image'
                     else:
                         continue
-
-                man_track = target_holder['man_track']
+                        
+                if args.tracking:
+                    man_track = target_holder['man_track']
 
                 frame_gt = viz.preprocess_img(target,image_name)
 
@@ -1084,13 +1206,14 @@ def plot_results(outputs,targets,samples,savepath,filename,folder,args):
                             if use_masks:
                                 frame_gt = viz.draw_mask(frame_gt,masks[idx,1],color)
 
-                        track_id_ind = man_track[:,0] == track_ids[idx]
+                        if args.tracking:
+                            track_id_ind = man_track[:,0] == track_ids[idx]
 
-                        if man_track[track_id_ind,1] == target['main'][target_name]['framenb'] and  man_track[track_id_ind,-1] > 0:
-                            mother_id = man_track[track_id_ind,-1]
-                            color = colors[mother_id - min_track_id]
-                            centroid = (int(np.clip(box[0] + box[2] / 2,0,width)), int(np.clip(box[1] + box[3] / 2,0,height)))
-                            frame_gt = cv2.circle(frame_gt, centroid, radius=2, color=color, thickness=-1)
+                            if man_track[track_id_ind,1] == target['main'][target_name]['framenb'] and  man_track[track_id_ind,-1] > 0:
+                                mother_id = man_track[track_id_ind,-1]
+                                color = colors[mother_id - min_track_id]
+                                centroid = (int(np.clip(box[0] + box[2] / 2,0,width)), int(np.clip(box[1] + box[3] / 2,0,height)))
+                                frame_gt = cv2.circle(frame_gt, centroid, radius=2, color=color, thickness=-1)
 
                 gt_dict[t] = frame_gt
 

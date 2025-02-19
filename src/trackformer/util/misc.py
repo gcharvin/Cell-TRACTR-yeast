@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision
 from torch import Tensor, nn
+from torchvision.ops import roi_align
 
 from . import box_ops
 
@@ -363,6 +364,9 @@ def threshold_indices(indices,targets,training_method,target_name,max_ind):
                 if 'masks' in target[training_method][target_name]:
                     target[training_method][target_name]['masks'][ind_tgt[i]] = torch.cat((target[training_method][target_name]['masks'][ind_tgt[i],1:],target[training_method][target_name]['masks'][ind_tgt[i],:1]),axis=0)
 
+                    raise NotImplementedError
+                    # need to update roi_boxes as well if available
+
     return indices, targets
 
 
@@ -424,7 +428,9 @@ def display_loss(metrics_dict:dict,i,i_total,epoch,dataset):
 
     for key in metrics_dict.keys():
         if ('loss' in key and not bool(re.search('\d',key)) and key != 'lr') or 'CoMOT' in key:
-            display_loss[key] = f'{np.nan if np.isnan(metrics_dict[key][-1]).all() else np.nanmean(metrics_dict[key][-1]):.4f}'
+            if not np.isnan(metrics_dict[key][-1]).all():
+                display_loss[key] = f'{np.nanmean(metrics_dict[key][-1]):.4f}'
+            # display_loss[key] = f'{np.nan if np.isnan(metrics_dict[key][-1]).all() else np.nanmean(metrics_dict[key][-1]):.4f}'
 
     pad = int(math.log10(i_total))+1
     print(f'{dataset}  Epoch: {epoch} ({i:0{pad}}/{i_total-1})',display_loss)
@@ -697,6 +703,64 @@ def point_sample(input, point_coords, **kwargs):
         output = output.squeeze(3)
     return output
 
+def sample_points_optimized_batch(masks, N, k=2, beta=0.5):
+    """
+    Efficiently sample N points from each mask in a batch with oversampling and uncertainty selection.
+    Args:
+        masks (Tensor): Batch of masks of shape (B, H, W) with confidence scores.
+        N (int): Number of points to sample per mask.
+        k (int): Oversampling factor.
+        beta (float): Ratio of most uncertain points to sample.
+    Returns:
+        point_coords (Tensor): Coordinates of sampled points, shape (B, N, 2).
+    """
+    B, H, W = masks.shape  # Batch size, height, width
+    kN = k * N  # Oversampled points count
+    
+    # Step 1: Oversample kN points for each mask
+    all_coords = torch.randint(0, H * W, (B, kN), device=masks.device)
+    
+    # Get confidence values of sampled points directly from mask
+    masks_flat = masks.view(B, -1)  # Flatten each mask for direct indexing
+    sampled_vals = torch.gather(masks_flat, 1, all_coords)  # Get sampled values efficiently
+    
+    # Step 2: Sort to get the most uncertain beta*N points per mask
+    uncertain_count = int(beta * N)
+    _, topk_indices = torch.topk(sampled_vals, uncertain_count, dim=1, largest=False)
+    uncertain_coords = torch.stack((topk_indices // W, topk_indices % W), dim=-1)  # Convert to 2D coordinates
+    
+    # Step 3: Random sampling for the remaining (1 - beta) * N points
+    random_indices = torch.randint(0, kN, (B, N - uncertain_count), device=masks.device)
+    random_coords = torch.stack((random_indices // W, random_indices % W), dim=-1)
+    
+    # Combine uncertain and random points
+    point_coords = torch.cat([uncertain_coords, random_coords], dim=1).float()
+    
+    return point_coords  # Shape (B, N, 2)
+
+def roi_align_regions(features, boxes, output_size=(32, 32), spatial_scale=1.0):
+    """
+    Apply RoIAlign to extract fixed-size regions from the feature map for each RoI.
+    
+    Args:
+        features (Tensor): Feature map of shape (B, C, H, W).
+        boxes (Tensor): Tensor of RoI boxes of shape (num_rois, 5), where each box is in
+                        (batch_index, x1, y1, x2, y2) format, specifying coordinates.
+        output_size (tuple): Size (height, width) of the output feature map from RoIAlign.
+        spatial_scale (float): Scaling factor to map boxes to feature map coordinates.
+        
+    Returns:
+        aligned_features (Tensor): Aligned feature map for each RoI of shape (num_rois, C, output_size[0], output_size[1]).
+    """
+    aligned_features = roi_align(
+        features,
+        boxes,
+        output_size=output_size,
+        spatial_scale=spatial_scale,
+        aligned=True
+    )
+    return aligned_features
+
 def man_track_ids(targets,training_method:str,input_target_name:str,output_target_name:str = None):
 
     target_names = ['prev_prev_target','prev_target','cur_target','fut_target']
@@ -842,7 +906,7 @@ def update_cropped_man_track(target):
         target_names += ['fut_target']
 
     man_track = target['man_track']
-    max_cellnb = target['man_track'][-1,0].item()
+    max_cellnb = target['man_track'][:,0].max().item()
 
     for target_name in target_names:
 
@@ -959,14 +1023,15 @@ def split_outputs(outputs,target_TM):
     end_ind = target_TM['end_query_ind']
 
     new_outputs = {}
-    
-    if new_outputs is None:
-        new_outputs = outputs
+
     new_outputs['pred_logits'] = outputs['pred_logits'][:,start_ind:end_ind]
     new_outputs['pred_boxes'] = outputs['pred_boxes'][:,start_ind:end_ind]
 
+
     if 'pred_masks' in outputs:
         new_outputs['pred_masks'] = outputs['pred_masks'][:,start_ind:end_ind]
+        if 'roi_boxes' in outputs:
+            new_outputs['roi_boxes'] = outputs['roi_boxes'][:,start_ind:end_ind]
 
     if 'aux_outputs' in outputs:
 
@@ -978,6 +1043,10 @@ def split_outputs(outputs,target_TM):
 
             if 'pred_masks' in outputs['aux_outputs'][lid]:
                 new_outputs['aux_outputs'][lid]['pred_masks'] = outputs['aux_outputs'][lid]['pred_masks'][:,start_ind:end_ind]
+
+                if 'roi_boxes' in outputs:
+                    new_outputs['aux_outputs'][lid]['roi_boxes'] = outputs['aux_outputs'][lid]['roi_boxes'][:,start_ind:end_ind]
+
 
     return new_outputs
 
@@ -1047,7 +1116,7 @@ def load_model(model_without_ddp,args,param_dicts=None,optimizer=None,lr_schedul
         checkpoint = torch.hub.load_state_dict_from_url(
             args.resume, map_location='cpu', check_hash=True)
     else:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu')
 
     model_state_dict = model_without_ddp.state_dict()
     checkpoint_state_dict = checkpoint['model']
@@ -1137,7 +1206,7 @@ def load_model(model_without_ddp,args,param_dicts=None,optimizer=None,lr_schedul
     return model_without_ddp
 
 
-def add_new_targets_from_main(targets,training_method,target_name):
+def add_new_targets_from_main(targets,training_method,target_name,tracking):
 
     keys = ['labels','boxes','track_ids','flexible_divisions','is_touching_edge']
 
@@ -1153,8 +1222,10 @@ def add_new_targets_from_main(targets,training_method,target_name):
 
         target[training_method][target_name]['empty'] = target['main'][target_name]['empty'].clone()
 
-        # This is needed for flex div for OD; could do this for two-stage encoder as well
-        target[training_method]['man_track'] = target['main']['man_track'].clone()
+        if tracking:
+            # This is needed for flex div for OD; could do this for two-stage encoder as well
+            target[training_method]['man_track'] = target['main']['man_track'].clone()
+            
         target[training_method][target_name]['framenb'] = target['main'][target_name]['framenb']
 
     return targets
@@ -1206,6 +1277,7 @@ def plot_loss_and_metrics(datapath):
     # Save the overall loss plot with log scale as well
     ax.set_yscale('log')
     plt.savefig(datapath / 'loss_plot_overall_log.png')
+    plt.close()
 
     # Plot the individual losses
     fig,ax = plt.subplots(len(training_methods),2,figsize=(10,15))
@@ -1255,6 +1327,7 @@ def plot_loss_and_metrics(datapath):
         ax[t,1].set_yscale('log')
 
     plt.savefig(datapath / 'loss_plot_log.png')
+    plt.close()
 
     # Remove losses that don't have intermediate losses / CoMOT as a loss if used since it is only an intermediate loss
     losses = ['loss_ce','loss_bbox','loss_giou','loss_mask','loss_dice']
@@ -1323,6 +1396,7 @@ def plot_loss_and_metrics(datapath):
 
             fig.tight_layout()
             plt.savefig(datapath / (f'aux_loss_{training_method}_plot.png'))
+            plt.close()
 
     plot_aux_losses(losses,metrics_train,metrics_val,training_methods,num_layers)
 
@@ -1370,6 +1444,7 @@ def plot_loss_and_metrics(datapath):
         ax[i].set_title(titles[i])
 
     plt.savefig(datapath / 'acc_plot.png')
+    plt.close()
         
     # Save metric values for last epoch in a txt file for an easy way to see the actually metric values (vs looking at a plot)
     with open(str(datapath / 'metrics.txt'),'w') as f:

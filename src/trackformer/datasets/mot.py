@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import time
 
+from torch.utils.data import Sampler
+
 from . import transforms as T
 from .coco import CocoDetection, make_coco_transforms_cells
 from ..util import misc
@@ -54,6 +56,10 @@ class MOT(CocoDetection):
     def set_dataset_type(self,dataset):
         self.dataset_type = dataset
 
+    def set_tracking(self,tracking, shift):
+        self.tracking = tracking
+        self.shift = tracking and shift
+
     def set_target_size(self,target_size):
         self.target_size = torch.tensor(list(map(int,re.findall('\d+',target_size))))
         self.RandomCrop = T.RandomCrop(self.target_size)
@@ -68,9 +74,47 @@ class MOT(CocoDetection):
         torch.cuda.manual_seed(idx + self.current_epoch)
         np.random.seed(idx + self.current_epoch)
 
+        target = {'main': {}}
+        target['main']['training_method'] = 'main'
+        main_target = target['main']
+
         fn = self.coco.imgs[idx]['file_name']
         dataset_nb = re.findall('\d+',fn)[:-1]
 
+        if self.args.masks and self.args.freeze_detr:
+            pass
+            # skip samples that contain no cells; loss can't back prop with nothing to calculate loss on
+        if self.tracking:
+            idx = self.get_idx(idx,dataset_nb)
+
+            man_track_id = self.coco.imgs[idx]['man_track_id']
+            man_track = self.get_man_track(man_track_id)
+            main_target['man_track'] = torch.from_numpy(man_track).long()
+
+        target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
+        fn = self.coco.imgs[idx]['file_name']
+        framenb = int(re.findall('\d+',fn)[-1])
+
+        self.RandomCrop.region = None
+    
+        if self.tracking:
+            target, main_target = self.get_prev_and_fut_targets(target, main_target, idx, framenb)
+
+        img, cur_target = self._getitem_from_id(idx, framenb)
+        target['cur_image'] = img
+        main_target['cur_target'] = cur_target
+
+        if self.tracking and self.crop:
+            main_target = misc.update_cropped_man_track(main_target)
+
+        # This saves the original annotations. Used for display purposes only if args.display_all is True. It gets too cluttered when there are too many cells. Therefore, I'd only use this for moma
+        if self.dataset_type == 'moma' and self.tracking:
+            target = self.save_copy_of_target(target,main_target)
+
+        return img, target
+    
+    def get_idx(self,idx,dataset_nb):
+            
         if idx < 2:
             idx = 2
 
@@ -93,10 +137,11 @@ class MOT(CocoDetection):
             if fut_dataset_nb != dataset_nb:
                 idx -= 1
 
-        fn = self.coco.imgs[idx]['file_name']
-        framenb = int(re.findall('\d+',fn)[-1])
+        return idx
 
-        man_track = np.loadtxt(self.root.parents[1] / 'man_track' / self.root.parts[-2] / (dataset_nb[0] + '.txt'),dtype=np.int16)
+    def get_man_track(self,man_track_id):
+
+        man_track = np.loadtxt(self.root.parents[1] / 'man_track' / self.root.parts[-2] / (str(man_track_id) + '.txt'),dtype=np.int16)
 
         # We remove cells that disappear and reappear
         divisions = np.unique(man_track[:,-1])
@@ -105,14 +150,10 @@ class MOT(CocoDetection):
             if (man_track[:,-1] == div).sum() != 2:
                 man_track[man_track[:,-1] == div,-1] = 0
 
-        target = {'main': {}}
-        main_target = target['main']
-        main_target['man_track'] = torch.from_numpy(man_track).long()
-
-        target['dataset_nb'] = torch.tensor(int(dataset_nb[0]))
-
-        self.RandomCrop.region = None
+        return man_track
     
+    def get_prev_and_fut_targets(self,target, main_target, idx, framenb):
+
         prev_prev_img, prev_prev_target = self._getitem_from_id(idx-2, framenb-2)
         target['prev_prev_image'] = prev_prev_img
         main_target['prev_prev_target'] = prev_prev_target
@@ -136,65 +177,69 @@ class MOT(CocoDetection):
             elif rand_num < 0.5:              
                 self.ShiftCrop(rand_num)
 
-        img, cur_target = self._getitem_from_id(idx, framenb)
-        target['cur_image'] = img
-        main_target['cur_target'] = cur_target
-
         if self.flex_div:
             fut_img, fut_target = self._getitem_from_id(idx+1, framenb+1)
             target['fut_image'] = fut_img
             main_target['fut_target'] = fut_target
 
-        if self.crop:
-            main_target = misc.update_cropped_man_track(main_target)
 
-        # This saves the original annotations. Used for display purposes only if args.display_all is True. It gets too cluttered when there are too many cells. Therefore, I'd only use this for moma
-        if self.dataset_type == 'moma':
-            target['target_og'] = {}
-            target['target_og']['man_track'] = main_target['man_track'].clone()
-                
-            for target_name in ['prev_prev_target','prev_target','cur_target','fut_target']:
-                if not self.flex_div and target_name == 'fut_target':
-                    continue
-                target['target_og'][target_name] = {}
-                target['target_og'][target_name]['boxes'] = main_target[target_name]['boxes'].clone()
-                target['target_og'][target_name]['track_ids'] = main_target[target_name]['track_ids'].clone()
-                target['target_og'][target_name]['is_touching_edge'] = main_target[target_name]['is_touching_edge'].clone()
-                target['target_og'][target_name]['framenb'] = main_target[target_name]['framenb'].clone()
-                
-                if 'masks' in main_target[target_name]:
-                    target['target_og'][target_name]['masks'] = main_target[target_name]['masks'].clone()
-
-        target['main']['training_method'] = 'main'
-
-        return img, target
+        return target, main_target
     
+    def save_copy_of_target(self, target, main_target):
+        target['target_og'] = {}
+        target['target_og']['man_track'] = main_target['man_track'].clone()
+            
+        for target_name in ['prev_prev_target','prev_target','cur_target','fut_target']:
+            if not self.flex_div and target_name == 'fut_target':
+                continue
+            target['target_og'][target_name] = {}
+            target['target_og'][target_name]['boxes'] = main_target[target_name]['boxes'].clone()
+            target['target_og'][target_name]['track_ids'] = main_target[target_name]['track_ids'].clone()
+            target['target_og'][target_name]['is_touching_edge'] = main_target[target_name]['is_touching_edge'].clone()
+            target['target_og'][target_name]['framenb'] = main_target[target_name]['framenb'].clone()
+            
+            if 'masks' in main_target[target_name]:
+                target['target_og'][target_name]['masks'] = main_target[target_name]['masks'].clone()
+
+        return target
+
     def ShiftCrop(self, rand_num):
 
-        shift_x = int(random.random() * self.shift_value)
-        shift_y = int(random.random() * self.shift_value)
-            
-        if rand_num < 0.25:
-            if self.RandomCrop.region[0] + self.RandomCrop.region[2] + shift_y < self.img_h:
-                self.RandomCrop.region[0] += shift_y
-            else:
-                self.RandomCrop.region[0] = self.img_h - self.target_size[0].item()
-        else:
-            if self.RandomCrop.region[0] - shift_y > 0:
-                self.RandomCrop.region[0] -= shift_y
-            else:
-                self.RandomCrop.region[0] = 0
+        h,w = self.RandomCrop.get_h_w()             
 
-        if rand_num > 0.125 and rand_num < 0.375:
-            if self.RandomCrop.region[1] + self.RandomCrop.region[3] + shift_x < self.img_w:
-                self.RandomCrop.region[1] += shift_x
-            else:
-                self.RandomCrop.region[1] = self.img_w - self.target_size[1].item()
+        if self.img_w_raw > w:
+            shift_x = int(random.random() * self.shift_value)
         else:
-            if self.RandomCrop.region[1] - shift_x > 0:
-                self.RandomCrop.region[1] -= shift_x
+            shift_x = 0
+
+        if self.img_h_raw > h:
+            shift_y = int(random.random() * self.shift_value)
+        else:
+            shift_y = 0
+
+        if shift_x != 0 or shift_y != 0:
+                
+            if rand_num < 0.25:
+                if self.RandomCrop.region[0] + self.RandomCrop.region[2] + shift_y < self.img_h:
+                    self.RandomCrop.region[0] += shift_y
+                else:
+                    self.RandomCrop.region[0] = self.img_h - self.target_size[0].item()
             else:
-                self.RandomCrop.region[1] = 0
+                if self.RandomCrop.region[0] - shift_y > 0:
+                    self.RandomCrop.region[0] -= shift_y
+                else:
+                    self.RandomCrop.region[0] = 0
+
+            if rand_num > 0.125 and rand_num < 0.375:
+                if self.RandomCrop.region[1] + self.RandomCrop.region[3] + shift_x < self.img_w:
+                    self.RandomCrop.region[1] += shift_x
+                else:
+                    self.RandomCrop.region[1] = self.img_w - self.target_size[1].item()
+            else:
+                if self.RandomCrop.region[1] - shift_x > 0:
+                    self.RandomCrop.region[1] -= shift_x
+                else:
+                    self.RandomCrop.region[1] = 0
 
         assert self.RandomCrop.region[0] >= 0 and self.RandomCrop.region[1] >= 0
         assert self.RandomCrop.region[0] + self.RandomCrop.region[2] <= self.img_h  and self.RandomCrop.region[1] + self.RandomCrop.region[3] <= self.img_w
@@ -221,11 +266,23 @@ def build_cells(image_set,args):
         overflow_boxes=args.overflow_boxes,
         remove_no_obj_imgs=False,
         crop=args.crop,
-        shift=shift,
+        batch_size=args.batch_size,
+        args=args,
         )  
     
     dataset.set_dataset_type(args.dataset)
     dataset.set_target_size(args.target_size)
+    dataset.set_tracking(args.tracking, args.shift)
     dataset.flex_div = args.flex_div
     
     return dataset
+
+class SubsetSampler(Sampler):
+    def __init__(self, indices):
+        self.indices = indices
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return len(self.indices)

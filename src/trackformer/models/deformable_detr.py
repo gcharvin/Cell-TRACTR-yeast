@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .deformable_transformer import DeformableTransformer
 from ..util import box_ops
 from ..util.misc import NestedTensor, inverse_sigmoid, nested_tensor_from_tensor_list, MLP
 
@@ -29,7 +30,7 @@ class DeformableDETR():
                  aux_loss=True, with_box_refine=False, two_stage=False, overflow_boxes=False,
                  multi_frame_attention=False, use_dab=True, random_refpoints_xy=False, dn_object=False, 
                  dn_object_FPs=False, dn_object_l1 = 0, dn_object_l2 = 0, refine_object_queries=False,
-                 share_bbox_layers=True,use_img_for_mask=False,masks=False):
+                 share_bbox_layers=True,use_img_for_mask=False,masks=False,freeze_backbone_and_encoder=False,freeze_backbone=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -51,7 +52,9 @@ class DeformableDETR():
         self.overflow_boxes = overflow_boxes
         self.class_embed = nn.Linear(self.hidden_dim, num_classes + 2)
         self.bbox_embed = MLP(self.hidden_dim, self.hidden_dim, 8, 3)
-        self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
+
+        if not two_stage:
+            self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
 
         # match interface with deformable DETR
         self.input_proj = nn.Conv2d(backbone.num_channels[-1], self.hidden_dim, kernel_size=1)
@@ -159,6 +162,21 @@ class DeformableDETR():
             self.decoder.bbox_embed = None
             self.decoder.class_embed = None
 
+
+        if freeze_backbone_and_encoder:
+            for name, param in self.named_parameters():
+                if 'decoder' not in name:
+                    param.requires_grad_(False)
+                #     print(f'Frozen: {name}')
+                # else:
+                #     print(f'Trainable: {name}')
+        
+        elif freeze_backbone:
+            for name, param in self.named_parameters():
+                if 'backbone' in name:
+                    param.requires_grad_(False)  
+
+
     def forward(self, samples: NestedTensor, targets: list = None, target_name: str = 'cur_target'):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensors: batched images, of shape [batch_size x 3 x H x W]
@@ -174,6 +192,13 @@ class DeformableDETR():
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
+
+        if not self.tracking:
+            for target in targets:
+                target['track'] = False
+                target['main']['cur_target']['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+
+
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
             
@@ -190,6 +215,8 @@ class DeformableDETR():
         pos_list = [] # pos embeddings
         frame_features = [features]
 
+        max_num_queries = 0
+
         for frame, frame_feat in enumerate(frame_features):
             if self.multi_frame_attention:
                 pos_list.extend([p[:, frame] for p in pos[-self.num_feature_levels:]])
@@ -203,6 +230,8 @@ class DeformableDETR():
                 mask_list.append(mask)
 
                 assert mask is not None
+
+                max_num_queries += src.shape[-1] * src.shape[-2]
 
             if self.num_feature_levels > len(frame_feat):
                 _len_srcs = len(frame_feat)
@@ -222,6 +251,16 @@ class DeformableDETR():
                         pos_list.append(pos_l[:, frame])
                     else:
                         pos_list.append(pos_l)
+
+                    max_num_queries += src.shape[-1] * src.shape[-2]
+
+        if self.two_stage and self.num_queries > max_num_queries:
+            self.num_queries = max_num_queries
+
+            if not self.tracking: # target_name will always be cur_target since this is for non tracking scenarios (only object detection / segmentation)
+                target['main'][target_name]['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+                target['main'][target_name]['track_queries_TP_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+                target['main'][target_name]['num_queries'] = self.num_queries
 
         bs = src.shape[0]
         training_methods = ['main']
@@ -255,7 +294,7 @@ class DeformableDETR():
                     target['main']['end_query_ind'] = num_total_queries
 
             #### DN-DETR for noised object detection
-            if self.dn_object and target_name == 'cur_target' and targets is not None and torch.tensor([target['main'][target_name]['empty'] for target in targets]).sum() == 0: # If there is an empty chamber, skip all denoising
+            if self.train_model and self.dn_object and target_name == 'cur_target' and targets is not None and torch.tensor([target['main'][target_name]['empty'] for target in targets]).sum() == 0: # If there is an empty chamber, skip all denoising
                 training_methods.append('dn_object')
 
                 num_boxes = torch.tensor([len(target['main'][target_name]['labels_orig']) - int(target['main'][target_name]['empty']) for target in targets]).to(self.device)
@@ -278,13 +317,14 @@ class DeformableDETR():
 
                     target['dn_object'] = {'training_method': 'dn_object', 'cur_target': {}}
 
-                    target['dn_object']['man_track'] = target['main']['man_track'].clone()
                     target['dn_object']['cur_target']['framenb'] = target['main'][target_name]['framenb']
                     target['dn_object']['cur_target']['empty'] = target['main'][target_name]['empty']
                     target['dn_object']['cur_target']['track_queries_fal_pos_mask'] = torch.zeros((num_dn_object_queries)).bool().to(self.device)
 
-                    target['dn_object']['prev_target'] = target['main']['prev_target'].copy()
-                    target['dn_object']['fut_target'] = target['main']['fut_target'].copy()
+                    if self.tracking:
+                        target['dn_object']['man_track'] = target['main']['man_track'].clone()
+                        target['dn_object']['prev_target'] = target['main']['prev_target'].copy()
+                        target['dn_object']['fut_target'] = target['main']['fut_target'].copy()
 
                     dict_keys = ['boxes','labels','track_ids','flexible_divisions','is_touching_edge']
 
@@ -389,3 +429,8 @@ class DeformableDETR():
 
         assert outputs_coord is not None and outputs_class is not None
         return [{'pred_boxes': a, 'pred_logits': b} for a, b in zip(outputs_coord[:-1], outputs_class[:-1])]
+    
+class DeformableDETRclass(DeformableDETR, DeformableTransformer):
+    def __init__(self, detr_kwargs, transformer_kwargs):
+        DeformableTransformer.__init__(self, **transformer_kwargs)
+        DeformableDETR.__init__(self, **detr_kwargs)

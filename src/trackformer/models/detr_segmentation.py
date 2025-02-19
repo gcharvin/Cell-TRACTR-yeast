@@ -5,7 +5,8 @@ import fvcore.nn.weight_init as weight_init
 import torch
 import torch.nn as nn
 
-from ..util.misc import NestedTensor, MLP
+from ..util.misc import NestedTensor, MLP, roi_align_regions
+from ..util import box_ops
 
 from .deformable_detr import DeformableDETR, _get_clones
 from .deformable_transformer import DeformableTransformer
@@ -13,7 +14,7 @@ from .detr_tracking import DETRTrackingBase
 
 
 class DETRSegmBase(nn.Module):
-    def __init__(self, freeze_detr=False,return_intermediate_masks=False, mask_dim = 288):
+    def __init__(self, freeze_detr=False,return_intermediate_masks=False, mask_dim = 288, use_ROIAlign_mask=False):
         
         if freeze_detr:
             for param in self.parameters():
@@ -21,9 +22,14 @@ class DETRSegmBase(nn.Module):
 
         self.return_intermediate_masks = return_intermediate_masks
         self.mask_dim = mask_dim
+        self.use_ROIAlign_mask= use_ROIAlign_mask
 
         self.decoder_norm  = nn.LayerNorm(self.hidden_dim)
-        self.mask_embed = MLP(self.hidden_dim, self.hidden_dim, self.mask_dim*2, 3)
+
+        if use_ROIAlign_mask:
+            self.mask_embed = MLP(self.hidden_dim, self.hidden_dim, self.mask_dim, 3)   
+        else:
+            self.mask_embed = MLP(self.hidden_dim, self.hidden_dim, self.mask_dim*2, 3)
 
         num_pred = 1
 
@@ -111,18 +117,45 @@ class DETRSegmBase(nn.Module):
         self.lateral_layers = nn.ModuleList(self.lateral_layers).to(self.device)
         self.output_layers = nn.ModuleList(self.output_layers).to(self.device)
 
-    def forward_prediction_heads(self, output, i):
+    def forward_prediction_heads(self, output, i, out_boxes):
+        b, N, _ = out_boxes.shape
         decoder_output = self.decoder_norm(output.transpose(0,1))
         decoder_output = decoder_output.transpose(0, 1)
 
         mask_embed = self.mask_embed[i](decoder_output)
 
-        outputs_mask_1 = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,:self.mask_dim], self.all_mask_features)
-        outputs_mask_2 = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,self.mask_dim:], self.all_mask_features)
+        batch_out_boxes = None
 
-        outputs_mask = torch.stack((outputs_mask_1,outputs_mask_2),axis=2)
+        if self.use_ROIAlign_mask:
+            batch_out_boxes = out_boxes.view(-1, out_boxes.shape[2])
+            if batch_out_boxes.shape[-1] == 8:
+                batch_out_boxes = torch.cat((batch_out_boxes[:,:4],batch_out_boxes[:,4:]))
 
-        return outputs_mask
+            batch_out_boxes = box_ops.box_cxcywh_to_xyxy(batch_out_boxes)
+            batch_out_boxes[:,1::2] = batch_out_boxes[:,1::2] * self.all_mask_features.shape[-2]
+            batch_out_boxes[:,::2] = batch_out_boxes[:,::2] * self.all_mask_features.shape[-1]
+
+            batch_out_boxes = torch.cat((torch.zeros((batch_out_boxes.shape[0],1),dtype=batch_out_boxes.dtype,device=self.device),batch_out_boxes),1)
+            resized_mask_features = roi_align_regions(self.all_mask_features, batch_out_boxes)
+
+            mask_embed = mask_embed.view(-1,mask_embed.shape[-1])
+            mask_embed = torch.cat((mask_embed,mask_embed),axis=0)[:,None]
+
+            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, resized_mask_features)[:,0]
+            h,w = outputs_mask.shape[-2:]
+            outputs_mask = torch.stack((outputs_mask[:N],outputs_mask[N:]),1)
+            outputs_mask = outputs_mask.view(b,-1,2,h,w)
+            batch_out_boxes = torch.stack((batch_out_boxes[:N],batch_out_boxes[N:]),1)
+            batch_out_boxes = batch_out_boxes.view(b,-1,2,5)
+            
+            
+        else:
+            outputs_mask_1 = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,:self.mask_dim], self.all_mask_features)
+            outputs_mask_2 = torch.einsum("bqc,bchw->bqhw", mask_embed[:,:,self.mask_dim:], self.all_mask_features)
+
+            outputs_mask = torch.stack((outputs_mask_1,outputs_mask_2),axis=2)
+
+        return outputs_mask, batch_out_boxes
 
     def forward(self, samples: NestedTensor, targets: list = None):
 
@@ -130,20 +163,29 @@ class DETRSegmBase(nn.Module):
         if not self.tracking and self.training:
             for target in targets:
                 target['main']['cur_target']['track_queries_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+                target['main']['cur_target']['track_queries_TP_mask'] = torch.zeros((self.num_queries)).bool().to(self.device)
+                target['main']['cur_target']['num_queries'] = self.num_queries
+                target['track'] = False
 
         out, targets, features, memory, hs = super().forward(samples, targets)
 
-        pred_masks = self.forward_prediction_heads(hs[-1],self.final_mask_embed_index)
+        pred_masks, batch_out_boxes = self.forward_prediction_heads(hs[-1],self.final_mask_embed_index, out['pred_boxes'])
         out["pred_masks"] = pred_masks
+        if self.use_ROIAlign_mask:
+            out["roi_boxes"] = batch_out_boxes
 
         if self.return_intermediate_masks:
             for i in range(len(hs) - 1):
-                pred_masks = self.forward_prediction_heads(hs[i],i)
+                pred_masks, batch_out_boxes = self.forward_prediction_heads(hs[i],i,out["aux_outputs"][i]['pred_boxes'])
                 out["aux_outputs"][i]['pred_masks'] = pred_masks
+                if self.use_ROIAlign_mask:
+                    out["aux_outputs"][i]['roi_boxes'] = batch_out_boxes
 
         if 'OD' in out:
-            pred_masks = self.forward_prediction_heads(out['OD']['hs_embed'],self.OD_mask_embed_index)
+            pred_masks, batch_out_boxes = self.forward_prediction_heads(out['OD']['hs_embed'],self.OD_mask_embed_index, out['OD']['pred_boxes'])
             out['OD']['pred_masks'] = pred_masks
+            if self.use_ROIAlign_mask:
+                out['OD']['roi_boxes'] = batch_out_boxes
 
         return out, targets, features, memory, hs
     

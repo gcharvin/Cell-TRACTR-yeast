@@ -10,7 +10,11 @@ def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(-1)
     b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
          (x_c + 0.5 * w), (y_c + 0.5 * h)]
-    return torch.stack(b, dim=-1)
+    b = torch.stack(b,dim=1)
+    # Predictions early on in training may generate bboxes wiht negative x0 and y0
+    b[b[:,0] < 0,0] = 0.
+    b[b[:,1] < 0,1] = 0.
+    return b
 
 
 def box_xyxy_to_cxcywh(x):
@@ -116,10 +120,11 @@ def masks_to_boxes(masks,cxcywh=False):
 
     boxes[masks.sum((1,2)) == 0] = torch.tensor([0,0,0,0],dtype=boxes.dtype,device=masks.device)
 
+    assert (boxes < 0).sum() == 0
     if cxcywh:
-        assert (boxes[::2] > 1).sum() == 0 and (boxes[1::2] > 1).sum() == 0
+        assert (boxes > 1).sum() == 0
     else:
-        assert (boxes[::2] > w).sum() == 0 and (boxes[1::2] > h).sum() == 0
+        assert (boxes[:,::2] > w).sum() == 0 and (boxes[:,1::2] > h).sum() == 0
     return boxes
 
 def mask_iou(inputs, targets):

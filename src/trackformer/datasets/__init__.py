@@ -7,7 +7,7 @@ from pycocotools.coco import COCO
 from torch.utils.data import Dataset, Subset
 from torchvision.datasets import CocoDetection
 
-from .mot import build_cells
+from .mot import build_cells, SubsetSampler
 
 
 def get_coco_api_from_dataset(dataset: Subset) -> COCO:

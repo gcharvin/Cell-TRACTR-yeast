@@ -22,7 +22,7 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, cost_mask: float = 1, cost_dice: float = 1,
-                 num_points = 10000, focal_loss: bool = False, focal_alpha: float = 0.25, focal_gamma: float = 2.0,match_masks:bool = False):
+                 num_points = 10000, focal_loss: bool = False, focal_alpha: float = 0.25, focal_gamma: float = 2.0,match_masks:bool = False, useROIAlign_mask=False):
         """Creates the matcher
 
         Params:
@@ -43,6 +43,7 @@ class HungarianMatcher(nn.Module):
         self.focal_gamma = focal_gamma
         self.match_masks = match_masks
         self.num_points = num_points
+        self.use_ROIAlign_mask = useROIAlign_mask
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
 
     @torch.no_grad()
@@ -72,8 +73,14 @@ class HungarianMatcher(nn.Module):
         batch_size, num_queries = outputs["pred_logits"].shape[:2]
 
         if sum([target[training_method][target_name]['empty'] for target in targets]) == batch_size:
-            return [(torch.tensor([]).long(),torch.tensor([]).long()) for _ in range(batch_size)], targets
 
+            ind = [(torch.tensor([]).long(),torch.tensor([]).long()) for _ in range(batch_size)]
+
+            # Automatically save the original index matching; it gets updated when divided cells need to track to the next frame
+            for i,target in zip(ind,targets):
+                target[training_method][target_name]['indices'] = i
+            return ind, targets
+        
         # We flatten to compute the cost matrices in a batch
         #
         # [batch_size * num_queries, num_classes]
@@ -139,7 +146,7 @@ class HungarianMatcher(nn.Module):
             + self.cost_class * cost_class \
             + self.cost_giou * cost_giou
 
-        if self.match_masks and 'pred_masks' in outputs:
+        if self.match_masks and 'pred_masks' in outputs and not self.use_ROIAlign_mask:
             # for now, matching just first cell, not divisions; following MaskDINO in terms of a batched method
 
             out_mask = outputs["pred_masks"]

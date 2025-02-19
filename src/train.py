@@ -8,34 +8,34 @@ import numpy as np
 import sacred
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 import trackformer.util.misc as utils
-from trackformer.datasets import build_dataset
+from trackformer.datasets import build_dataset, SubsetSampler
 from trackformer.engine import evaluate, train_one_epoch
 from trackformer.models import build_model
 
 filepath = Path(__file__)
 yaml_file_paths = (filepath.parents[1] / 'cfgs').glob("*.yaml")
-yaml_files = [yaml_file.stem.split('train_')[1] for yaml_file in yaml_file_paths]
+yaml_files = [yaml_file for yaml_file in yaml_file_paths]
 
 ex = sacred.Experiment('train')
 
-def train(respath, dataset) -> None:
+def train(yaml_filepath) -> None:
     
-    if (respath / 'checkpoint.pth').exists():
-        ex.add_config(str(respath / 'config.yaml'))
-    else:
-        ex.add_config(str(filepath.parents[1] / 'cfgs' / ('train_' + dataset + '.yaml')))
+    ex.add_config(str(yaml_filepath))
 
     config = ex.run_commandline().config
     args = utils.nested_dict_to_namespace(config)
 
-    if (respath / 'config.yaml').exists():
-        args.resume = str(respath / 'checkpoint.pth')
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    Path(args.output_dir).mkdir(exist_ok=True)
+    yaml.dump(
+        vars(args),
+        open(Path(args.output_dir) / 'config.yaml', 'w'), allow_unicode=True)
 
+    args.output_dir = Path(args.output_dir)
+    
     if args.dn_track or args.dn_object:
         assert args.use_dab, f'DAB-DETR is needed to use denoised boxes for tracking / object detection. args.use_dab is currently set to {args.use_dab}'
 
@@ -51,13 +51,6 @@ def train(respath, dataset) -> None:
     if args.debug:
         args.num_workers = 0
 
-    if args.output_dir:
-        args.output_dir = str(args.output_dir)
-        yaml.dump(
-            vars(args),
-            open(Path(args.output_dir) / 'config.yaml', 'w'), allow_unicode=True)
-
-    args.output_dir = Path(args.output_dir)
     print(args)
 
     val_output_folder = 'val_outputs'
@@ -116,7 +109,11 @@ def train(respath, dataset) -> None:
     dataset_train = build_dataset(split='train', args=args)
     dataset_val = build_dataset(split='val', args=args)
 
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    if args.weighted_sampling and not np.all(np.array(dataset_train.weights) == dataset_train.weights[0]):
+        sampler_train = WeightedRandomSampler(dataset_train.weights, num_samples=len(dataset_train.weights), replacement=True)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     batch_sampler_train = torch.utils.data.BatchSampler(sampler_train, args.batch_size, drop_last=True)
@@ -206,7 +203,7 @@ def train(respath, dataset) -> None:
 
 @ex.config
 def my_config():
-    dataset = yaml_files[0]  # Default dataset
+    yaml_file = yaml_files[0]  # Default yaml file
 
 @ex.main
 def load_config(_config, _run):
@@ -216,10 +213,8 @@ def load_config(_config, _run):
 if __name__ == '__main__':
     # Parse the dataset from the command line
     args = ex.run_commandline().config
-    dataset = args['dataset']
+    yaml_filename = args['yaml_file']
+    yaml_filepath = filepath.parents[1] / 'cfgs' / yaml_filename
+    # yaml_filepath = filepath.parents[1] / 'cfgs' / 'pretrain-segmentation-std-moma.yaml'
 
-    respath = filepath.parents[1] / 'results' / dataset
-
-    respath.mkdir(exist_ok=True)
-
-    train(respath, dataset)
+    train(yaml_filepath)

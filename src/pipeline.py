@@ -17,31 +17,25 @@ from trackformer.models import build_model
 from trackformer.util.misc import nested_dict_to_namespace
 
 filepath = Path(__file__)
-yaml_file_paths = (filepath.parents[1] / 'cfgs').glob("*.yaml")
-yaml_files = [yaml_file.stem.split('_')[1] for yaml_file in yaml_file_paths]
 
 ex = sacred.Experiment('pipeline')
 
-def train(args: Namespace, datapath) -> None:
+def train(args: Namespace, path_to_dataset) -> None:
 
     print(args.output_dir)
     args.resume = args.output_dir / 'checkpoint.pth'
+    args.output_dir = args.output_dir / path_to_dataset.name
 
-    dataset_name = args.dataset
-
-    if not datapath.exists():
-        datapath = datapath.parent / 'val'
-
-        if not datapath.exists():
-            raise NotImplementedError
-
-    args.output_dir = args.output_dir / datapath.name
+    if (path_to_dataset / 'CTC' / 'test').exists():
+        path_to_dataset = path_to_dataset / 'CTC' / 'test'
+    elif (path_to_dataset / 'CTC' / 'val').exists():
+        path_to_dataset = path_to_dataset / 'CTC' / 'train'
+    else:
+        raise NotImplementedError
 
     args.hooks = False
     args.avg_attn_weight_maps = False
-
-    if dataset_name != 'moma':
-        args.display_decoder_aux = False
+    args.display_decoder_aux = False
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -72,12 +66,8 @@ def train(args: Namespace, datapath) -> None:
 
     model_without_ddp = utils.load_model(model_without_ddp,args) # If eval_only, optimizer will not be loaded (only relevant for training)
 
-    folderpaths = [folderpath for folderpath in sorted(datapath.iterdir()) if re.findall('\d\d$',folderpath.name)]
+    folderpaths = [folderpath for folderpath in sorted(path_to_dataset.iterdir()) if re.findall('\d\d$',folderpath.name)]
 
-    if not args.tracking or not args.masks:
-        raise NotImplementedError
-
-    (args.output_dir.parent).mkdir(exist_ok=True)
     (args.output_dir).mkdir(exist_ok=True)
     args.output_dir = args.output_dir / 'CTC'
     (args.output_dir).mkdir(exist_ok=True)
@@ -106,7 +96,8 @@ def train(args: Namespace, datapath) -> None:
 
 @ex.config
 def my_config():
-    dataset = yaml_files[0]  # Default dataset
+    path_to_dataset = '/path/to/CTC-dataset' 
+    modelname = 'pretrain-OD-freeze-backbone-train-tracking-segmentation-moma'
 
 @ex.main
 def load_config(_config, _run):
@@ -115,15 +106,17 @@ def load_config(_config, _run):
 
 if __name__ == '__main__':
     args = ex.run_commandline().config
-    dataset = args['dataset']
-    respath = filepath.parents[1] / 'results' / dataset
+    path_to_dataset = Path(args['path_to_dataset'])
+    modelname = args['modelname']
+
+
+    path_to_dataset = Path('/projectnb/dunlop/ooconnor/MOT/data/CTC_datasets/moma')
+    respath = filepath.parents[1] / 'results' / modelname
 
     ex.add_config(str(respath / 'config.yaml'))
     args = ex.run_commandline().config
     args = utils.nested_dict_to_namespace(args)
 
     args.output_dir = Path(args.output_dir)
-    args.data_dir = Path(args.data_dir)
-    datapath = args.data_dir / dataset / 'CTC' / 'test'
 
-    train(args,datapath)
+    train(args,path_to_dataset)

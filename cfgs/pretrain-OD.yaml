@@ -1,0 +1,190 @@
+tracking: false
+freeze_backbone: false
+freeze_backbone_and_encoder: false
+lr: 0.0002
+lr_backbone_names: ['backbone.0']
+lr_backbone: 0.00002
+lr_linear_proj_names: ['reference_points', 'sampling_offsets']
+lr_linear_proj_mult: 0.1
+lr_track: 0.0001
+overwrite_lrs: false
+overwrite_lr_scheduler: false
+batch_size: 1
+gradient_accumulation_steps: 1
+weight_decay: 0.0001
+epochs: 12
+lr_drop: 11
+target_size: (1024,1024)
+# Number of object queries
+num_queries: 400
+# Flexible divisions
+flex_div: false
+# Tracking 2 sequential frames - use prev_prev, prev and cur frame (detection 1 frame and track for 2 frames - 3 frames total)
+use_prev_prev_frame: false
+# For 2D data, image will be randomly cropped around objects
+crop: true
+# Shift only applies to cropped images. Crop will be shifted between sequential frames
+shift: false
+# gradient clipping max norm
+clip_max_norm: 0.1
+# Deformable DETR parameters
+deformable: true
+with_box_refine: true
+two_stage: true
+pre_norm: false
+dec_n_points: 4
+enc_n_points: 4
+# Model parameters
+freeze_detr: false
+load_mask_head_from_model: null
+# Backbone
+# Name of the convolutional backbone to use. ('resnet50', 'resnet101')
+backbone: resnet50
+# If true, we replace stride with dilation in the last convolutional block (DC5)
+dilation: false
+# Type of positional embedding to use on top of the image features. ('sine', 'learned')
+position_embedding: sine
+# Number of feature levels the encoder processes from the backbone
+num_feature_levels: 3
+# Transformer
+# Number of encoding layers in the transformer
+enc_layers: 1
+# Number of decoding layers in the transformer
+dec_layers: 3
+# Number of decoding layers in transformer used for object detection. Rest of layers will be used for tracking
+num_OD_layers: 0
+# Intermediate size of the feedforward layers in the transformer blocks
+dim_feedforward: 512
+# Size of the embeddings (dimension of the transformer)
+hidden_dim: 144
+# Dropout applied in the transformer
+dropout: 0.1
+# Number of attention heads inside the transformer's attentions
+nheads: 8
+# DAB-DETR 4D coordinates instead of 2D
+use_dab: true
+# DN-DETR denoising parameters
+# Denoised tracking queriesdn_track: true
+dn_track: false
+dn_track_l1: 0.2
+dn_track_l2: 0.1
+# Denoised object queries
+dn_object: true
+dn_object_FPs: true
+dn_object_l1: 0.3
+dn_object_l2: 0.15
+# Denoised enc queries (from first stage)
+dn_enc: false
+dn_enc_l1: 0.3
+dn_enc_l2: 0.15
+enc_FN: 1
+# Denoised group tracking queries
+dn_track_group: false
+tgt_noise: 0.1
+# Share parameters among bbox predictors for aux layers
+share_bbox_layers: false
+# COMOT is a paper that used the first X decoder layers to simultaneously track and detect and used the last layer solely for tracking
+CoMOT: false
+# COMOT - determines if loss is backpropgated over COMOT loss for cross-entropy (class)
+CoMOT_loss_ce: false
+# Use masks to generate the bounding boxes that are fed to next decoder + to next frame
+init_boxes_from_masks: true
+# Embeddings to differentiate object vs track queries
+refine_track_queries: true
+refine_object_queries: true
+refine_div_track_queries: false
+# Handling ref points with divisions
+use_div_box_as_ref_pts: true
+# Intialize content embeddings with a learned embedding for enc queries (fed from encoder to decoder)
+init_enc_queries_embeddings: false
+# Backprop the whole sequence of frames versus just the one frame that is being tracked and detected
+backprop_prev_frame: true
+# Handle multiple frames at once - needs to be updated
+multi_frame_attention: false
+# Encoder can process both frames at once or together if multiple frames are used
+multi_frame_attention_separate_encoder: false
+overflow_boxes: true
+# Segmentation
+masks: false
+mask_dim: 144
+enc_masks: false
+use_img_for_mask: true
+# Matcher - matching cost
+set_cost_class: 4.0
+set_cost_bbox: 5.0
+set_cost_giou: 2.0
+set_cost_mask: 5.0
+set_cost_dice: 2.0
+# Use masks in matching - more expensive computational
+match_masks: false
+# num of points to use when matching - reduces computational load
+num_points: 10000
+# Loss
+# Disables auxiliary decoding losses (loss at each layer)
+aux_loss: true
+# Backpropagate for mask at every aux layer (can create OOM issues)
+return_intermediate_masks: false
+# Use Sampling points in mask loss
+use_point_sampling_mask_loss: false
+# Use ROIAlign in mask loss
+use_ROIAlign_mask: true
+# Loss coefficients
+loss_coef: 1.0 # This is just a formality
+cls_loss_coef: 4.0 
+bbox_loss_coef: 5.0
+giou_loss_coef: 2.0
+pos_wei_loss_coef: 5.0
+dice_loss_coef: 5.0
+mask_loss_coef: 5.0
+mask_weight_target_cell_coef: 2.0
+mask_weight_all_cells_coef: 10.0
+div_loss_coef: 5.0 
+track_div_loss_coef: 2.0
+dn_object_coef: 1.0
+dn_track_coef: 1.0
+FN_det_query_loss_coef: 2.0
+object_queies_loss_coef: 1.0
+touching_edge_loss_coef: 0.2
+flex_div_loss_coef: 0.
+# Relative classification weight of the no-object class
+eos_coef: 0.1
+focal_loss: true
+focal_alpha: 0.25
+focal_gamma: 2
+# Number of plots
+num_plots: 100
+# Miscellaneous
+# path where to save, empty for no saving
+# Dataset
+dataset: pretrain-segmentation
+output_dir: /projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/pretrain-object-detection-test-1024x1024-4000-queries
+data_dir: /projectnb/dunlop/ooconnor/MOT/data
+weighted_sampling: True
+# device to use for training / testing
+device: cuda
+seed: 42
+# resume from checkpoint
+resume: '/projectnb/dunlop/ooconnor/MOT/models/Cell-TRACTR/results/pretrain-object-detection-test-1024x1024-4000-queries/checkpoint.pth'
+resume_shift_neuron: False
+# resume optimization from checkpoint
+resume_optim: true
+start_epoch: 1
+eval_only: false
+num_workers: 0
+val_interval: 5
+debug: false
+# epoch interval for model saving. if 0 only save last and best models
+save_model_interval: 5
+# distributed training parameters
+# number of distributed processes
+world_size: 1
+# url used to set up distributed training
+dist_url: env://
+cls_threshold: 0.5
+iou_threshold: 0.5
+# Data Viz
+data_viz: True
+# Data Viz - show all 
+display_all: False
+hooks: False
+avg_attn_weight_maps: True

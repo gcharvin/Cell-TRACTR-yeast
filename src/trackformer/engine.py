@@ -23,7 +23,7 @@ from .util import box_ops
 from .util import data_viz
 from .datasets.transforms import Normalize,ToTensor,Compose
 
-def calc_loss_for_training_methods(outputs, targets, criterion):
+def calc_loss_for_training_methods(outputs, targets, criterion, tracking):
 
     outputs_split = {}
     losses = {}
@@ -47,8 +47,9 @@ def calc_loss_for_training_methods(outputs, targets, criterion):
         
         losses = criterion(outputs_TM, targets, losses, training_method)
 
-    outputs_split['prev_outputs'] = outputs['prev_outputs']
-    outputs_split['prev_prev_outputs'] = outputs['prev_prev_outputs']
+    if tracking:
+        outputs_split['prev_outputs'] = outputs['prev_outputs']
+        outputs_split['prev_prev_outputs'] = outputs['prev_prev_outputs']
         
     return outputs_split, losses
 
@@ -68,17 +69,24 @@ def train_one_epoch(model: torch.nn.Module,
 
     metrics_dict = {}
 
+    gradient_accumulation_steps = args.gradient_accumulation_steps  # Number of steps to accumulate gradients
+    accumulation_counter = 0  # Counter for accumulation
+
     for i, (samples, targets) in enumerate(data_loader):
 
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
+        if args.masks and args.freeze_detr and sum([t['main']['cur_target']['empty'] for t in targets]) == len(targets):
+            continue
+        model.num_queries = args.num_queries # This can get adjuste if hte image is too small and there are not enough features for queries in two stage
+        assert targets[0]['main']['cur_target']['boxes'].shape[0] < args.num_queries
 
         outputs, targets, _, _, _ = model(samples,targets)
 
         del _
         torch.cuda.empty_cache()
 
-        outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion)
+        outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion, args.tracking)
         
         weight_dict = criterion.weight_dict
 
@@ -89,13 +97,17 @@ def train_one_epoch(model: torch.nn.Module,
             print(f"Loss is {losses.item()}, stopping training")
             sys.exit(1)
 
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
         losses.backward()
+        accumulation_counter += 1
 
         if args.clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_max_norm)
 
-        optimizer.step()
+        if accumulation_counter == gradient_accumulation_steps:
+            optimizer.step()
+            optimizer.zero_grad()
+            accumulation_counter = 0
 
         if i == 0:
             lr = np.zeros((1,len(optimizer.param_groups)))
@@ -108,10 +120,10 @@ def train_one_epoch(model: torch.nn.Module,
         if targets[0]['track']:
             acc_dict = utils.calc_track_acc(acc_dict,outputs['main'],main_targets,args)
 
-        if outputs['prev_prev_outputs'] is not None:
+        if args.tracking and outputs['prev_prev_outputs'] is not None:
             det_outputs = outputs['prev_prev_outputs']
             det_targets = [target['main']['prev_prev_target'] for target in targets]
-        elif outputs['prev_outputs'] is not None:
+        elif args.tracking and outputs['prev_outputs'] is not None:
             det_outputs = outputs['prev_outputs']
             det_targets = [target['main']['prev_target'] for target in targets]
         else:
@@ -126,9 +138,9 @@ def train_one_epoch(model: torch.nn.Module,
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i,lr)
 
-        if (i in ids and (epoch % 5 == 0 or epoch == 1)) and args.data_viz:
+        if (i in ids and (epoch % 5 == 0 or epoch == 1 or epoch == args.epochs)) and args.data_viz:
             data_viz.plot_results(outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args)
-
+        
         if i > 0 and (i % interval == 0 or i == len(data_loader) - 1):
             utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
     
@@ -147,9 +159,12 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
          
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
+        if args.masks and args.freeze_detr and sum([t['main']['cur_target']['empty'] for t in targets]) == len(targets):
+            continue
+        model.num_queries = args.num_queries # This can get adjust if the image is too small and there are not enough features for queries in two stage
 
         outputs, targets, _, _, _ = model(samples,targets)
-        outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion)
+        outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion, args.tracking)
 
         weight_dict = criterion.weight_dict
 
@@ -162,10 +177,10 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
         if targets[0]['track']:
             acc_dict = utils.calc_track_acc(acc_dict,outputs['main'],main_targets,args)
 
-        if outputs['prev_prev_outputs'] is not None:
+        if args.tracking and outputs['prev_prev_outputs'] is not None:
             det_outputs = outputs['prev_prev_outputs']
             det_targets = [target['main']['prev_prev_target'] for target in targets]
-        elif outputs['prev_outputs'] is not None:
+        elif args.tracking and outputs['prev_outputs'] is not None:
             det_outputs = outputs['prev_outputs']
             det_targets = [target['main']['prev_target'] for target in targets]
         else:
@@ -180,7 +195,7 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
 
         metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
 
-        if i in ids and (epoch % 5 == 0 or epoch == 1) and args.data_viz:
+        if i in ids and (epoch % 5 == 0 or epoch == 1 or epoch == args.epochs) and args.data_viz:
             data_viz.plot_results(outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args)
 
         if i > 0 and (i % interval == 0  or i == len(data_loader) - 1):
@@ -262,7 +277,13 @@ class pipeline():
             self.num_decoder_frames = 1
 
         img = PIL.Image.open(fps[0],mode='r')
-        self.color_stack = np.zeros((len(fps),img.size[1],img.size[0],3))
+
+        if img.size[0] < self.target_size[1] or img.size[1] < self.target_size[0]:
+            self.color_stack = np.zeros((len(fps),img.size[1],img.size[0],3))
+            self.crop = False
+        else:
+            self.color_stack = np.zeros((len(fps),self.target_size[0],self.target_size[1],3))
+            self.crop = True
 
         if np.max(img) < 2**8:
             self.max_val = 255
@@ -311,7 +332,7 @@ class pipeline():
             # Update the max cellnb
             self.max_cellnb = np.max(self.cells)
 
-    def update_div_boxes(self,pred_boxes,pred_masks=None):
+    def update_div_boxes(self,pred_boxes,pred_masks=None,roi_boxes=None):
         # boxes where div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
         unique_divs = np.unique(self.div_track[self.div_track != -1])
         for unique_div in unique_divs:
@@ -322,8 +343,17 @@ class pipeline():
 
             if pred_masks is not None:
                 pred_masks[div_ids[1],:1] = pred_masks[div_ids[0],1:] 
+                if self.args.use_ROIAlign_mask:
+                    roi_boxes[div_ids[1],:1] = roi_boxes[div_ids[0],1:]
 
-        return pred_boxes[:,:4], pred_masks[:,0]   
+        if pred_masks is not None:
+            pred_masks = pred_masks[:,0]
+            if self.args.use_ROIAlign_mask:
+                roi_boxes = roi_boxes[:,0]            
+
+        pred_boxes = pred_boxes[:,:4]
+
+        return pred_boxes, pred_masks, roi_boxes
     
     def preprocess_img(self,fp):
 
@@ -331,13 +361,22 @@ class pipeline():
         ### This is the preprocessing when converting the CTC to COCO - maybe we want to chnage this for the future as 8 bti is less info than 16 bit
         self.img = self.img / np.max(self.img)
         self.img = (255 * self.img).astype(np.uint8)
+
+        if self.crop:
+            h,w = self.img.shape
+            ch, cw = h // 2, w // 2
+            y0,y1 = ch - self.target_size[0] // 2, ch + self.target_size[0] // 2 
+            x0,x1 = cw - self.target_size[1] // 2, cw + self.target_size[1] // 2 
+            self.img = self.img[y0:y1,x0:x1]
         ###
         img = PIL.Image.fromarray(self.img)
         self.img_size = img.size
         
-        img_resized = img.resize((self.target_size[1],self.target_size[0])).convert('RGB')
+        # img_resized = img.resize((self.target_size[1],self.target_size[0]))
 
-        samples = self.normalize(img_resized)[0][None]
+
+        img = img.convert('RGB')
+        samples = self.normalize(img)[0][None]
         samples = samples.to(self.device)            
 
         return samples
@@ -359,12 +398,31 @@ class pipeline():
 
         return all_indices, track_indices, object_indices, div_indices
     
-    def post_process_masks(self,masks,boxes):
+    def post_process_masks(self,masks, roi_boxes, boxes):
 
-        # Resize mask to original size
-        masks = cv2.resize(np.transpose(masks.cpu().numpy(),(1,2,0)),self.img_size) # regardless of cropping / resize, segmentation is 2x smaller than the original image                                
-        masks = masks[:,:,None] if masks.ndim == 2 else masks # cv2.resize will drop last dim if it is 1
-        masks = np.transpose(masks,(-1,0,1))
+        if self.args.use_ROIAlign_mask:
+            roi_boxes = roi_boxes.cpu().numpy()[:,1:]
+            masks = masks.cpu().numpy()
+            init_mask = np.zeros((len(masks),self.img_size[1],self.img_size[0]))
+            for m, mask in enumerate(masks):
+                roi_box = roi_boxes[m]
+                x0, y0, x1, y1 = roi_box.astype(int)
+                y1 = min(y1,self.img_size[1])
+                x1 = min(x1,self.img_size[0])
+                width = x1 - x0
+                height = y1 - y0
+
+                if width > 0 and height > 0:
+                    roi_mask = cv2.resize(mask,(width,height))
+                    init_mask[m,y0:y1, x0:x1] = roi_mask
+
+            masks = init_mask
+
+        else:
+            # Resize mask to original size
+            masks = cv2.resize(np.transpose(masks.cpu().numpy(),(1,2,0)),self.img_size) # regardless of cropping / resize, segmentation is 2x smaller than the original image                                
+            masks = masks[:,:,None] if masks.ndim == 2 else masks # cv2.resize will drop last dim if it is 1
+            masks = np.transpose(masks,(-1,0,1))
 
         # Get max pixel value across all segmentations and then threshold
         masks_filt = np.zeros((masks.shape))
@@ -473,7 +531,18 @@ class pipeline():
             samples = self.preprocess_img(fp)
 
             with torch.no_grad():
-                outputs, targets, _, _, _ = self.model(samples,targets=targets)                
+
+                # with torch.profiler.profile(
+                #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                #     profile_memory=True,
+                #     record_shapes=True
+                #     ) as profiler:
+
+                #     outputs, targets, _, _, _ = self.model(samples,targets=targets)   
+                                 
+                #     profiler.export_chrome_trace("trace.json")  # Export detailed report
+
+                outputs, targets, _, _, _ = self.model(samples,targets=targets)   
 
             pred_logits = outputs['pred_logits'][0].sigmoid().cpu().numpy()
 
@@ -494,26 +563,34 @@ class pipeline():
                 # Get predicted boxes and masks
                 boxes = outputs['pred_boxes'][0][self.all_indices] # For div_indices, the boxes will be repeated and will properly updated below
 
+                roi_boxes = None
                 if self.masks:
                     masks = outputs['pred_masks'][0].sigmoid()[self.all_indices]
+                    if self.args.use_ROIAlign_mask:
+                        roi_boxes = outputs['roi_boxes'][0][self.all_indices]
+                else:
+                    masks = None
 
                 # Track queries that were predicted to be divisions need to split into separate boxes/masks
-                boxes, masks = self.update_div_boxes(boxes,masks)
+                boxes, masks, roi_boxes = self.update_div_boxes(boxes,masks,roi_boxes)
 
                 # post-process mask; need to get max pixel value across all segmentations and then threshold into a binary mask
                 if self.masks:
-                    masks, boxes = self.post_process_masks(masks, boxes)
+                    masks, boxes = self.post_process_masks(masks, roi_boxes, boxes)
 
-                # 'hs_embed' is used as the content embedding for the track queries
-                targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.all_indices] # For div_indices, hs_embeds will be the same; no update
 
                 # 'track_query_boxes' are used as the positional embeddings for the track queries
                 # You can use the bounding box or mask as a positional embedding; default is to use the mask
-                if self.args.init_boxes_from_masks:
-                    boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks),cxcywh=True).to(self.device)
-                    targets[0]['main']['cur_target']['track_query_boxes'] = boxes_encoded_from_masks
-                else:
-                    targets[0]['main']['cur_target']['track_query_boxes'] = boxes
+                if self.args.tracking:
+                    
+                    # 'hs_embed' is used as the content embedding for the track queries
+                    targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.all_indices] # For div_indices, hs_embeds will be the same; no update
+
+                    if self.args.masks and self.args.init_boxes_from_masks:
+                        boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks),cxcywh=True).to(self.device)
+                        targets[0]['main']['cur_target']['track_query_boxes'] = boxes_encoded_from_masks
+                    else:
+                        targets[0]['main']['cur_target']['track_query_boxes'] = boxes
 
                 boxes = boxes.cpu().numpy()
 
@@ -538,43 +615,43 @@ class pipeline():
             assert np.max(color_frame) <= 255 and np.min(color_frame) >= 0
 
             ### Need for paper
-            # Scale bar - don't delete until paper is publsihed
-            if i < 10 and self.fps[0].parts[-2] == '10':
-                blah = np.copy(color_frame)
-                # if i == 0:
-                #     blah[10:12,5:20] = 255
-                # cv2.imwrite(f'/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/moma/test/CTC/20/color_frames/frame{i:03d}.png',blah)
-                cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_pred.png',blah)
-                cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_img.png',self.img)
+            # # Scale bar - don't delete until paper is publsihed
+            # if i < 10 and self.fps[0].parts[-2] == '10':
+            #     blah = np.copy(color_frame)
+            #     # if i == 0:
+            #     #     blah[10:12,5:20] = 255
+            #     # cv2.imwrite(f'/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/moma/test/CTC/20/color_frames/frame{i:03d}.png',blah)
+            #     cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_pred.png',blah)
+            #     cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_img.png',self.img)
 
-            min = i * 5
-            hr = min // 60
-            rem_min = min % 60
+            # min = i * 5
+            # hr = min // 60
+            # rem_min = min % 60
 
-            color_frame = cv2.putText(
-                color_frame,
-                # text = f'{i:03d}', 
-                text = f'{hr:01d} hr', 
-                org=(0,10), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = 0.4,
-                color = (255,255,255),
-                thickness=1,
-                )
+            # color_frame = cv2.putText(
+            #     color_frame,
+            #     # text = f'{i:03d}', 
+            #     text = f'{hr:01d} hr', 
+            #     org=(0,10), 
+            #     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+            #     fontScale = 0.4,
+            #     color = (255,255,255),
+            #     thickness=1,
+            #     )
 
             # color_frame = np.concatenate((color_frame,np.zeros((color_frame.shape[0],20,3))),1)
 
-            color_frame = cv2.putText(
-                color_frame,
-                # text = f'{rem_min:02d} min', 
-                text = f'{min:03d} min', 
-                # org=(0,10), 
-                org=(0,20), 
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-                fontScale = 0.4,
-                color = (255,255,255),
-                thickness=1,
-                )
+            # color_frame = cv2.putText(
+            #     color_frame,
+            #     # text = f'{rem_min:02d} min', 
+            #     text = f'{min:03d} min', 
+            #     # org=(0,10), 
+            #     org=(0,20), 
+            #     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+            #     fontScale = 0.4,
+            #     color = (255,255,255),
+            #     thickness=1,
+            #     )
 
             ### Need for paper
 

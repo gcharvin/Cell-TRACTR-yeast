@@ -285,7 +285,7 @@ class DeformableTransformer(nn.Module):
             enc_outputs_class = self.class_embed[-1](output_memory)[...,:1]
             enc_outputs_coord_unact = self.bbox_embed[-1](output_memory)[...,:output_proposals.shape[-1]] + output_proposals
 
-            assert self.num_queries <= enc_outputs_class.shape[1]
+
             topk = self.num_queries
 
             # topk = min(self.two_stage_num_proposals,enc_outputs_class.shape[1])
@@ -312,12 +312,16 @@ class DeformableTransformer(nn.Module):
                 tgt = self.enc_query_embeddings.weight.repeat(memory.shape[0],self.num_queries,1) # Don't use batch size here in case at end of epoch, only one sample is used
             else:
                 # gather tgt
-                tgt = tgt_undetach.detach()
+                tgt = tgt_undetach.detach().clone()
+                tgt += self.object_emedding_v2.weight.repeat(topk,1)
 
             if self.enc_masks and self.masks:
 
-                outputs_mask = self.forward_prediction_heads(tgt_undetach,-1)
+                outputs_mask, batch_out_boxes = self.forward_prediction_heads(tgt_undetach,-1, enc_outputs['pred_boxes'])
                 enc_outputs['pred_masks'] = outputs_mask
+
+                if self.use_ROIAlign_mask:
+                    enc_outputs['roi_boxes'] = batch_out_boxes
                 
                 # if self.init_boxes_from_masks:
                 if self.init_boxes_from_masks: 
@@ -334,7 +338,7 @@ class DeformableTransformer(nn.Module):
                     reference_points = refpoint_embed
 
             if query_embed is not None: # used for dn_object or if you want to add extra object queries on top of two_stage
-                reference_points = torch.cat((reference_points,query_embed[..., self.d_model:].sigmoid()),axis=1)
+                reference_points = torch.cat((reference_points,query_embed[..., self.d_model:]),axis=1)
                 tgt = torch.cat((tgt,query_embed[..., :self.d_model]),axis=1)
 
                 query_embed = None
@@ -401,7 +405,6 @@ class DeformableTransformer(nn.Module):
 
                 new_query_attn_mask[:-num_dn_track,-num_dn_track:] = True
                 new_query_attn_mask[-num_dn_track:,:-num_dn_track] = True
-                # new_query_attn_mask[-num_dn_track:,self.num_queries:-num_dn_track] = True
 
                 query_attn_mask = new_query_attn_mask
 

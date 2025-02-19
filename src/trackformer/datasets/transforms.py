@@ -30,54 +30,55 @@ def crop(image, target, region, overflow_boxes=False):
 
     fields = ["labels", "boxes", "area", "iscrowd", "ignore", "track_ids", "flexible_divisions"]
     
-    if "masks" in target:
+    if not target['empty']:
+        if "masks" in target:
 
-        fields.append("masks")
-        area = target['masks'].sum(dim=(1,2))
-        target["area"] = area
-
-        cropped_boxes = masks_to_boxes(target['masks'])
-        target["boxes"] = cropped_boxes
-
-    else:
-
-        boxes = target["boxes"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes -  torch.as_tensor([j, i, j, i])
-
-        if overflow_boxes:
-            for i, box in enumerate(cropped_boxes):
-                l, t, r, b = box
-                if l < 0 and r < 0:
-                    l = r = 0
-                if l > w and r > w:
-                    l = r = w
-                if t < 0 and b < 0:
-                    t = b = 0
-                if t > h and b > h:
-                    t = b = h
-                cropped_boxes[i] = torch.tensor([l, t, r, b], dtype=box.dtype)
-            cropped_boxes = cropped_boxes.reshape(-1, 2, 2)
-        else:
-            cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
-            cropped_boxes = cropped_boxes.clamp(min=0)
-
-            area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
-            target["boxes"] = cropped_boxes.reshape(-1, 4)
+            fields.append("masks")
+            area = target['masks'].sum(dim=(1,2))
             target["area"] = area
 
-    keep = area > 10
+            cropped_boxes = masks_to_boxes(target['masks'])
+            target["boxes"] = cropped_boxes
 
-    if 'masks' in target:
-        area_boxes = ((target['boxes'][:,2] - target['boxes'][:,0]) * (target['boxes'][:,3] - target['boxes'][:,1]))
-        keep *= (area_boxes > 10)
+        else:
 
-    if (~keep).sum() > 0:
-        for field in fields:
-            if field in target:
-                target[field] = target[field][keep]
+            boxes = target["boxes"]
+            max_size = torch.as_tensor([w, h], dtype=torch.float32)
+            cropped_boxes = boxes -  torch.as_tensor([j, i, j, i])
 
-    assert target['boxes'].shape[0] == (target['boxes'][:,2] - target['boxes'][:,0] > 0).sum() == (target['boxes'][:,3] - target['boxes'][:,1] > 0).sum()
+            if overflow_boxes:
+                for i, box in enumerate(cropped_boxes):
+                    l, t, r, b = box
+                    if l < 0 and r < 0:
+                        l = r = 0
+                    if l > w and r > w:
+                        l = r = w
+                    if t < 0 and b < 0:
+                        t = b = 0
+                    if t > h and b > h:
+                        t = b = h
+                    cropped_boxes[i] = torch.tensor([l, t, r, b], dtype=box.dtype)
+                cropped_boxes = cropped_boxes.reshape(-1, 2, 2)
+            else:
+                cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+                cropped_boxes = cropped_boxes.clamp(min=0)
+
+                area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+                target["boxes"] = cropped_boxes.reshape(-1, 4)
+                target["area"] = area
+
+        keep = area > 10
+
+        if 'masks' in target:
+            area_boxes = ((target['boxes'][:,2] - target['boxes'][:,0]) * (target['boxes'][:,3] - target['boxes'][:,1]))
+            keep *= (area_boxes > 10)
+
+        if (~keep).sum() > 0:
+            for field in fields:
+                if field in target:
+                    target[field] = target[field][keep]
+
+        assert target['boxes'].shape[0] == (target['boxes'][:,2] - target['boxes'][:,0] > 0).sum() == (target['boxes'][:,3] - target['boxes'][:,1] > 0).sum()
 
     return cropped_image, target
 
@@ -204,6 +205,13 @@ class RandomCrop:
 
     def __call__(self, img, target):
         return crop(img, target, self.region, self.overflow_boxes)
+    
+    def get_h_w(self):
+        y0,x0,y1,x1 = self.region
+        w = x1 - x0
+        h = y1 - y0
+
+        return h,w
 
 
 class RandomSizeCrop:
