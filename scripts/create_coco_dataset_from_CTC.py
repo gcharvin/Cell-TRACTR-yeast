@@ -96,6 +96,7 @@ for folder,dataset_paths in zip(folders,[train_sets,val_sets]):
 
             image = {
                 'license': 1,
+                'man_track_id': dataset_name,
                 'file_name': fn,
                 'height': img.shape[0],
                 'width': img.shape[1],
