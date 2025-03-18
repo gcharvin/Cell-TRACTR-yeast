@@ -127,6 +127,6 @@ if __name__ == '__main__':
 
     args.output_dir = Path(args.output_dir)
     args.data_dir = Path(args.data_dir)
-    datapath = args.data_dir / 'CTC_datasets' / dataset / 'CTC' / 'test'
+    datapath = args.data_dir / dataset / 'CTC' / 'test'
 
     train(args,datapath)
