@@ -16,246 +16,16 @@ import math
 import shutil
 from pathlib import Path
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+mpl.rcParams['figure.max_open_warning'] = 0
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision
 from torch import Tensor, nn
-import sys
 
 from . import box_ops
-
-#print("[WHERE] imported utils.misc from:", __file__, flush=True)
-
-@torch.no_grad()
-def validate_divisions_in_targets(
-    targets, training_method: str,
-    input_target_name: str = 'prev_target',
-    output_target_name: str = 'cur_target',
-    div_event_key: str = 'gt_div'  # optionnel
-):
-    """
-    Vérifie, pour chaque item du batch:
-      - man_track: pour chaque mère qui divise, il y a exactement 2 filles avec start==framenb (t+1)
-      - la mère est bien présente à t (input_target), les deux filles à t+1 (output_target)
-      - (optionnel) une boîte d'évènement existe et elle est raisonnablement proche du milieu(des filles)
-    Renvoie un petit résumé.
-    """
-    summary = dict(
-        items=len(targets), mothers_checked=0, bad_daughters_count=0,
-        missing_mother_box=0, missing_daughter_box=0, bad_event_anchor=0
-    )
-    msgs = []
-
-    for b, target in enumerate(targets):
-        T = target[training_method]
-        if output_target_name not in T or input_target_name not in T:
-            continue
-        out = T[output_target_name]
-        inp = T[input_target_name]
-        if out.get('empty', False):
-            continue
-
-        fr = out['framenb']
-        man = T['man_track']
-        if man.ndim != 2 or man.shape[0] == 0:
-            continue
-
-        tid_out = out.get('track_ids_orig', out.get('track_ids'))
-        boxes_out = out.get('boxes_orig', out.get('boxes'))
-        tid_in  = inp.get('track_ids_orig', inp.get('track_ids'))
-        boxes_in = inp.get('boxes_orig', inp.get('boxes'))
-
-        # Daughters de cette frame
-        is_daughter = (man[:, 1] == fr) & (man[:, -1] > 0)
-        daughters_rows = man[is_daughter]
-        if daughters_rows.numel() == 0:
-            continue
-
-        mother_ids = torch.unique(daughters_rows[:, -1])
-        for m_id_t in mother_ids.tolist():
-            m_id = int(m_id_t)
-            summary['mothers_checked'] += 1
-
-            dau = daughters_rows[daughters_rows[:, -1] == m_id][:, 0]
-            if dau.numel() != 2:
-                summary['bad_daughters_count'] += 1
-                msgs.append(f"[CHK] b{b} fr={int(fr)} mother={m_id} => nb_filles={int(dau.numel())} (attendu=2)")
-                continue
-
-            d1, d2 = int(dau[0].item()), int(dau[1].item())
-
-            # mère à t (input)
-            mom_in = (tid_in == m_id)
-            if mom_in.sum() != 1:
-                summary['missing_mother_box'] += 1
-                msgs.append(f"[CHK] b{b} fr={int(fr)} mother={m_id} => mère absente à t (or dupliquée)")
-                # on continue quand même pour checker les filles
-
-            # filles à t+1 (output)
-            d1_out = (tid_out == d1)
-            d2_out = (tid_out == d2)
-            if d1_out.sum() != 1 or d2_out.sum() != 1:
-                summary['missing_daughter_box'] += 1
-                msgs.append(f"[CHK] b{b} fr={int(fr)} mother={m_id} => fille(s) absente(s)/dupliquée(s) à t+1")
-
-            # Ancrage évènement (optionnel)
-            if div_event_key in out and d1_out.any() and d2_out.any():
-                gt = out[div_event_key]
-                mid = (boxes_out[d1_out][0][:2] + boxes_out[d2_out][0][:2]) / 2
-                dist = float(torch.linalg.norm(gt[:2].float() - mid))
-                # seuil large: si > 0.2 (en coords normalisées), probable mauvais ancrage
-                if dist > 0.2:
-                    summary['bad_event_anchor'] += 1
-                    msgs.append(f"[CHK] b{b} fr={int(fr)} mother={m_id} => éloignement evt-mid_filles={dist:.3f}")
-
-    # Petit rendu
-    print("[DIVCHK] summary:", summary)
-    for m in msgs[:20]:
-        print(m)
-    if len(msgs) > 20:
-        print(f"... ({len(msgs)-20} autres)")
-
-
-def _cxcywh_to_xyxy(box):
-    # box: (4,) or (N,4) in [cx,cy,w,h] normalisés
-    c = box[..., :2]
-    s = box[..., 2:]
-    xy1 = c - s / 2
-    xy2 = c + s / 2
-    return torch.cat([xy1, xy2], dim=-1)
-
-def _center_xywh(box):
-    # retourne (cx, cy) – accepte torch/tensor ou np
-    return box[..., :2]
-
-@torch.no_grad()
-def debug_div_event_alignment(
-    target, training_method: str,
-    input_target_name: str, output_target_name: str,
-    gt_div_key: str = 'gt_div',  # clé où tu loggais déjà tes boîtes GT d’évènement (cx,cy,w,h normalisés)
-    pred_div_key: str = 'pred_div',  # idem pour la prédiction
-    max_print: int = 5
-):
-    """
-    Pour chaque division à la frame courante:
-      - retrouve la mère (t) et les 2 filles (t+1) depuis man_track
-      - calcule le centre GT évènement (si présent) et le centre milieu(des filles)
-      - imprime distances et éventuels décalages
-    """
-    T = target[training_method]
-    out = T[output_target_name]
-    if out.get('empty', False):
-        return
-
-    fr = out['framenb']  # frame courante = t+1 pour les divisions
-    man = T['man_track'] # colonnes supposées: [track_id, start_f, end_f, ..., mother_id_in_last_col]
-    if man.ndim != 2 or man.shape[0] == 0:
-        return
-
-    # Daughters = lignes dont start == fr ET mother_id > 0
-    is_daughter = (man[:, 1] == fr) & (man[:, -1] > 0)
-    daughters_rows = man[is_daughter]
-    if daughters_rows.numel() == 0:
-        return
-
-    # Regroupe par mother_id
-    mother_ids = torch.unique(daughters_rows[:, -1])
-    printed = 0
-
-    # Build indexers pour boxes at t (input) et t+1 (output)
-    inp = T[input_target_name]
-    # NB: *orig* = avant suppression des "new_cell_ids" → utile pour retrouver tout le monde
-    tid_out = out.get('track_ids_orig', out.get('track_ids'))
-    boxes_out = out.get('boxes_orig', out.get('boxes'))
-    tid_in  = inp.get('track_ids_orig', inp.get('track_ids'))
-    boxes_in = inp.get('boxes_orig', inp.get('boxes'))
-
-    for m_id in mother_ids.tolist():
-        if printed >= max_print:
-            break
-        dau = daughters_rows[daughters_rows[:, -1] == m_id][:, 0]  # track_ids des deux filles
-        if dau.numel() != 2:
-            print(f"[DIVDBG:CHK] mother={int(m_id)} @fr={int(fr)} => nb_filles={int(dau.numel())} (attendu=2)")
-            continue
-
-        d1, d2 = int(dau[0].item()), int(dau[1].item())
-
-        # Boîtes des filles à t+1
-        d1_mask = (tid_out == d1)
-        d2_mask = (tid_out == d2)
-        if d1_mask.sum() != 1 or d2_mask.sum() != 1:
-            print(f"[DIVDBG:CHK] mother={int(m_id)} filles({d1},{d2}) @fr={int(fr)} => boxes_out manquantes/dupliquées")
-            continue
-
-        b1 = boxes_out[d1_mask][0]  # [cx,cy,w,h] normalisés
-        b2 = boxes_out[d2_mask][0]
-        center_filles = (b1[:2] + b2[:2]) / 2
-
-        # Boîte de la mère à t (facultatif, juste pour info; elle n’existe normalement plus à t+1)
-        mom_mask_in = (tid_in == m_id)
-        mom_info = "NA"
-        if mom_mask_in.any():
-            bm = boxes_in[mom_mask_in][0]
-            mom_info = f"mom_cxcy=({float(bm[0]):.3f},{float(bm[1]):.3f})"
-
-        # GT/PRED évènement si présents
-        gt_c = None
-        if gt_div_key in out:
-            gt = out[gt_div_key]
-            gt_c = _center_xywh(gt).float()
-        pred_c = None
-        if pred_div_key in out:
-            pr = out[pred_div_key]
-            pred_c = _center_xywh(pr).float()
-
-        # Distances
-        def L2(a, b): 
-            return float(torch.linalg.norm(a - b).item())
-
-        dist_gt_to_mid = dist_pred_to_mid = None
-        if gt_c is not None:
-            dist_gt_to_mid = L2(gt_c, center_filles)
-        if pred_c is not None:
-            dist_pred_to_mid = L2(pred_c, center_filles)
-
-        # Impression
-        msg = f"[DIVDBG:ANATOMY] fr={int(fr)} mother={int(m_id)} filles=({d1},{d2}) " \
-              f"mid_filles=({float(center_filles[0]):.3f},{float(center_filles[1]):.3f}) {mom_info}"
-        if gt_c is not None:
-            msg += f" | gt_center=({float(gt_c[0]):.3f},{float(gt_c[1]):.3f}) d(gt,mid)={dist_gt_to_mid:.3f}"
-        if pred_c is not None:
-            msg += f" | pred_center=({float(pred_c[0]):.3f},{float(pred_c[1]):.3f}) d(pred,mid)={dist_pred_to_mid:.3f}"
-        print(msg)
-        printed += 1
-
-
-def _val_from_args(args, name, default):
-    if args is None:
-        return default
-    # supporte argparse.Namespace ou dict
-    try:
-        return getattr(args, name)
-    except Exception:
-        try:
-            return args.get(name, default)
-        except Exception:
-            return default
-
-def read_thresholds(args=None):
-    # ENV > args > défauts
-    cls_env = os.getenv("CLS_THR")
-    div_env = os.getenv("DIV_THR")
-    iou_env = os.getenv("DIV_IOU_THR") or os.getenv("DIV_BBOX_IOU_THR")
-
-    cls = float(cls_env) if cls_env is not None else float(_val_from_args(args, "cls_threshold", 0.5))
-    div = float(div_env) if div_env is not None else float(_val_from_args(args, "div_threshold", cls))
-    iou = float(iou_env) if iou_env is not None else float(_val_from_args(args, "iou_threshold", 0.5))
-
-    dbg = (os.environ.get("DIVDBG", "") == "1") or bool(_val_from_args(args, "debug_division", False))
-    return cls, div, iou, dbg
-
 
 if int(re.findall('\d+',(torchvision.__version__[:4]))[-1]) < 7:
     from torchvision.ops import _new_empty_tensor
@@ -677,33 +447,11 @@ def save_metrics_pkl(metrics_dict,output_dir,dataset,epoch):
         with open(output_dir / ('metrics_' + dataset + '.pkl'), 'wb') as f:
             pickle.dump(loaded_metrics_dict, f)
 
-def _getf(obj, name, default):
-    try:
-        return float(getattr(obj, name))
-    except Exception:
-        return float(default)
 
-def _getb(obj, name, default):
-    try:
-        return bool(getattr(obj, name))
-    except Exception:
-        return bool(default)
 
 def calc_bbox_acc(acc_dict,outputs,targets,args,calc_mask_acc=True,text=''):
-    #cls_thresh = args.cls_threshold
-    #iou_thresh = args.iou_threshold
-    
-    from trackformer.util.misc import read_thresholds
-    cls_thresh, div_thresh, iou_thresh, debug_div = read_thresholds(args)
-    #if debug_div:
-    #    print(f"[DIVDBG] enabled  cls={cls_thresh:.2f}  div={div_thresh:.2f}  IoU={iou_thresh:.2f}", flush=True)
-
-    #if debug_div:
-    #    print(f"[DIVDBG] enabled  cls={cls_thresh:.2f}  div={div_thresh:.2f}  IoU={iou_thresh:.2f}", flush=True)
-
- 
-
-
+    cls_thresh = args.cls_threshold
+    iou_thresh = args.iou_threshold
     TP_bbox = TP_mask = FN = FP = FP_bbox = FP_mask = 0
     for t,target in enumerate(targets):
         indices = target['indices']
@@ -758,292 +506,175 @@ def calc_bbox_acc(acc_dict,outputs,targets,args,calc_mask_acc=True,text=''):
 
     return acc_dict
 
-def calc_track_acc(track_acc_dict, outputs, targets, args, calc_mask_acc=True, use_generalized_iou=False):
-    
-    # cls_thresh = args.cls_threshol
-    
-    from trackformer.util.misc import read_thresholds
-    cls_thresh, div_thresh, iou_thresh, debug_div = read_thresholds(args)
-    #if debug_div:
-    #    print(f"[DIVDBG] enabled  cls={cls_thresh:.2f}  div={div_thresh:.2f}  IoU={iou_thresh:.2f}", flush=True)
+def calc_track_acc(track_acc_dict,outputs,targets,args, calc_mask_acc=True):
+    cls_thresh = args.cls_threshold
+    iou_thresh = args.iou_threshold
+    TP_bbox = TP_mask = FN = FP = FP_bbox = FP_mask = 0
+    div_acc = np.zeros((2),dtype=np.int32)
+    div_bbox_acc = np.zeros((2),dtype=np.int32)
+    div_mask_acc = np.zeros((2),dtype=np.int32)
+    new_cells_acc = np.zeros((2),dtype=np.int32) 
+    new_cells_bbox_acc = np.zeros((2),dtype=np.int32) 
+    new_cells_mask_acc = np.zeros((2),dtype=np.int32)
+
+    for t,target in enumerate(targets):
+        indices = target['indices']
+        pred_logits = outputs['pred_logits'][t].sigmoid().detach()
+        pred_boxes = outputs['pred_boxes'][t].detach()
+        tgt_boxes = target['boxes']
+        
+                # --- DEBUG division head (solution 1) ---
+        try:
+            fr = int(target.get('framenb', -1))
+        except Exception:
+            fr = -1
+        if tgt_boxes.numel():
+            gt_div_cur = int((tgt_boxes[:, -1] > 0).sum().item())
+        else:
+            gt_div_cur = 0
+        # on suppose que la classe 'division' est la dernière (index -1)
+        pred_div_pos = int((pred_logits[:, -1] > cls_thresh).sum().item())
+        if gt_div_cur or pred_div_pos:
+            print(f"[div-metrics-debug] frame={fr} gt_div_cur={gt_div_cur} pred_div_pos={pred_div_pos}")
 
         
-    # cls_thresh = float(getattr(args, "cls_threshold", 0.5))
-    # # seuil spécifique division (sinon retombe sur cls_thresh)
-    # div_thresh = float(getattr(args, "div_threshold", cls_thresh))
-    # debug_div  = bool(getattr(args, "debug_division", False))
-    # iou_thresh = float(getattr(args, "iou_threshold", 0.5))
+        
 
-    TP_bbox = TP_mask = FN = FP = FP_bbox = FP_mask = 0
-    div_acc = np.zeros(2, dtype=np.int32)
-    div_bbox_acc = np.zeros(2, dtype=np.int32)
-    div_mask_acc = np.zeros(2, dtype=np.int32)
-    new_cells_acc = np.zeros(2, dtype=np.int32)
-    new_cells_bbox_acc = np.zeros(2, dtype=np.int32)
-    new_cells_mask_acc = np.zeros(2, dtype=np.int32)
-
-    # --- helpers robustes ---
-    def _as_scalar(x):
-        if isinstance(x, tuple):
-            x = x[0]
-        return float(x.reshape(-1)[0].item())
-
-    def _pair_iou(boxA_xywh, boxB_xywh, generalized=False):
-        if generalized:
-            out = box_ops.generalized_box_iou(
-                box_ops.box_cxcywh_to_xyxy(boxA_xywh),
-                box_ops.box_cxcywh_to_xyxy(boxB_xywh),
-                return_iou_only=True
-            )
-        else:
-            out = box_ops.box_iou(
-                box_ops.box_cxcywh_to_xyxy(boxA_xywh),
-                box_ops.box_cxcywh_to_xyxy(boxB_xywh)
-            )
-        return _as_scalar(out)
-
-    def _mask_iou_scalar(pred01, gt01):
-        out = box_ops.mask_iou(pred01.flatten(1), gt01.flatten(1))
-        return _as_scalar(out)
-
-    def _gt_has_div_fn(tgt_vec):
-        """
-        Robustifier la présence de division en GT :
-        - Si vecteur de taille >= 9: on prend colonne 8 comme flag (0/1).
-        - Sinon (taille 8): on considère qu'il y a division si la bbox 'fille' (cols 4:8)
-          a une largeur/hauteur positives et non triviales.
-        """
-        if tgt_vec.numel() >= 9:
-            return float(tgt_vec[8].item()) > 0.0
-        else:
-            w_f = float(tgt_vec[6].item())
-            h_f = float(tgt_vec[7].item())
-            # Optionnel: vérifier aussi que le centre n'est pas (0,0)
-            cx_f = abs(float(tgt_vec[4].item()))
-            cy_f = abs(float(tgt_vec[5].item()))
-            return (w_f > 1e-6) and (h_f > 1e-6) and ((cx_f + cy_f) > 1e-6)
-
-    # --- compteurs debug ---
-    dbg = {
-        "gt_div_total": 0,
-        "pred_div_above": 0,
-        "pred_div_on_gt": 0,
-        "pred_div_below_on_gt": 0,
-        "iou_div_hits": 0,    # IoU fille > seuil
-        "iou_div_trials": 0,  # essais IoU fille (pred_div au-dessus + gt_has_div)
-        "mean_pred_div_gt": 0.0,
-        "mean_pred_div_nogt": 0.0,
-        "n_pred_div_gt": 0,
-        "n_pred_div_nogt": 0,
-    }
-
-    for t, target in enumerate(targets):
-        indices     = target['indices']
-        pred_logits = outputs['pred_logits'][t].sigmoid().detach()
-        pred_boxes  = outputs['pred_boxes'][t].detach()
-        tgt_boxes   = target['boxes']
-
-        has_masks = calc_mask_acc and ('pred_masks' in outputs) and ('masks' in target)
-        if has_masks:
-            pred_masks = outputs['pred_masks'][t].sigmoid().detach()
-            tgt_masks  = target['masks'].detach()
-
-        # mapping pred->gt pour "new cells"
-        if indices is not None and len(indices[0]) > 0:
-            pred_to_tgt = {int(pi): int(ti) for pi, ti in zip(indices[0].tolist(), indices[1].tolist())}
-        else:
-            pred_to_tgt = {}
-
-        if target.get('empty', False):
-            FP += int((pred_logits[:, 0] > cls_thresh).sum().item())
+        if target['empty']: # No objects to track
+            FP += int((pred_logits[:,0] > cls_thresh).sum())
             continue
 
-        tq_tp_mask = target['track_queries_TP_mask']
-        tq_valid   = target['track_queries_mask']
-        pred_logits_FPs = pred_logits[(~tq_tp_mask) & tq_valid, 0]
-        FP += int((pred_logits_FPs > cls_thresh).sum().item())
+        # Coutning False Positives; cells leaving the frame + False Positives added to the frame
+        pred_logits_FPs = pred_logits[~target['track_queries_TP_mask'] * target['track_queries_mask'],0]
+        FP += int((pred_logits_FPs > cls_thresh).sum())
 
-        # -------- nouvelles cellules --------
-        for q in range(pred_logits.shape[0]):
-            if (~tq_valid)[q]:
-                if q in pred_to_tgt:
-                    gt_id = pred_to_tgt[q]
-                    if pred_logits[q, 0] > cls_thresh:
-                        iou_val = _pair_iou(pred_boxes[q, :4][None], tgt_boxes[gt_id, :4][None], use_generalized_iou)
-                        if iou_val > iou_thresh:
+        if calc_mask_acc and 'pred_masks' in outputs:
+            pred_masks = outputs['pred_masks'].sigmoid().detach()[t]
+            tgt_masks = target['masks'].detach()
+
+        # Calculate accuracy for new objects detected; FPs or TPs
+        for query_id in range(pred_logits.shape[0]):
+            if (~target['track_queries_mask'])[query_id]:
+                if query_id in indices[0]:
+                    ind_loc = torch.where(indices[0] == query_id)[0]
+                    if pred_logits[query_id,0] > cls_thresh:
+                        iou = box_ops.generalized_box_iou(
+                                box_ops.box_cxcywh_to_xyxy(pred_boxes[query_id,:4][None]),
+                                box_ops.box_cxcywh_to_xyxy(tgt_boxes[indices[1][ind_loc],:4]),
+                                return_iou_only=True
+                                )
+
+                        if iou > iou_thresh:
                             TP_bbox += 1
-                            new_cells_bbox_acc[0] += 1
-                            new_cells_bbox_acc[1] += 1
-                        else:
-                            FP_bbox += 1
-                            new_cells_bbox_acc[1] += 1
+                            new_cells_bbox_acc += 1
 
-                        if has_masks:
-                            pm = pred_masks[q:q+1, :1]
-                            pm = F.interpolate(pm, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
-                            pm = (pm > 0.5).float()
-                            miou_val = _mask_iou_scalar(pm, tgt_masks[gt_id:gt_id+1, :1])
-                            if miou_val > iou_thresh:
+                        else:
+                            FP_bbox += 1       
+                            new_cells_bbox_acc[1] += 1  
+
+                        if calc_mask_acc and 'pred_masks' in outputs:
+                            pred_mask = pred_masks[query_id:query_id+1,:1]
+                            pred_mask_scaled = F.interpolate(pred_mask, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
+                            pred_mask_scaled = (pred_mask_scaled > 0.5) * 1.
+                            mask_iou = box_ops.mask_iou(pred_mask_scaled.flatten(1),tgt_masks[indices[1][ind_loc],:1].flatten(1))
+
+                            if mask_iou > iou_thresh:
                                 TP_mask += 1
-                                new_cells_mask_acc[0] += 1
-                                new_cells_mask_acc[1] += 1
+                                new_cells_mask_acc += 1
+
                             else:
                                 FP_mask += 1
                                 new_cells_mask_acc[1] += 1
+
                     else:
                         FN += 1
                         new_cells_acc[1] += 1
+
                 else:
-                    if pred_logits[q, 0] > cls_thresh:
+                    if pred_logits[query_id,0] > cls_thresh:
                         FP += 1
 
-        # -------- track queries --------
-        pred_track_logits = pred_logits[tq_tp_mask]
-        pred_track_boxes  = pred_boxes[tq_tp_mask]
-        box_matching      = target['track_query_match_ids']
-        if has_masks:
-            pred_track_masks = pred_masks[tq_tp_mask]
+        pred_track_logits = pred_logits[target['track_queries_TP_mask']]
+        pred_track_boxes = pred_boxes[target['track_queries_TP_mask']]
+        box_matching = target['track_query_match_ids']
 
-        for p, plog in enumerate(pred_track_logits):
-            gt_id = int(box_matching[p])
+        if 'pred_masks' in outputs:
+            pred_track_masks = pred_masks[target['track_queries_TP_mask']]
 
-            # classe "mère"
-            if float(plog[0].item()) < cls_thresh:
+        for p,pred_logit in enumerate(pred_track_logits):
+            if pred_logit[0] < cls_thresh:
                 FN += 1
+
             else:
-                iou_val = _pair_iou(pred_track_boxes[p:p+1, :4], tgt_boxes[gt_id:gt_id+1, :4], use_generalized_iou)
-                if iou_val > iou_thresh:
-                    TP_bbox += 1
-                else:
-                    FP_bbox += 1
-
-                if has_masks:
-                    pm = pred_track_masks[p:p+1, :1]
-                    pm = F.interpolate(pm, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
-                    pm = (pm > 0.5).float()
-                    miou_val = _mask_iou_scalar(pm, tgt_masks[gt_id:gt_id+1, :1])
-                    if miou_val > iou_thresh:
-                        TP_mask += 1
-                    else:
-                        FP_mask += 1
-
-            # -------- divisions --------
-            pred_div_score = float(plog[1].item())
-            gt_has_div     = _gt_has_div_fn(tgt_boxes[gt_id])
-
-            if gt_has_div:
-                dbg["gt_div_total"] += 1
-
-            if (pred_div_score > div_thresh) and (not gt_has_div):
-                FP += 1
-                div_acc[1] += 1
-                dbg["pred_div_above"] += 1
-                dbg["mean_pred_div_nogt"] += pred_div_score
-                dbg["n_pred_div_nogt"] += 1
-
-            elif (pred_div_score <= div_thresh) and gt_has_div:
-                FN += 1
-                div_acc[1] += 1
-                dbg["pred_div_below_on_gt"] += 1
-                dbg["mean_pred_div_gt"] += pred_div_score
-                dbg["n_pred_div_gt"] += 1
-
-            elif (pred_div_score > div_thresh) and gt_has_div:
-                # IoU sur bbox fille
-                iou_div = _pair_iou(pred_track_boxes[p:p+1, 4:8], tgt_boxes[gt_id:gt_id+1, 4:8], use_generalized_iou)
-                dbg["pred_div_on_gt"] += 1
-                dbg["mean_pred_div_gt"] += pred_div_score
-                dbg["n_pred_div_gt"] += 1
-                dbg["iou_div_trials"] += 1
-                if iou_div > iou_thresh:
-                    TP_bbox += 1
-                    div_bbox_acc[0] += 1
-                    div_bbox_acc[1] += 1
-                    dbg["iou_div_hits"] += 1
-                else:
-                    FP_bbox += 1
-                    div_bbox_acc[1] += 1
-
-                if has_masks:
-                    pm = pred_track_masks[p:p+1, :1]
-                    pm = F.interpolate(pm, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
-                    pm = (pm > 0.5).float()
-                    miou_div = _mask_iou_scalar(pm, tgt_masks[gt_id:gt_id+1, :1])
-                    if miou_div > iou_thresh:
-                        TP_mask += 1
-                        div_mask_acc[0] += 1
-                        div_mask_acc[1] += 1
-                    else:
-                        FP_mask += 1
-                        div_mask_acc[1] += 1
+                iou = box_ops.generalized_box_iou(
+                        box_ops.box_cxcywh_to_xyxy(pred_track_boxes[p:p+1,:4]),
+                        box_ops.box_cxcywh_to_xyxy(tgt_boxes[box_matching[p],:4][None]),
+                        return_iou_only=True
+                    )
                 
-                if debug_div and (dbg["iou_div_trials"] <= 5) and (iou_div <= iou_thresh):
-                    print("[DIVDBG][MISS] pred_div_score=%.3f iou_div=%.3f  pred_div=%s  gt_div=%s" %
-                        (pred_div_score, iou_div,
-                        pred_track_boxes[p, 4:8].detach().cpu().numpy(),
-                        tgt_boxes[gt_id, 4:8].detach().cpu().numpy()))
-                    sys.stdout.flush()
+                if iou > iou_thresh:
+                    TP_bbox += 1
+                else:
+                    FP_bbox += 1
 
+                if calc_mask_acc and 'pred_masks' in outputs:
+                    pred_mask = pred_track_masks[p:p+1,:1]
+                    pred_mask_scaled = F.interpolate(pred_mask, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
+                    pred_mask_scaled = (pred_mask_scaled > 0.5) * 1.
+                    mask_iou = box_ops.mask_iou(pred_mask_scaled.flatten(1),tgt_masks[box_matching[p],:1].flatten(1))
 
-            else:
-                # TN division
+                    if mask_iou > iou_thresh:
+                        TP_mask += 1
+                    else:
+                        FP_mask += 1
+
+            # Need to check for divisions
+            if pred_logit[1] > cls_thresh and tgt_boxes[box_matching[p],-1] == 0: # Predicted FP division
+                FP += 1  
+                div_acc[1] += 1           
+            elif pred_logit[1] < cls_thresh and tgt_boxes[box_matching[p],-1] > 0: # Predicted FN division
+                FN += 1
+                div_acc[1] += 1           
+            elif pred_logit[1] > cls_thresh and tgt_boxes[box_matching[p],-1] > 0: # Correctly predictly TP division
+                iou = box_ops.generalized_box_iou(
+                        box_ops.box_cxcywh_to_xyxy(pred_track_boxes[p:p+1,4:]),
+                        box_ops.box_cxcywh_to_xyxy(tgt_boxes[box_matching[p],4:][None]),
+                        return_iou_only=True
+                    )
+                # Divided cells were not accounted above so we add one to correct & total column
+                if iou > iou_thresh:
+                    TP_bbox += 1
+                    div_bbox_acc += 1
+                else:
+                    FP_bbox += 1
+                    div_bbox_acc[1] += 1
+
+                if calc_mask_acc and 'pred_masks' in outputs:
+                    pred_mask = pred_track_masks[p:p+1,:1]
+                    pred_mask_scaled = F.interpolate(pred_mask, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
+                    pred_mask_scaled = (pred_mask_scaled > 0.5) * 1.
+                    mask_iou = box_ops.mask_iou(pred_mask_scaled.flatten(1),tgt_masks[box_matching[p],:1].flatten(1))
+
+                    if mask_iou > iou_thresh:
+                        TP_mask += 1
+                        div_mask_acc += 1
+                    else:
+                        FP_mask += 1
+                        div_mask_acc[1] += 1
+
+            elif pred_logit[1] > cls_thresh and tgt_boxes[box_matching[p],-1] == 0: # Predicted TN correctly
                 pass
 
-    track_acc_dict['track_bbox_acc']     = np.array((TP_bbox, TP_bbox + FN + FP + FP_bbox), dtype=np.int32)[None, None]
-    track_acc_dict['divisions_bbox_acc'] = (div_acc + div_bbox_acc)[None, None]
-    track_acc_dict['new_cells_bbox_acc'] = (new_cells_acc + new_cells_bbox_acc)[None, None]
+    track_acc_dict['track_bbox_acc'] = np.array((TP_bbox,TP_bbox + FN + FP + FP_bbox),dtype=np.int32)[None,None]
+    track_acc_dict['divisions_bbox_acc'] = (div_acc + div_bbox_acc)[None,None]
+    track_acc_dict['new_cells_bbox_acc'] = (new_cells_acc + new_cells_bbox_acc)[None,None]
 
-    if calc_mask_acc and ('pred_masks' in outputs):
-        track_acc_dict['track_mask_acc']     = np.array((TP_mask, TP_mask + FN + FP + FP_mask), dtype=np.int32)[None, None]
-        track_acc_dict['divisions_mask_acc'] = (div_acc + div_mask_acc)[None, None]
-        track_acc_dict['new_cells_mask_acc'] = (new_cells_acc + new_cells_mask_acc)[None, None]
-
-    # --- Export debug compact dans le dict (pour affichage/print côté engine) ---
-        # --- impression directe si debug ---
-    #if debug_div:
-    # dbg a été rempli dans la boucle (si tu as bien repris la version précédente)
-    if debug_div:
-        if dbg["n_pred_div_gt"] > 0:  # tes moyennes
-            dbg["mean_pred_div_gt"] /= dbg["n_pred_div_gt"]
-        if dbg["n_pred_div_nogt"] > 0:
-            dbg["mean_pred_div_nogt"] /= dbg["n_pred_div_nogt"]
-
-        print(
-            "[DIVDBG] gt_div_total="
-            f"{dbg['gt_div_total']}  pred_div>thr(noGT)={dbg['pred_div_above']}  "
-            f"pred_div>thr&GT={dbg['pred_div_on_gt']}  pred_div<=thr&GT={dbg['pred_div_below_on_gt']}  "
-            f"iou_div_hits/trials={dbg['iou_div_hits']}/{dbg['iou_div_trials']}  "
-            f"mean_pred_div(gt)={dbg['mean_pred_div_gt']:.3f}  mean_pred_div(noGT)={dbg['mean_pred_div_nogt']:.3f}"
-        )
-       
-
-
-        
-        sys.stdout.flush()
-    else:
-        print("[DIVDBG] (warning) no dbg dict in this batch")
-        sys.stdout.flush()
-
-    # Résumé compact pour affichage côté engine
-    dbg_arr = np.array([
-        dbg["gt_div_total"],
-        dbg["pred_div_above"],
-        dbg["pred_div_on_gt"],
-        dbg["pred_div_below_on_gt"],
-        dbg["iou_div_hits"],
-        dbg["iou_div_trials"],
-        dbg["mean_pred_div_gt"],
-        dbg["mean_pred_div_nogt"],
-    ], dtype=np.float32)[None, None]
-        
-    track_acc_dict['dbg_div'] = dbg_arr
-
+    if calc_mask_acc and 'pred_masks' in outputs:
+        track_acc_dict['track_mask_acc'] = np.array((TP_mask,TP_mask + FN + FP + FP_mask),dtype=np.int32)[None,None]
+        track_acc_dict['divisions_mask_acc'] = (div_acc + div_mask_acc)[None,None]
+        track_acc_dict['new_cells_mask_acc'] = (new_cells_acc + new_cells_mask_acc)[None,None]
 
     return track_acc_dict
-
-
-
-
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -1085,180 +716,138 @@ def point_sample(input, point_coords, **kwargs):
         output = output.squeeze(3)
     return output
 
-def man_track_ids(targets, training_method: str, input_target_name: str, output_target_name: str = None):
-    import torch
+def man_track_ids(targets,training_method:str,input_target_name:str,output_target_name:str = None):
 
-    # 1) Détermine les cibles présentes
-    candidate_names = ['prev_prev_target', 'prev_target', 'cur_target', 'fut_target']
-    target_names = [n for n in candidate_names if n in targets[0][training_method]]
+    target_names = ['prev_prev_target','prev_target','cur_target','fut_target']
+    target_names = [target_name for target_name in target_names if target_name in targets[0][training_method]]
 
-    if output_target_name is None or output_target_name not in target_names:
-        return targets
+    output_target_index = target_names.index(output_target_name)
+    future_target_names = [target_name for target_name in target_names if target_names.index(target_name) > output_target_index]
 
-    out_idx = target_names.index(output_target_name)
-    future_target_names = [n for n in target_names if target_names.index(n) > out_idx]
-
-    # 2) Caractéristiques manipulées (on n'ajoute 'masks' que si présent)
-    features = ['track_ids', 'boxes', 'labels', 'flexible_divisions', 'is_touching_edge']
+    features = ['track_ids','boxes','labels','flexible_divisions','is_touching_edge']
     if 'masks' in targets[0][training_method][output_target_name]:
-        features.append('masks')
+        features += ['masks']
 
-    # 3) Boucle sur les batch items
-    for t in targets:
-        # 3.a) Filtrage des "new_cell_ids" et copie *_orig -> tenseurs de travail
-        for name in target_names:
-            tt = t[training_method][name]
-            if not tt['empty']:
-                remove_indices = torch.zeros_like(tt['track_ids_orig'], dtype=torch.bool, device=tt['track_ids_orig'].device)
-                if 'new_cell_ids' in tt:
-                    rid = tt['new_cell_ids']
-                    if isinstance(rid, torch.Tensor) and rid.numel() > 0:
-                        # vectorisé: enlève tout track_id présent dans rid
-                        remove_indices |= (tt['track_ids_orig'].unsqueeze(-1) == rid.reshape(1, -1)).any(dim=1)
-                    elif isinstance(rid, (list, tuple)) and len(rid) > 0:
-                        rid = torch.as_tensor(rid, device=tt['track_ids_orig'].device, dtype=tt['track_ids_orig'].dtype)
-                        remove_indices |= (tt['track_ids_orig'].unsqueeze(-1) == rid.reshape(1, -1)).any(dim=1)
+    for target in targets:
+        for target_name in target_names:
+            
+            if not target[training_method][target_name]['empty']: # when there are no cells, formatting is weird for empty images. need to fix this in the future
+                remove_indices = torch.zeros_like(target[training_method][target_name]['track_ids_orig']).bool()
+                
+                if 'new_cell_ids' in target[training_method][target_name]: # This is necessary for dn_track and dn_track_group; it removes newly detected cells since we only care about tracking here
+                    remove_track_ids = target[training_method][target_name]['new_cell_ids']
+                    track_ids_orig = target[training_method][target_name]['track_ids_orig']
 
-                for feat in features:
-                    base = feat + '_orig'
-                    if base in tt:
-                        tt[feat] = tt[base][~remove_indices].clone()
+                    for remove_track_id in remove_track_ids:
+                        remove_indices |= (track_ids_orig == remove_track_id)
 
-        input_target  = t[training_method][input_target_name]
-        output_target = t[training_method][output_target_name]
+                for feature in features:
+                    target[training_method][target_name][feature] = target[training_method][target_name][feature + '_orig'][~remove_indices].clone()
+       
+        input_target = target[training_method][input_target_name]
+        output_target = target[training_method][output_target_name]
 
         if input_target['empty'] or output_target['empty']:
             continue
-
-        framenb = int(output_target['framenb'])
+        
+        framenb = output_target['framenb']
         prev_track_ids = input_target['track_ids']
+
         if 'prev_ind' in output_target:
             prev_track_ids = prev_track_ids[output_target['prev_ind'][1]]
 
-        # 3.b) Masque d'items à ignorer (FN/FP)
+        # This is needed if false negatives are added or tracks are removed. So groundtruths exist but need to be ignored
         if 'target_ind_matching' in output_target:
-            tim = output_target['target_ind_matching']
-            if output_target.get('num_FPs', 0) > 0:
-                tim = tim[:-int(output_target['num_FPs'])]
-        else:
-            tim = None
+            if output_target['num_FPs'] == 0:
+                target_ind_matching = output_target['target_ind_matching']
+            else:
+                target_ind_matching = output_target['target_ind_matching'][:-output_target['num_FPs']]
 
-        # 3.c) Sous-ensemble de man_track utile au frame courant
-        man_full = t[training_method]['man_track']
-        man = man_full.clone()
-        man = man[(man[:, 1] <= framenb) & (man[:, 2] >= framenb)]
+        man_track = target[training_method]['man_track'].clone()
+        man_track = man_track[(man_track[:,1] <= framenb) * (man_track[:,2] >= framenb)]
+        
+        # cell_divisions = man_track[:,-1]
+        cell_divisions = man_track[:,-1] * (man_track[:,1] == framenb) # only check for divisions that occur in the current frame
 
-        # Divisions actives à ce frame
-        cell_divisions = man[:, -1] * (man[:, 1] == framenb)
+        for idx,prev_track_id in enumerate(prev_track_ids):
+            if 'target_ind_matching' in output_target and not target_ind_matching[idx]:
+                continue # This is necesary for when FN are added; the model is forced to detect the cell instead of tracking it
 
-        # 3.d) Parcours des tracks du frame précédent
-        for idx, prev_track_id in enumerate(prev_track_ids):
-            if tim is not None and not bool(tim[idx]):
-                # forcé de détecter (FN), on saute
-                continue
+            if prev_track_id not in output_target['track_ids_orig']: # If cell does not track to next frame
+                if prev_track_id in cell_divisions: # check if cell divided
 
-            # Si pas de tracking vers le frame suivant…
-            if not (output_target['track_ids_orig'] == prev_track_id).any():
-                # …regarde si c'est une division à ce frame
-                if (cell_divisions == prev_track_id).any():
-                    div_cur_track_ids = man[man[:, -1] == prev_track_id, 0]
+                    div_cur_track_ids = man_track[man_track[:,-1] == prev_track_id,0]
 
-                    if div_cur_track_ids.numel() != 2:
-                        # Cas pathologique (mauvaise annnotation/échantillonnage) → on n'échoue pas
-                        continue
+                    if len(div_cur_track_ids) == 2:
 
-                    d0, d1 = div_cur_track_ids[0], div_cur_track_ids[1]
-                    div_ind_1 = (output_target['track_ids'] == d0)
-                    div_ind_2 = (output_target['track_ids'] == d1)
+                        div_ind_1 = output_target['track_ids'] == div_cur_track_ids[0]
+                        div_ind_2 = output_target['track_ids'] == div_cur_track_ids[1]
 
-                    if div_ind_1.sum() == 1 and div_ind_2.sum() == 1:
-                        # Deux filles visibles → fusion propre
-                        output_target['track_ids'][div_ind_1] = prev_track_id
-                        remove_ind = (output_target['track_ids'] != d1)
+                        if div_ind_1.sum() == 1 and div_ind_2.sum() == 1:
 
-                        for feat in features:
-                            if feat not in ['flexible_divisions', 'track_ids', 'is_touching_edge']:
-                                L = output_target[feat].shape[1]
-                                output_target[feat][div_ind_1, L // 2:] = output_target[feat][div_ind_2, :L // 2]
-                            if feat == 'is_touching_edge':
-                                if bool(output_target['is_touching_edge'][div_ind_2].any()):
+                            output_target['track_ids'][div_ind_1] = prev_track_id
+                            remove_ind = output_target['track_ids'] != div_cur_track_ids[1]         
+
+                            for feature in features:
+                                if feature not in ['flexible_divisions','track_ids','is_touching_edge']:
+                                    feature_len = output_target[feature].shape[1]
+                                    output_target[feature][div_ind_1,feature_len//2:] = output_target[feature][div_ind_2,:feature_len//2]
+                                
+                                if feature == 'is_touching_edge' and output_target['is_touching_edge'][div_ind_2]:
                                     output_target['is_touching_edge'][div_ind_1] = True
-                            output_target[feat] = output_target[feat][remove_ind]
 
-                    elif div_ind_1.sum() == 1 or div_ind_2.sum() == 1:
-                        # Une seule fille visible → remonter la mère et nettoyer l'arbre
-                        if div_ind_1.sum() == 1:
-                            div_ind      = div_ind_1
-                            div_ind_orig = (output_target['track_ids_orig'] == d0)
-                            visible_dau  = d0
-                            hidden_dau   = d1
-                        else:
-                            div_ind      = div_ind_2
-                            div_ind_orig = (output_target['track_ids_orig'] == d1)
-                            visible_dau  = d1
-                            hidden_dau   = d0
+                                output_target[feature] = output_target[feature][remove_ind]
 
-                        if div_ind_orig.sum() != 1:
-                            # Pas assez fiable pour réécrire *_orig → skip
-                            continue
+                        elif div_ind_1.sum() == 1 or div_ind_2.sum() == 1:
 
-                        # La mère remplace la fille visible
-                        output_target['track_ids'][div_ind] = prev_track_id
-                        output_target['track_ids_orig'][div_ind_orig] = prev_track_id
+                            if div_ind_1.sum() == 1:
+                                div_ind = div_ind_1
+                                div_ind_orig = output_target['track_ids_orig'] == div_cur_track_ids[0]
+                            else:
+                                div_ind = div_ind_2
+                                div_ind_orig = output_target['track_ids_orig'] == div_cur_track_ids[1]
+                                div_cur_track_ids = torch.flip(div_cur_track_ids,dims=[0])
 
-                        # ⚠️ AFFECTATION SCALAIRE ROBUSTE (évite mismatch): fin de vie de la mère = framenb-1
-                        mask_prev = (man_full[:, 0] == prev_track_id)
-                        if mask_prev.any():
-                            man_full[mask_prev, 2] = torch.as_tensor(
-                                framenb - 1, dtype=man_full.dtype, device=man_full.device
-                            )
+                            assert div_ind_orig.sum() == 1
+                            output_target['track_ids'][div_ind] = prev_track_id
+                            output_target['track_ids_orig'][div_ind_orig] = prev_track_id
 
-                        # Remplace toutes occurrences des filles concernées par la mère dans la colonne "division"
-                        dau_cells = man_full[man_full[:, -1] == visible_dau, 0]
-                        if dau_cells.numel() > 0:
-                            mask_dau = torch.isin(man_full[:, 0], dau_cells.reshape(-1))
-                            if mask_dau.any():
-                                man_full[mask_dau, -1] = torch.as_tensor(prev_track_id, dtype=man_full.dtype, device=man_full.device)
+                            assert target[training_method]['man_track'][target[training_method]['man_track'][:,0] == prev_track_id,2] == framenb-1
 
-                        # Nettoyage des filles dans l'arbre de lignées
-                        mask_vis = (man_full[:, 0] == visible_dau)
-                        mask_hid = (man_full[:, 0] == hidden_dau)
-                        if mask_vis.any():
-                            man_full[mask_vis, 1:] = -1
-                        if mask_hid.any():
-                            man_full[mask_hid, -1] = 0
+                            # Have mother cell replace daughter cell that is still in frame 
+                            dau_cells = target[training_method]['man_track'][target[training_method]['man_track'][:,-1] == div_cur_track_ids[0],0]
+                            target[training_method]['man_track'][target[training_method]['man_track'][:,0] == dau_cells,-1] = prev_track_id
+                            target[training_method]['man_track'][target[training_method]['man_track'][:,0] == prev_track_id,2] = target[training_method]['man_track'][target[training_method]['man_track'][:,0] == div_cur_track_ids[0],2] 
+                            
+                            target[training_method]['man_track'][target[training_method]['man_track'][:,0] == div_cur_track_ids[0],1:] = -1 # remove cell from lineage since the mother cell replaced it
+                            target[training_method]['man_track'][target[training_method]['man_track'][:,0] == div_cur_track_ids[1],-1] = 0 # remove division track from other cell
 
-                        # Propager le mapping dans les futures cibles
-                        for fname in future_target_names:
-                            fut = t[training_method][fname]
-                            fut['track_ids'][fut['track_ids'] == visible_dau] = prev_track_id
-                            fut['track_ids_orig'][fut['track_ids_orig'] == visible_dau] = prev_track_id
+                            for future_target_name in future_target_names:
+                                fut_target = target[training_method][future_target_name]
+                                fut_target['track_ids'][fut_target['track_ids'] == div_cur_track_ids[0]] = prev_track_id
+                                fut_target['track_ids_orig'][fut_target['track_ids_orig'] == div_cur_track_ids[0]] = prev_track_id
+                            
                     else:
-                        # aucune fille visible → rien à faire ici
-                        pass
+                        raise NotImplementedError
 
-            # 3.e) Sanity checks (comme l’original)
-            removed_in  = int(len(input_target.get('new_cell_ids', [])))  if 'new_cell_ids'  in input_target  else 0
-            removed_out = int(len(output_target.get('new_cell_ids', []))) if 'new_cell_ids' in output_target else 0
+            removed_cells_input = 0 
+            removed_cells_output = 0 
 
-            assert input_target['boxes_orig'].shape[0] == (
-                input_target['boxes'].shape[0] + (input_target['boxes'][:, -1] > 0).sum().item() + removed_in
-            ), "input_target boxes accounting mismatch"
+            if 'new_cell_ids' in input_target:
+                removed_cells_input += len(input_target['new_cell_ids'])
+            if 'new_cell_ids' in output_target:
+                removed_cells_output += len(output_target['new_cell_ids'])
 
-            assert output_target['boxes_orig'].shape[0] == (
-                output_target['boxes'].shape[0] + (output_target['boxes'][:, -1] > 0).sum().item() + removed_out
-            ), "output_target boxes accounting mismatch"
+            assert input_target['boxes_orig'].shape[0] == (input_target['boxes'].shape[0] + (input_target['boxes'][:,-1] > 0).sum().item() + removed_cells_input)
+            assert output_target['boxes_orig'].shape[0] == (output_target['boxes'].shape[0] + (output_target['boxes'][:,-1] > 0).sum().item() + removed_cells_output)
 
-    # 4) Vérifie que tous les track_ids référencés existent dans man_track
-    for t in targets:
-        known = t[training_method]['man_track'][:, 0]
-        for name in target_names:
-            tids = t[training_method][name]['track_ids']
-            if len(tids.shape) == 1 and not torch.isin(tids, known).all():
-                raise NotImplementedError("Unknown track_id detected in targets vs man_track.")
+    for target_name in target_names:
+        if len(target[training_method][target_name]['track_ids'].shape) == 1:
+            for track_id in target[training_method][target_name]['track_ids']:
+                if track_id not in target[training_method]['man_track'][:,0]:
+                    raise NotImplementedError
 
     return targets
-
 
 
 def update_cropped_man_track(target):
@@ -1636,8 +1225,7 @@ def plot_loss_and_metrics(datapath):
     # Save the overall loss plot with log scale as well
     ax.set_yscale('log')
     plt.savefig(datapath / 'loss_plot_overall_log.png')
-    plt.close(fig)
-    
+
     # Plot the individual losses
     fig,ax = plt.subplots(len(training_methods),2,figsize=(10,15))
 

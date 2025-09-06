@@ -1,7 +1,89 @@
+import os
 import torch
-from .misc import man_track_ids
-from .box_ops import combine_div_boxes, calc_iou, combine_div_masks, divide_mask, divide_box, generalized_box_iou, box_cxcywh_to_xyxy
 
+from .misc import man_track_ids
+from .box_ops import (
+    combine_div_boxes,
+    calc_iou,
+    combine_div_masks,
+    divide_mask,
+    divide_box,
+    generalized_box_iou,
+    box_cxcywh_to_xyxy,
+)
+from trackformer.util.misc import read_thresholds
+
+
+# ---------------------------------------------------------------------
+# Seuils (ENV ou défauts) + debug
+# ---------------------------------------------------------------------
+_cls, _div, _iou, _dbg = read_thresholds(None)
+CLS_THR = _cls
+DIV_THR = _div
+DIV_BBOX_IOU_THR = _iou  # IoU utilisé pour les divisions
+
+if _dbg:
+    print(
+        f"[DIVDBG] enabled  cls={CLS_THR:.2f}  div={DIV_THR:.2f}  IoU={DIV_BBOX_IOU_THR:.2f}",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------
+# Helpers robustes (torch / numpy) pour lever toute ambiguïté booléenne
+# ---------------------------------------------------------------------
+def _to_int(x):
+    """Retourne un int Python à partir d'un tensor 0-D / numpy / int."""
+    try:
+        if isinstance(x, torch.Tensor):
+            return int(x.item()) if x.ndim == 0 else int(x)
+        return int(x)
+    except Exception:
+        return int(x)
+
+def _any(x):
+    """True si un élément True dans x (torch/numpy/bool)."""
+    try:
+        if isinstance(x, torch.Tensor):
+            return bool(x.any().item())
+        import numpy as _np
+        return bool(_np.any(x))
+    except Exception:
+        return bool(x)
+
+def _any_eq(x, val):
+    """True si un élément de x == val (torch/numpy)."""
+    try:
+        if isinstance(x, torch.Tensor):
+            return bool((x == val).any().item())
+        import numpy as _np
+        return bool(_np.any(x == val))
+    except Exception:
+        return x == val
+
+def _count_eq(x, val):
+    """Nombre d'éléments égaux à val (torch/numpy)."""
+    try:
+        if isinstance(x, torch.Tensor):
+            return int((x == val).sum().item())
+        import numpy as _np
+        return int((_np.asarray(x) == val).sum())
+    except Exception:
+        return 0
+
+def _isin_scalar(val, arr):
+    """Test 'val in arr' robuste pour des tenseurs 1D."""
+    if isinstance(arr, torch.Tensor):
+        return _any(arr == val)
+    try:
+        return val in arr
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------
+# Early/Late division updates (vectorisé et safe)
+# ---------------------------------------------------------------------
 def update_early_or_late_track_divisions(
     outputs,
     targets,
@@ -9,300 +91,473 @@ def update_early_or_late_track_divisions(
     prev_target_name,
     cur_target_name,
     fut_target_name,
-    ):
-
-    device = outputs['pred_logits'].device
-    use_masks = 'masks' in targets[0][training_method][cur_target_name]
+):
+    device = outputs["pred_logits"].device
+    use_masks = "masks" in targets[0][training_method][cur_target_name]
 
     # check for early / late cell division and adjust ground truths as necessary
     for t, target in enumerate(targets):
-
-        man_track = target[training_method]['man_track']
+        man_track = target[training_method]["man_track"]
 
         prev_target = target[training_method][prev_target_name]
         cur_target = target[training_method][cur_target_name]
         fut_target = target[training_method][fut_target_name]
 
-        if cur_target['empty']:
+        if cur_target["empty"]:
             continue
 
-        if 'track_query_match_ids' in cur_target:
+        if "track_query_match_ids" in cur_target:
+            # Get all predictions for TP track queries
+            pred_boxes_track = outputs["pred_boxes"][t][
+                cur_target["track_queries_TP_mask"]
+            ].detach()
+            pred_logits_track = (
+                outputs["pred_logits"][t][cur_target["track_queries_TP_mask"]]
+                .sigmoid()
+                .detach()
+            )
 
-            # Get all prdictions for TP track queries
-            pred_boxes_track = outputs['pred_boxes'][t][cur_target['track_queries_TP_mask']].detach()
-            pred_logits_track = outputs['pred_logits'][t][cur_target['track_queries_TP_mask']].sigmoid().detach()
-            # Check to see if there were any divisions in the future frame; if not, we skip to check for early division
+            # ensure prev<->cur remap is up-to-date
+            targets = man_track_ids(
+                targets, training_method, prev_target_name, cur_target_name
+            )
 
-            targets = man_track_ids(targets,training_method,prev_target_name,cur_target_name)
-
-            boxes = cur_target['boxes'].clone()
-            track_ids = cur_target['track_ids'].clone()
+            boxes = cur_target["boxes"].clone()
+            track_ids = cur_target["track_ids"].clone()
 
             for p, pred_box in enumerate(pred_boxes_track):
-                box = boxes[cur_target['track_query_match_ids'][p]].clone()
-                track_id = track_ids[cur_target['track_query_match_ids'][p]].clone()
+                cur_idx = cur_target["track_query_match_ids"][p]
+                box = boxes[cur_idx].clone()
+                track_id = track_ids[cur_idx].clone()
 
-                if track_id not in prev_target['track_ids']:
-                    print(f'track_id: {track_id}')
-                    print(f"dataset_nb: {target['dataset_nb']}")
-                    print(f'training method: {training_method}')
-                    print(f'cur_target_name: {cur_target_name}')
-                    print(f'Image_id: {target[training_method][cur_target_name]["image_id"]}')
-                    print(f'framenb: {target[training_method][cur_target_name]["framenb"]}')
-                    print(f'Num of boxes: {target[training_method][cur_target_name]["boxes"].shape[0]}')
-                    print(f'Num of orig boxes: {target[training_method][cur_target_name]["boxes_orig"].shape[0]}')
-                    print(f'Num of prev boxes: {target[training_method][prev_target_name]["boxes"].shape[0]}')
-                    print(f'Num of prev orig boxes: {target[training_method][prev_target_name]["boxes_orig"].shape[0]}')
-                    print(target[training_method]['man_track'][target[training_method]['man_track'][:,0] == track_id])
-                    mot_cellnb = target[training_method]['man_track'][target[training_method]['man_track'][:,0] == track_id,-1][0]
-                    if mot_cellnb > 0:
-                        print(f'mother cellnb: {mot_cellnb}')
-                        print(target[training_method]['man_track'][target[training_method]['man_track'][:,-1] == mot_cellnb])       
-                    print(target[training_method]['man_track'])
+                # si ce track n'existait pas à t-1, essayer d'utiliser la mère
+                prev_has = _any(prev_target["track_ids"] == track_id)
+                track_id_prev = track_id  # défaut
 
-                                        
-                assert track_id in prev_target['track_ids']
+                if not prev_has:
+                    # man_track: [gid, start, end, parent]
+                    mt = man_track
+                    row = (mt[:, 0] == track_id)
+                    if _any(row):
+                        start = _to_int(mt[row, 1][0])
+                        parent = _to_int(mt[row, 3][0])
+                    else:
+                        start, parent = -1, -1
 
-                if prev_target['flexible_divisions'][prev_target['track_ids'] == track_id]:
+                    # nouveau-né à cette frame -> utiliser la mère à t-1
+                    if start == _to_int(cur_target["framenb"]) and parent > 0 and _any(
+                        prev_target["track_ids"] == parent
+                    ):
+                        track_id_prev = prev_target["track_ids"].new_tensor(parent)
+                    else:
+                        # cas object-query de nouveau-né -> ignorer
+                        continue
+
+                # si flexible division à t-1, ne force rien
+                prev_flex_mask = prev_target["track_ids"] == track_id_prev
+                if _any(prev_target["flexible_divisions"][prev_flex_mask]):
                     continue
 
-                # First check if the model predicted a single cell instead of a division
-                if box[-1] > 0 and pred_logits_track[p,0] > 0.5 and pred_logits_track[p,-1] < 0.5: # gt - division ; pred - single-cell
-
+                # ----- LATE division fix -----
+                # GT = division ; pred = single-cell
+                cond_late = (
+                    (box[-1] > 0).item()
+                    and (pred_logits_track[p, 0] > CLS_THR).item()
+                    and (pred_logits_track[p, -1] < DIV_THR).item()
+                )
+                if cond_late:
                     area_box_1 = box[2] * box[3]
                     area_box_2 = box[6] * box[7]
 
-                    prev_box = prev_target['boxes'][prev_target['track_ids'] == track_id]
-                    area_prev_box = prev_box[0,2] * prev_box[0,3]
+                    prev_box = prev_target["boxes"][prev_flex_mask]
+                    area_prev_box = (
+                        prev_box[0, 2] * prev_box[0, 3] if prev_box.shape[0] > 0 else 0
+                    )
 
-                    if area_box_1 > area_box_2 * 2 or area_box_2 > area_box_1 * 2: # and 0.8 * area_prev_box < (area_box_1 + area_box_2): # Last part checks if cell is exiting frame then it would discount it as a filamented cell
-                        continue # force filament cells to divide training otherwise it favors flexible divisoin due to asymmetrical division
-                    
+                    # division très asymétrique -> ne pas fusionner
+                    if area_box_1 > area_box_2 * 2 or area_box_2 > area_box_1 * 2:
+                        continue
+
                     combined_box = combine_div_boxes(box)
-                    iou_div = calc_iou(box,pred_box)
+                    iou_div = calc_iou(box, pred_box)
 
-                    pred_box[4:] = 0
-                    iou_combined = calc_iou(combined_box,pred_box)
+                    pred_box_single = pred_box.clone()
+                    pred_box_single[4:] = 0
+                    iou_combined = calc_iou(combined_box, pred_box_single)
 
-                    if iou_combined - iou_div > 0 and iou_combined > 0.5: 
-                        cur_target['boxes'][cur_target['track_query_match_ids'][p]] = combined_box
-                        cur_target['labels'][cur_target['track_query_match_ids'][p]] = torch.tensor([0,1]).to(device)
-                        cur_target['flexible_divisions'][cur_target['track_query_match_ids'][p]] = True
-                        
+                    if (iou_combined - iou_div > 0) and (iou_combined > DIV_BBOX_IOU_THR):
+                        # remplacer la division GT par une boîte unique combinée
+                        cur_target["boxes"][cur_idx] = combined_box
+                        cur_target["labels"][cur_idx] = torch.tensor([0, 1]).to(device)
+                        cur_target["flexible_divisions"][cur_idx] = True
 
-                        track_id = cur_target['track_ids'][cur_target['track_query_match_ids'][p]].clone()
+                        track_id_now = cur_target["track_ids"][cur_idx].clone()
 
-                        div_bool_1 = cur_target['boxes_orig'][:,:4].eq(box[None,:4]).all(1)
-                        div_bool_2 = cur_target['boxes_orig'][:,:4].eq(box[None,4:]).all(1)
+                        div_bool_1 = cur_target["boxes_orig"][:, :4].eq(
+                            box[None, :4]
+                        ).all(1)
+                        div_bool_2 = cur_target["boxes_orig"][:, :4].eq(
+                            box[None, 4:]
+                        ).all(1)
 
-                        div_track_id_1 = cur_target['track_ids_orig'][div_bool_1].clone()
-                        div_track_id_2 = cur_target['track_ids_orig'][div_bool_2].clone()
+                        div_track_id_1 = cur_target["track_ids_orig"][div_bool_1].clone()
+                        div_track_id_2 = cur_target["track_ids_orig"][div_bool_2].clone()
 
-                        cur_target['boxes_orig'][div_bool_1] = combined_box.clone()
-                        cur_target['boxes_orig'] = cur_target['boxes_orig'][~div_bool_2]
+                        cur_target["boxes_orig"][div_bool_1] = combined_box.clone()
+                        cur_target["boxes_orig"] = cur_target["boxes_orig"][~div_bool_2]
 
-                        cur_target['track_ids_orig'][div_bool_1] = track_id
-                        cur_target['track_ids_orig'] = cur_target['track_ids_orig'][~div_bool_2]
+                        cur_target["track_ids_orig"][div_bool_1] = track_id_now
+                        cur_target["track_ids_orig"] = cur_target["track_ids_orig"][
+                            ~div_bool_2
+                        ]
 
-                        cur_target['flexible_divisions_orig'][div_bool_1] = True
-                        cur_target['flexible_divisions_orig'] = cur_target['flexible_divisions_orig'][~div_bool_2]
+                        cur_target["flexible_divisions_orig"][div_bool_1] = True
+                        cur_target["flexible_divisions_orig"] = (
+                            cur_target["flexible_divisions_orig"][~div_bool_2]
+                        )
 
-                        is_touching_edge = cur_target['is_touching_edge_orig'][div_bool_1] or cur_target['is_touching_edge_orig'][div_bool_2]
-                        cur_target['is_touching_edge'][cur_target['track_query_match_ids'][p]] = is_touching_edge
+                        is_touching_edge = _any(
+                            cur_target["is_touching_edge_orig"][div_bool_1]
+                        ) or _any(cur_target["is_touching_edge_orig"][div_bool_2])
+                        cur_target["is_touching_edge"][cur_idx] = is_touching_edge
+                        cur_target["is_touching_edge_orig"][div_bool_1] = (
+                            is_touching_edge
+                        )
+                        cur_target["is_touching_edge_orig"] = cur_target[
+                            "is_touching_edge_orig"
+                        ][~div_bool_2]
 
-                        cur_target['is_touching_edge_orig'][div_bool_1] = is_touching_edge
-                        cur_target['is_touching_edge_orig'] = cur_target['is_touching_edge_orig'][~div_bool_2]
-
-                        assert cur_target['labels_orig'][div_bool_1,1] == 1
-                        cur_target['labels_orig'] = cur_target['labels_orig'][~div_bool_2]
+                        assert _any(cur_target["labels_orig"][div_bool_1, 1] == 1)
+                        cur_target["labels_orig"] = cur_target["labels_orig"][
+                            ~div_bool_2
+                        ]
 
                         if use_masks:
-                            mask = cur_target['masks'][cur_target['track_query_match_ids'][p]]
-                            prev_mask = prev_target['masks'][prev_target['track_ids'] == track_id][0]
-                            combined_mask = combine_div_masks(mask,prev_mask)
-                            cur_target['masks'][cur_target['track_query_match_ids'][p]] = combined_mask
+                            mask = cur_target["masks"][cur_idx]
+                            prev_mask = prev_target["masks"][prev_flex_mask][0]
+                            combined_mask = combine_div_masks(mask, prev_mask)
+                            cur_target["masks"][cur_idx] = combined_mask
+                            cur_target["masks_orig"][div_bool_1] = combined_mask
+                            cur_target["masks_orig"] = cur_target["masks_orig"][
+                                ~div_bool_2
+                            ]
 
-                            cur_target['masks_orig'][div_bool_1] = combined_mask
-                            cur_target['masks_orig'] = cur_target['masks_orig'][~div_bool_2]    
+                        track_id_ind = man_track[:, 0] == track_id_now
+                        div_track_id_1_ind = man_track[:, 0] == div_track_id_1
+                        div_track_id_2_ind = man_track[:, 0] == div_track_id_2
 
-                        track_id_ind = man_track[:,0] == track_id
-                        div_track_id_1_ind = man_track[:,0] == div_track_id_1
-                        div_track_id_2_ind = man_track[:,0] == div_track_id_2
+                        man_track[track_id_ind, 2] += 1
+                        man_track[div_track_id_1_ind, 1] += 1
+                        man_track[div_track_id_2_ind, 1] += 1
 
-                        man_track[track_id_ind,2] += 1                    
-                        man_track[div_track_id_1_ind,1] += 1                    
-                        man_track[div_track_id_2_ind,1] += 1                    
+                        # fille qui sort juste après naissance -> la mère remplace
+                        daughters_bad = _any(
+                            man_track[div_track_id_1_ind, 1]
+                            > man_track[div_track_id_1_ind, 2]
+                        ) or _any(
+                            man_track[div_track_id_2_ind, 1]
+                            > man_track[div_track_id_2_ind, 2]
+                        )
+                        if daughters_bad:
+                            man_track[track_id_ind, 2] = torch.max(
+                                man_track[div_track_id_1_ind, 2],
+                                man_track[div_track_id_2_ind, 2],
+                            )
+                            man_track[div_track_id_1_ind, 1:] = -1
+                            man_track[div_track_id_2_ind, 1:] = -1
 
-                        # Check to see if one of the daughters cells leave the FOV the frame after they are born
-                        # If so, the mother cell will replace the other daugher cell since this is just tracking and division occured                        
-                        if man_track[div_track_id_1_ind,1] > man_track[div_track_id_1_ind,2] or man_track[div_track_id_2_ind,1] > man_track[div_track_id_2_ind,2]:
-                            man_track[track_id_ind,2] = torch.max(man_track[div_track_id_1_ind,2],man_track[div_track_id_2_ind,2])
-                            man_track[div_track_id_1_ind,1:] = -1
-                            man_track[div_track_id_2_ind,1:] = -1
+                            # update fut ids if needed
+                            in_fut_1 = _isin_scalar(div_track_id_1, fut_target["track_ids"])
+                            in_fut_2 = _isin_scalar(div_track_id_2, fut_target["track_ids"])
 
-                            # Since cell division does not exist in future frames, we need to update the fut_track_id to the mother_id
-                            if div_track_id_1 in fut_target['track_ids'] and div_track_id_2 in fut_target['track_ids']: 
+                            if in_fut_1 and in_fut_2:
                                 raise NotImplementedError
-                            elif div_track_id_1 in fut_target['track_ids']:
-                                fut_target['track_ids'][fut_target['track_ids'] == div_track_id_1] = track_id.long().to(device)
-                                if fut_target_name != 'fut_target' and div_track_id_1 in target[training_method]['fut_target']['track_ids']:
-                                    target[training_method]['fut_target']['track_ids'][target[training_method]['fut_target']['track_ids'] == div_track_id_1] = track_id.long().to(device)
-                            elif div_track_id_2 in fut_target['track_ids']:
-                                fut_target['track_ids'][fut_target['track_ids'] == div_track_id_2] = track_id.long().to(device)
-                                if fut_target_name != 'fut_target' and div_track_id_2 in target[training_method]['fut_target']['track_ids']:
-                                    target[training_method]['fut_target']['track_ids'][target[training_method]['fut_target']['track_ids'] == div_track_id_2] = track_id.long().to(device)
+                            elif in_fut_1:
+                                fut_target["track_ids"][
+                                    fut_target["track_ids"] == div_track_id_1
+                                ] = track_id_now.long().to(device)
+                                if fut_target_name != "fut_target" and _isin_scalar(
+                                    div_track_id_1, target[training_method]["fut_target"]["track_ids"]
+                                ):
+                                    target[training_method]["fut_target"]["track_ids"][
+                                        target[training_method]["fut_target"]["track_ids"]
+                                        == div_track_id_1
+                                    ] = track_id_now.long().to(device)
+                            elif in_fut_2:
+                                fut_target["track_ids"][
+                                    fut_target["track_ids"] == div_track_id_2
+                                ] = track_id_now.long().to(device)
+                                if fut_target_name != "fut_target" and _isin_scalar(
+                                    div_track_id_2, target[training_method]["fut_target"]["track_ids"]
+                                ):
+                                    target[training_method]["fut_target"]["track_ids"][
+                                        target[training_method]["fut_target"]["track_ids"]
+                                        == div_track_id_2
+                                    ] = track_id_now.long().to(device)
 
-                            fut_target['track_ids_orig'] = fut_target['track_ids'].clone()
-                            if fut_target_name != 'fut_target':
-                                target[training_method]['fut_target']['track_ids_orig'] = target[training_method]['fut_target']['track_ids'].clone()
+                            fut_target["track_ids_orig"] = fut_target["track_ids"].clone()
+                            if fut_target_name != "fut_target":
+                                target[training_method]["fut_target"]["track_ids_orig"] = target[
+                                    training_method
+                                ]["fut_target"]["track_ids"].clone()
 
-                            if div_track_id_1 in man_track[:,-1] and div_track_id_2 in man_track[:,-1]:
-                                # error in dataset here. Cell divides two frames in a row
-                                fut_div_track_id_1, fut_div_track_id_2 = man_track[(man_track[:,-1] == div_track_id_1),0]
-                                fut_div_track_id_1_ind = man_track[:,0] == fut_div_track_id_1
-                                fut_div_track_id_2_ind = man_track[:,0] == fut_div_track_id_2
-                                man_track[fut_div_track_id_1_ind,-1] = 0
-                                man_track[fut_div_track_id_2_ind,-1] = 0  
-                                fut_div_track_id_1, fut_div_track_id_2 = man_track[(man_track[:,-1] == div_track_id_2),0]
-                                fut_div_track_id_1_ind = man_track[:,0] == fut_div_track_id_1
-                                fut_div_track_id_2_ind = man_track[:,0] == fut_div_track_id_2
-                                man_track[fut_div_track_id_1_ind,-1] = 0
-                                man_track[fut_div_track_id_2_ind,-1] = 0                          
-                            elif div_track_id_1 in man_track[:,-1]:
-                                fut_div_track_id_1, fut_div_track_id_2 = man_track[(man_track[:,-1] == div_track_id_1),0]
-                                fut_div_track_id_1_ind = man_track[:,0] == fut_div_track_id_1
-                                fut_div_track_id_2_ind = man_track[:,0] == fut_div_track_id_2
-                                man_track[fut_div_track_id_1_ind,-1] = track_id
-                                man_track[fut_div_track_id_2_ind,-1] = track_id
-                            elif div_track_id_2 in man_track[:,-1]:
-                                fut_div_track_id_1, fut_div_track_id_2 = man_track[(man_track[:,-1] == div_track_id_2),0]
-                                fut_div_track_id_1_ind = man_track[:,0] == fut_div_track_id_1
-                                fut_div_track_id_2_ind = man_track[:,0] == fut_div_track_id_2
-                                man_track[fut_div_track_id_1_ind,-1] = track_id
-                                man_track[fut_div_track_id_2_ind,-1] = track_id
+                            if _isin_scalar(div_track_id_1, man_track[:, -1]) and _isin_scalar(
+                                div_track_id_2, man_track[:, -1]
+                            ):
+                                fut_div_track_id_1, fut_div_track_id_2 = man_track[
+                                    (man_track[:, -1] == div_track_id_1), 0
+                                ]
+                                fut_div_track_id_1_ind = (
+                                    man_track[:, 0] == fut_div_track_id_1
+                                )
+                                fut_div_track_id_2_ind = (
+                                    man_track[:, 0] == fut_div_track_id_2
+                                )
+                                man_track[fut_div_track_id_1_ind, -1] = 0
+                                man_track[fut_div_track_id_2_ind, -1] = 0
+                                fut_div_track_id_1, fut_div_track_id_2 = man_track[
+                                    (man_track[:, -1] == div_track_id_2), 0
+                                ]
+                                fut_div_track_id_1_ind = (
+                                    man_track[:, 0] == fut_div_track_id_1
+                                )
+                                fut_div_track_id_2_ind = (
+                                    man_track[:, 0] == fut_div_track_id_2
+                                )
+                                man_track[fut_div_track_id_1_ind, -1] = 0
+                                man_track[fut_div_track_id_2_ind, -1] = 0
+                            elif _isin_scalar(div_track_id_1, man_track[:, -1]):
+                                fut_div_track_id_1, fut_div_track_id_2 = man_track[
+                                    (man_track[:, -1] == div_track_id_1), 0
+                                ]
+                                fut_div_track_id_1_ind = (
+                                    man_track[:, 0] == fut_div_track_id_1
+                                )
+                                fut_div_track_id_2_ind = (
+                                    man_track[:, 0] == fut_div_track_id_2
+                                )
+                                man_track[fut_div_track_id_1_ind, -1] = track_id_now
+                                man_track[fut_div_track_id_2_ind, -1] = track_id_now
+                            elif _isin_scalar(div_track_id_2, man_track[:, -1]):
+                                fut_div_track_id_1, fut_div_track_id_2 = man_track[
+                                    (man_track[:, -1] == div_track_id_2), 0
+                                ]
+                                fut_div_track_id_1_ind = (
+                                    man_track[:, 0] == fut_div_track_id_1
+                                )
+                                fut_div_track_id_2_ind = (
+                                    man_track[:, 0] == fut_div_track_id_2
+                                )
+                                man_track[fut_div_track_id_1_ind, -1] = track_id_now
+                                man_track[fut_div_track_id_2_ind, -1] = track_id_now
 
-                            assert (torch.arange(1,target[training_method]['man_track'].shape[0]+1,dtype=target[training_method]['man_track'].dtype).to(target[training_method]['man_track'].device) == target[training_method]['man_track'][:,0]).all()
+                            assert (
+                                torch.arange(
+                                    1,
+                                    target[training_method]["man_track"].shape[0] + 1,
+                                    dtype=target[training_method]["man_track"].dtype,
+                                    device=target[training_method]["man_track"].device,
+                                )
+                                == target[training_method]["man_track"][:, 0]
+                            ).all()
 
-                # assert cur_target['track_query_match_ids'].max() < cur_target['boxes'].shape[0]
-                 
+            # ensure cur->fut remap before early checks
+            targets = man_track_ids(targets, training_method, cur_target_name, fut_target_name)
 
-            targets = man_track_ids(targets,training_method,cur_target_name,fut_target_name)
-
+            # ----- EARLY division fix -----
             for p, pred_box in enumerate(pred_boxes_track):
-                box = boxes[cur_target['track_query_match_ids'][p]].clone()
+                cur_idx = cur_target["track_query_match_ids"][p]
+                box = boxes[cur_idx].clone()
 
-                if box[-1] == 0 and (pred_logits_track[p] > 0.5).all(): # gt - single-cell ; pred- division
-                    # if model predcitions division, check future frame and see if there is a division
+                # GT single ; pred division
+                cond_early = (
+                    (box[-1] == 0).item()
+                    and (pred_logits_track[p, 0] > CLS_THR).item()
+                    and (pred_logits_track[p, -1] > DIV_THR).item()
+                )
+                if not cond_early:
+                    continue
 
-                    track_id = track_ids[cur_target['track_query_match_ids'][p]].clone()
-                    track_id_ind = man_track[:,0] == track_id
+                track_id = track_ids[cur_idx].clone()
+                track_id_ind = man_track[:, 0] == track_id
 
-                    if man_track[track_id_ind,2] == prev_target['framenb']:
-                        track_id = man_track[track_id_ind,-1]
-                        
-                    if track_id not in fut_target['track_ids']:
-                        continue  # Cell leaves chamber in future frame
+                # si juste née à t-1, remonter à la mère
+                if _any_eq(man_track[track_id_ind, 2], prev_target["framenb"]):
+                    track_id = man_track[track_id_ind, -1]
 
-                    fut_box_ind = (fut_target['track_ids'] == track_id).nonzero()[0][0]
-                    fut_box = fut_target['boxes'][fut_box_ind]
+                if not _isin_scalar(track_id, fut_target["track_ids"]):
+                    continue  # sort du champ
 
+                fut_box_ind = (fut_target["track_ids"] == track_id).nonzero()[0][0]
+                fut_box = fut_target["boxes"][fut_box_ind]
 
-                    if fut_box[-1] > 0: # If cell divides next frame, we check to see if the model is predicting an early division
-                        div_box = divide_box(box,fut_box)
+                if (fut_box[-1] > 0).item():  # divise à t+1 -> early division possible
+                    div_box = divide_box(box, fut_box)
 
-                        iou_div = calc_iou(div_box,pred_box)
-                        iou = calc_iou(box[:4],pred_box[:4])
+                    iou_div = calc_iou(div_box, pred_box)
+                    iou = calc_iou(box[:4], pred_box[:4])
 
-                        if iou_div - iou > 0 and iou_div > 0.5:
-                            cur_target['boxes'][cur_target['track_query_match_ids'][p]] = div_box
-                            cur_target['labels'][cur_target['track_query_match_ids'][p]] = torch.tensor([0,0]).to(device)
-                            cur_target['flexible_divisions_orig'][cur_target['track_query_match_ids'][p]] = True           
-                            # don't need to adjust is_touching_edge because it will remain the same but need to adjust the orig version
+                    if (iou_div - iou > 0) and (iou_div > DIV_BBOX_IOU_THR):
+                        cur_target["boxes"][cur_idx] = div_box
+                        cur_target["labels"][cur_idx] = torch.tensor([0, 0]).to(device)
+                        cur_target["flexible_divisions_orig"][cur_idx] = True
 
-                            fut_track_id_1, fut_track_id_2 = man_track[man_track[:,-1] == track_id,0]
-                            fut_box_1 = fut_target['boxes_orig'][fut_target['track_ids_orig'] == fut_track_id_1][0]
-                            fut_box_2 = fut_target['boxes_orig'][fut_target['track_ids_orig'] == fut_track_id_2][0]
+                        fut_track_id_1, fut_track_id_2 = man_track[
+                            man_track[:, -1] == track_id, 0
+                        ]
+                        fut_box_1 = fut_target["boxes_orig"][
+                            fut_target["track_ids_orig"] == fut_track_id_1
+                        ][0]
+                        fut_box_2 = fut_target["boxes_orig"][
+                            fut_target["track_ids_orig"] == fut_track_id_2
+                        ][0]
 
-                            if (div_box[:2] - fut_box_1[:2]).square().sum() +(div_box[4:6] - fut_box_2[:2]).square().sum() > (div_box[:2] - fut_box_2[:2]).square().sum() +(div_box[4:6] - fut_box_1[:2]).square().sum():
-                                fut_track_id_1, fut_track_id_2 = fut_track_id_2, fut_track_id_1
-                            assert (torch.arange(1,target[training_method]['man_track'].shape[0]+1,dtype=target[training_method]['man_track'].dtype).to(target[training_method]['man_track'].device) == target[training_method]['man_track'][:,0]).all()
+                        if (
+                            (div_box[:2] - fut_box_1[:2]).square().sum()
+                            + (div_box[4:6] - fut_box_2[:2]).square().sum()
+                            > (div_box[:2] - fut_box_2[:2]).square().sum()
+                            + (div_box[4:6] - fut_box_1[:2]).square().sum()
+                        ):
+                            fut_track_id_1, fut_track_id_2 = fut_track_id_2, fut_track_id_1
 
-                            ind_tgt_orig = torch.where(cur_target['boxes_orig'].eq(box).all(-1))[0][0]
-                            cur_target['boxes_orig'][ind_tgt_orig,:4] = div_box[:4]
-                            cur_target['boxes_orig'] = torch.cat((cur_target['boxes_orig'], torch.cat((div_box[4:],torch.zeros_like(div_box[4:])))[None]),axis=0)
+                        assert (
+                            torch.arange(
+                                1,
+                                target[training_method]["man_track"].shape[0] + 1,
+                                dtype=target[training_method]["man_track"].dtype,
+                                device=target[training_method]["man_track"].device,
+                            )
+                            == target[training_method]["man_track"][:, 0]
+                        ).all()
 
-                            cur_target['track_ids_orig'][ind_tgt_orig] = fut_track_id_1 
-                            cur_target['track_ids_orig'] = torch.cat((cur_target['track_ids_orig'], torch.tensor([fut_track_id_2]).to(device)))
+                        ind_tgt_orig = torch.where(
+                            cur_target["boxes_orig"].eq(box).all(-1)
+                        )[0][0]
+                        cur_target["boxes_orig"][ind_tgt_orig, :4] = div_box[:4]
+                        cur_target["boxes_orig"] = torch.cat(
+                            (
+                                cur_target["boxes_orig"],
+                                torch.cat((div_box[4:], torch.zeros_like(div_box[4:])))[
+                                    None
+                                ],
+                            ),
+                            dim=0,
+                        )
 
-                            cur_target['labels_orig'] = torch.cat((cur_target['labels_orig'], cur_target['labels_orig'][:1]),axis=0)                   
-                            cur_target['flexible_divisions_orig'] = torch.cat((cur_target['flexible_divisions_orig'], torch.tensor([True]).to(device)))            
+                        cur_target["track_ids_orig"][ind_tgt_orig] = fut_track_id_1
+                        cur_target["track_ids_orig"] = torch.cat(
+                            (
+                                cur_target["track_ids_orig"],
+                                torch.tensor([fut_track_id_2]).to(device),
+                            )
+                        )
 
-                            cur_target['is_touching_edge_orig'] = torch.cat((cur_target['is_touching_edge_orig'], cur_target['is_touching_edge_orig'][ind_tgt_orig][None]))                   
+                        cur_target["labels_orig"] = torch.cat(
+                            (cur_target["labels_orig"], cur_target["labels_orig"][:1]),
+                            dim=0,
+                        )
+                        cur_target["flexible_divisions_orig"] = torch.cat(
+                            (
+                                cur_target["flexible_divisions_orig"],
+                                torch.tensor([True]).to(device),
+                            )
+                        )
 
-                            if use_masks:
-                                mask = cur_target['masks'][cur_target['track_query_match_ids'][p]]
-                                fut_mask = fut_target['masks'][fut_box_ind]
-                                div_mask = divide_mask(mask,fut_mask)
-                                cur_target['masks'][cur_target['track_query_match_ids'][p]] = div_mask
-                                cur_target['masks_orig'][ind_tgt_orig,:1] = div_mask[:1]
-                                cur_target['masks_orig'] = torch.cat((cur_target['masks_orig'], torch.cat((div_mask[1:],torch.zeros_like(div_mask[1:])))[None]),axis=0)
+                        cur_target["is_touching_edge_orig"] = torch.cat(
+                            (
+                                cur_target["is_touching_edge_orig"],
+                                cur_target["is_touching_edge_orig"][ind_tgt_orig][None],
+                            )
+                        )
 
-                            fut_track_id_1_ind = man_track[:,0] == fut_track_id_1
-                            fut_track_id_2_ind = man_track[:,0] == fut_track_id_2
+                        if use_masks:
+                            mask = cur_target["masks"][cur_idx]
+                            fut_mask = fut_target["masks"][fut_box_ind]
+                            div_mask = divide_mask(mask, fut_mask)
+                            cur_target["masks"][cur_idx] = div_mask
+                            cur_target["masks_orig"][ind_tgt_orig, :1] = div_mask[:1]
+                            cur_target["masks_orig"] = torch.cat(
+                                (
+                                    cur_target["masks_orig"],
+                                    torch.cat(
+                                        (div_mask[1:], torch.zeros_like(div_mask[1:]))
+                                    )[None],
+                                ),
+                                dim=0,
+                            )
 
-                            man_track[fut_track_id_1_ind,1] -= 1
-                            man_track[fut_track_id_2_ind,1] -= 1
-                            man_track[track_id_ind,2] -= 1
+                        fut_track_id_1_ind = man_track[:, 0] == fut_track_id_1
+                        fut_track_id_2_ind = man_track[:, 0] == fut_track_id_2
 
-                            if man_track[track_id_ind,1] > man_track[track_id_ind,2]:
-                                man_track[track_id_ind,1:] = -1
-                                man_track[fut_track_id_1_ind,-1] = 0
-                                man_track[fut_track_id_2_ind,-1] = 0
+                        man_track[track_id_ind, 2] -= 1
+                        man_track[fut_track_id_1_ind, 1] -= 1
+                        man_track[fut_track_id_2_ind, 1] -= 1
 
-        targets[t][training_method]['man_track'] = man_track
-                            
+                        if _any(
+                            man_track[track_id_ind, 1] > man_track[track_id_ind, 2]
+                        ):
+                            man_track[track_id_ind, 1:] = -1
+                            man_track[fut_track_id_1_ind, -1] = 0
+                            man_track[fut_track_id_2_ind, -1] = 0
 
-    if 'track_query_match_ids' in cur_target: # This needs to be updated for aux outputs and enc outputs because the matcher is rerun then
+        targets[t][training_method]["man_track"] = man_track
 
-        targets = man_track_ids(targets,training_method,prev_target_name,cur_target_name)
+    # Rebuild masks (post-loop refresh; s'aligne sur la logique originale)
+    # NB: on réutilise les "prev/cur" de la dernière itération — comportement identique au code d'origine
+    if "track_query_match_ids" in cur_target:
+        targets = man_track_ids(targets, training_method, prev_target_name, cur_target_name)
 
-        prev_track_ids = prev_target['track_ids'][cur_target['prev_ind'][1]]
+        prev_track_ids = prev_target["track_ids"][cur_target["prev_ind"][1]]
 
-        # match track ids between frames
-        target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(cur_target['track_ids'])
-        cur_target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
-        cur_target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
+        # match track ids entre frames
+        target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(
+            cur_target["track_ids"]
+        )
+        cur_target["target_ind_matching"] = target_ind_match_matrix.any(dim=1)
+        cur_target["track_query_match_ids"] = target_ind_match_matrix.nonzero()[:, 1]
 
-        # For images with no cells in them, we reformat target_ind_matching so torch.cat works properly with zero cells
-        if cur_target['target_ind_matching'].shape[0] == 0:
-            cur_target['target_ind_matching'] = torch.tensor([],device=device).bool()
+        # garde-fou si zéro cellule
+        if cur_target["target_ind_matching"].shape[0] == 0:
+            cur_target["target_ind_matching"] = torch.tensor([], device=device).bool()
 
-        track_queries_mask = torch.ones_like(cur_target['target_ind_matching']).bool()
+        track_queries_mask = torch.ones_like(cur_target["target_ind_matching"]).bool()
+        num_queries = (~cur_target["track_queries_mask"]).sum()
 
-        num_queries = (~cur_target['track_queries_mask']).sum()
+        cur_target["track_queries_mask"] = torch.cat(
+            [
+                track_queries_mask,
+                torch.tensor([True] * cur_target["num_FPs"]).to(device),
+                torch.tensor([False] * num_queries).to(device),
+            ]
+        ).bool()
 
-        cur_target['track_queries_mask'] = torch.cat([
-            track_queries_mask,
-            torch.tensor([True,] * cur_target['num_FPs']).to(device),
-            torch.tensor([False,] * num_queries).to(device), 
-            ]).bool()
+        cur_target["track_queries_TP_mask"] = torch.cat(
+            [
+                cur_target["target_ind_matching"],
+                torch.tensor([False] * cur_target["num_FPs"]).to(device),
+                torch.tensor([False] * num_queries).to(device),
+            ]
+        ).bool()
 
-        cur_target['track_queries_TP_mask'] = torch.cat([
-            cur_target['target_ind_matching'],
-            torch.tensor([False,] * cur_target['num_FPs']).to(device),
-            torch.tensor([False,] * num_queries).to(device), 
-            ]).bool()
+        cur_target["track_queries_fal_pos_mask"] = torch.cat(
+            [
+                ~cur_target["target_ind_matching"],
+                torch.tensor([True] * cur_target["num_FPs"]).to(device),
+                torch.tensor([False] * num_queries).to(device),
+            ]
+        ).bool()
 
-        cur_target['track_queries_fal_pos_mask'] = torch.cat([
-            ~cur_target['target_ind_matching'],
-            torch.tensor([True,] * cur_target['num_FPs']).to(device),
-            torch.tensor([False,] * num_queries).to(device),
-            ]).bool()
-
-        assert cur_target['track_queries_TP_mask'].sum() == len(cur_target['track_query_match_ids'])
+        assert (
+            cur_target["track_queries_TP_mask"].sum()
+            == len(cur_target["track_query_match_ids"])
+        )
 
     return targets
 
+
+# ---------------------------------------------------------------------
+# OD / tracking update (vectorisé et safe)
+# ---------------------------------------------------------------------
 def update_object_detection(
     outputs,
     targets,
@@ -311,409 +566,662 @@ def update_object_detection(
     training_method,
     prev_target_name,
     cur_target_name,
-    fut_target_name,):
+    fut_target_name,
+):
+    N = outputs["pred_logits"].shape[1]
+    use_masks = "masks" in targets[0][training_method][cur_target_name]
+    device = outputs["pred_logits"].device
 
-    N = outputs['pred_logits'].shape[1]
-    use_masks = 'masks' in targets[0][training_method][cur_target_name]
-    device = outputs['pred_logits'].device
-
-    # Indicies are saved in targets for calcualting object detction / tracking accuracy
-    for t,(target,(ind_out,ind_tgt)) in enumerate(zip(targets,indices)):
-
+    # Indices are saved in targets for calculating object detection / tracking accuracy
+    for t, (target, (ind_out, ind_tgt)) in enumerate(zip(targets, indices)):
         prev_target = target[training_method][prev_target_name]
         cur_target = target[training_method][cur_target_name]
         fut_target = target[training_method][fut_target_name]
 
-        if cur_target['empty']:
+        if cur_target["empty"]:
             continue
 
-        if training_method == 'dn_object':
-            cur_target['track_queries_mask'] = torch.zeros_like(cur_target['track_queries_mask']).bool()
+        if training_method == "dn_object":
+            cur_target["track_queries_mask"] = torch.zeros_like(
+                cur_target["track_queries_mask"]
+            ).bool()
 
-        man_track = target[training_method]['man_track']
-        framenb = cur_target['framenb']
+        man_track = target[training_method]["man_track"]
+        framenb = _to_int(cur_target["framenb"])
 
-        skip =[] # If a GT cell is split into two cells, we want to skip the second cell
+        skip = []  # si une GT est fusionnée, on saute la seconde
         ind_keep = torch.tensor([True for _ in range(len(ind_tgt))]).bool()
 
-        for ind_out_i, ind_tgt_i in zip(ind_out,ind_tgt):
+        for ind_out_i, ind_tgt_i in zip(ind_out, ind_tgt):
             # Confirm prediction is an object query, not a track query
             if ind_out_i >= (N - num_queries) and ind_tgt_i not in skip:
-                if 'track_queries_mask' in cur_target:
-                    assert not cur_target['track_queries_mask'][ind_out_i] 
-                track_id = cur_target['track_ids'][ind_tgt_i].clone()
-                # assert (man_track[:,-1] == track_id).sum() == 2 or (man_track[:,-1] == track_id).sum() == 0
-                
-                track_id_ind = man_track[:,0] == track_id
-                # Check if cell has just divided --> the two daugheter cells will be labeled cell 1 and 2
-                if man_track[track_id_ind,1] == framenb and man_track[track_id_ind,-1] > 0:
-                    
-                    # Get id of mother cell by using the man_track
-                    mother_id = man_track[track_id_ind,-1].clone().long()
-                    assert mother_id in prev_target['track_ids']
+                if "track_queries_mask" in cur_target:
+                    assert not cur_target["track_queries_mask"][ind_out_i]
+                track_id = cur_target["track_ids"][ind_tgt_i].clone()
+
+                track_id_ind = man_track[:, 0] == track_id
+
+                # === Cas: la cellule vient de NAÎTRE à cette frame (deux filles présentes)
+                rows = man_track[track_id_ind]  # (4,) ou (k,4)
+
+                if rows.ndim == 1:
+                    start_here = bool((rows[1] == framenb) and (rows[-1] > 0))
+                else:
+                    start_here = _any(
+                        (rows[:, 1] == framenb) & (rows[:, -1] > 0)
+                    )
+
+                if start_here:
+                    # id de la mère
+                    mother_id = man_track[track_id_ind, -1].clone().long()
+                    assert _isin_scalar(mother_id, prev_target["track_ids"])
+
                     track_id_1 = track_id
 
-                    # Relabel variables to be consistent with cell 1 & 2
+                    # indices filles 1 & 2
                     ind_tgt_1 = ind_tgt_i
                     ind_out_1 = ind_out_i
-                    ind_1 = torch.where(ind_out == ind_out_1)[0][0] 
+                    ind_1 = torch.where(ind_out == ind_out_1)[0][0]
 
-                    # Get information for the other daughter cell
-                    track_id_2 = man_track[(man_track[:,-1] == mother_id) * (man_track[:,0] != track_id_1),0][0].clone()
-                    ind_tgt_2 = torch.where(cur_target['track_ids'] == track_id_2)[0][0].cpu()
-                    ind_2 = torch.where(ind_tgt == ind_tgt_2)[0][0] 
-                    ind_out_2 = ind_out[ind_2] 
+                    track_id_2 = man_track[
+                        (man_track[:, -1] == mother_id) * (man_track[:, 0] != track_id_1),
+                        0,
+                    ][0].clone()
+                    ind_tgt_2 = torch.where(cur_target["track_ids"] == track_id_2)[0][0].cpu()
+                    ind_2 = torch.where(ind_tgt == ind_tgt_2)[0][0]
+                    ind_out_2 = ind_out[ind_2]
 
-                    # Get predictions for cell 1 & 2
-                    pred_box_1 =  outputs['pred_boxes'][t,ind_out_1].detach()
-                    pred_box_2 =  outputs['pred_boxes'][t,ind_out_2].detach()
+                    # prédictions pour 1 & 2
+                    pred_box_1 = outputs["pred_boxes"][t, ind_out_1].detach()
+                    pred_box_2 = outputs["pred_boxes"][t, ind_out_2].detach()
 
-                    # Get groundtruths for cell 1 & 2
-                    box_1 =  cur_target['boxes'][ind_tgt_1]
-                    box_2 =  cur_target['boxes'][ind_tgt_2]
+                    # GT pour 1 & 2
+                    box_1 = cur_target["boxes"][ind_tgt_1]
+                    box_2 = cur_target["boxes"][ind_tgt_2]
+                    assert (
+                        box_1[-1] == 0 and box_2[-1] == 0
+                    ), "Cells have just divided. Each box should contain just one cell"
 
-                    assert box_1[-1] == 0 and box_2[-1] == 0, 'Cells have just divided. Each box should contain just one cell'
+                    # formatage concat
+                    boxes_1_2 = torch.cat((box_1[:4], box_2[:4]))
+                    pred_boxes_1_2 = torch.cat((pred_box_1[:4], pred_box_2[:4]))
 
-                    # Combine predictions and GTs 
-                    # This is done for formatting issues when calculating the iou
-                    boxes_1_2 = torch.cat((box_1[:4],box_2[:4]))
-                    pred_boxes_1_2 = torch.cat((pred_box_1[:4],pred_box_2[:4]))
-                    
-                    # Calculate iou for cell 1 matching to GT 1 and cell 2 matching to GT 2
-                    iou_sep,flip = calc_iou(pred_boxes_1_2,boxes_1_2,return_flip=True)
+                    # IoU séparés / flip
+                    iou_sep, flip = calc_iou(pred_boxes_1_2, boxes_1_2, return_flip=True)
 
                     if flip:
-                        iou_1 = calc_iou(pred_boxes_1_2[:4],boxes_1_2[4:])
-                        pred_logits_1 = outputs['pred_logits'][t,ind_out_2].sigmoid()[0]
-                        iou_2 = calc_iou(pred_boxes_1_2[4:],boxes_1_2[:4])
-                        pred_logits_2 = outputs['pred_logits'][t,ind_out_1].sigmoid()[0]
+                        iou_1 = calc_iou(pred_boxes_1_2[:4], boxes_1_2[4:])
+                        pred_logits_1 = outputs["pred_logits"][t, ind_out_2].sigmoid()[0]
+                        iou_2 = calc_iou(pred_boxes_1_2[4:], boxes_1_2[:4])
+                        pred_logits_2 = outputs["pred_logits"][t, ind_out_1].sigmoid()[0]
                     else:
-                        iou_1 = calc_iou(pred_boxes_1_2[:4],boxes_1_2[:4])
-                        pred_logits_1 = outputs['pred_logits'][t,ind_out_1].sigmoid()[0]
-                        iou_2 = calc_iou(pred_boxes_1_2[4:],boxes_1_2[4:])
-                        pred_logits_2 = outputs['pred_logits'][t,ind_out_2].sigmoid()[0]
+                        iou_1 = calc_iou(pred_boxes_1_2[:4], boxes_1_2[:4])
+                        pred_logits_1 = outputs["pred_logits"][t, ind_out_1].sigmoid()[0]
+                        iou_2 = calc_iou(pred_boxes_1_2[4:], boxes_1_2[4:])
+                        pred_logits_2 = outputs["pred_logits"][t, ind_out_2].sigmoid()[0]
 
-                    # Make a guess if GT 1 and GT 2 were actually 1 cell
-                    # Note this does not work well when cells are on the edge of the image
+                    # hypothèse: GT1 & GT2 étaient en fait une seule cellule
                     combined_box = combine_div_boxes(boxes_1_2)
 
-                    # Get all unused object queries that were predicted to be cells but did not match to a GT
-                    # We are checking to see if the model predicted GT 1 & 2 as one cell but didn't match either
-                    potential_object_query_indices = [ind_out_id for ind_out_id in torch.arange(N-num_queries,N) if ((ind_out_id not in ind_out or ind_out_id in [ind_out_1,ind_out_2]) and outputs['pred_logits'][t,ind_out_id,0].sigmoid().detach() > 0.5)]
-                    
-                    if len(potential_object_query_indices) == 0:
+                    # tous les object queries non utilisés qui prédisent "cellule"
+                    used = set([_to_int(x) for x in ind_out.tolist()])
+                    pot_inds = []
+                    for ind_out_id in range(N - num_queries, N):
+                        is_used = (ind_out_id in used) and (
+                            ind_out_id not in [_to_int(ind_out_1), _to_int(ind_out_2)]
+                        )
+                        cls_ok = (
+                            outputs["pred_logits"][t, ind_out_id, 0].sigmoid().item()
+                            > CLS_THR
+                        )
+                        if (not is_used) and cls_ok:
+                            pot_inds.append(ind_out_id)
+
+                    if len(pot_inds) == 0:
                         continue
 
-                    potential_pred_boxes = outputs['pred_boxes'][t,potential_object_query_indices].detach() 
+                    potential_pred_boxes = outputs["pred_boxes"][t, pot_inds].detach()
 
-                    # Check iou for all unused pred boxes against the combined box
-                    iou_combined = generalized_box_iou(box_cxcywh_to_xyxy(potential_pred_boxes[:,:4]),box_cxcywh_to_xyxy(combined_box[None,:4]),return_iou_only=True)
+                    iou_combined = generalized_box_iou(
+                        box_cxcywh_to_xyxy(potential_pred_boxes[:, :4]),
+                        box_cxcywh_to_xyxy(combined_box[None, :4]),
+                        return_iou_only=True,
+                    )
 
-                    # Get ind of which pred box that matched best to the combined box
                     max_ind = torch.argmax(iou_combined)
-                    assert iou_combined[max_ind] <= 1 and iou_combined[max_ind] >= 0 and iou_sep <= 1 and iou_sep >= 0, 'Calc_iou not working; producings numbers outside of 0 and 1'
+                    assert (
+                        0.0 <= iou_combined[max_ind] <= 1.0 and 0.0 <= iou_sep <= 1.0
+                    ), "calc_iou out of range"
 
-                    # We check to see if the separate pred boxes 1 & 2 have a higher iou than the pred box combined
-                    if iou_combined[max_ind] - iou_sep > 0 and iou_combined[max_ind] > 0.5 and (iou_combined[max_ind] > iou_1 or pred_logits_1 < 0.5) and (iou_combined[max_ind] > iou_2 or pred_logits_2 < 0.5):
-                        # Get ind_out for the pred box combined
-                        ind_out_combined = potential_object_query_indices[max_ind]
+                    if (
+                        iou_combined[max_ind] - iou_sep > 0
+                        and iou_combined[max_ind] > CLS_THR
+                        and (iou_combined[max_ind] > iou_1 or pred_logits_1 < 0.5)
+                        and (iou_combined[max_ind] > iou_2 or pred_logits_2 < 0.5)
+                    ):
+                        ind_out_combined = pot_inds[_to_int(max_ind)]
 
-                        # Track which pred / tgt are going to get removed since two cells are being merged into one cell
+                        # on supprime la seconde fille
                         ind_keep[ind_2] = False
-                        skip += [ind_tgt_1,ind_tgt_2]
-            
-                        # Replace box 1 with the combined box in ind_tgt_1 and remove box 2
-                        cur_target['boxes'][ind_tgt_1] = combined_box
-                        cur_target['track_ids'][ind_tgt_1] = mother_id
-                        cur_target['track_ids'][ind_tgt_2] = -1
-                        cur_target['flexible_divisions'][ind_tgt_1] = True
-                        cur_target['is_touching_edge'][ind_tgt_1] = cur_target['is_touching_edge'][ind_tgt_1] or cur_target['is_touching_edge'][ind_tgt_2] # if either of the two gt boxes were touching edge, then the new combined box is touching the edge as well
+                        skip += [ind_tgt_1, ind_tgt_2]
 
-                        assert mother_id not in cur_target['track_ids_orig']
-                        ind_tgt_orig_1 = cur_target['track_ids_orig'] == track_id_1
-                        cur_target['track_ids_orig'][ind_tgt_orig_1] = mother_id
-                        cur_target['boxes_orig'][ind_tgt_orig_1] = combined_box
-                        cur_target['flexible_divisions_orig'][ind_tgt_orig_1] = True
-                        cur_target['is_touching_edge_orig'][ind_tgt_orig_1] = cur_target['is_touching_edge'][ind_tgt_1]
+                        # fusion: box 1 <- combined, 2 supprimée
+                        cur_target["boxes"][ind_tgt_1] = combined_box
+                        mother_id = man_track[track_id_ind, -1].clone().long()
+                        cur_target["track_ids"][ind_tgt_1] = mother_id
+                        cur_target["track_ids"][ind_tgt_2] = -1
+                        cur_target["flexible_divisions"][ind_tgt_1] = True
+                        cur_target["is_touching_edge"][ind_tgt_1] = (
+                            cur_target["is_touching_edge"][ind_tgt_1]
+                            or cur_target["is_touching_edge"][ind_tgt_2]
+                        )
 
-                        ind_orig_keep = cur_target['track_ids_orig'] != track_id_2
-                        
-                        cur_target['track_ids_orig'] = cur_target['track_ids_orig'][ind_orig_keep]
-                        cur_target['boxes_orig'] = cur_target['boxes_orig'][ind_orig_keep]
-                        cur_target['labels_orig'] = cur_target['labels_orig'][ind_orig_keep]
-                        cur_target['flexible_divisions_orig'] = cur_target['flexible_divisions_orig'][ind_orig_keep]
-                        cur_target['is_touching_edge_orig'] = cur_target['is_touching_edge_orig'][ind_orig_keep]
+                        assert not _isin_scalar(mother_id, cur_target["track_ids_orig"])
+                        ind_tgt_orig_1 = cur_target["track_ids_orig"] == track_id_1
+                        cur_target["track_ids_orig"][ind_tgt_orig_1] = mother_id
+                        cur_target["boxes_orig"][ind_tgt_orig_1] = combined_box
+                        cur_target["flexible_divisions_orig"][ind_tgt_orig_1] = True
+                        cur_target["is_touching_edge_orig"][ind_tgt_orig_1] = cur_target[
+                            "is_touching_edge"
+                        ][ind_tgt_1]
+
+                        ind_orig_keep = cur_target["track_ids_orig"] != track_id_2
+                        cur_target["track_ids_orig"] = cur_target["track_ids_orig"][ind_orig_keep]
+                        cur_target["boxes_orig"] = cur_target["boxes_orig"][ind_orig_keep]
+                        cur_target["labels_orig"] = cur_target["labels_orig"][ind_orig_keep]
+                        cur_target["flexible_divisions_orig"] = cur_target[
+                            "flexible_divisions_orig"
+                        ][ind_orig_keep]
+                        cur_target["is_touching_edge_orig"] = cur_target[
+                            "is_touching_edge_orig"
+                        ][ind_orig_keep]
 
                         if use_masks:
-                            # Get mask of mother cell in the previous frame
-                            mother_ind = torch.where(prev_target['track_ids'] == mother_id)[0][0]
-                            prev_mask = prev_target['masks'][mother_ind][:1]
-                            
-                            # Get masks of the two daughter cells (cell 1 and cell 2)
-                            mask_1 = cur_target['masks'][ind_tgt_1].detach()[:1]
-                            mask_2 = cur_target['masks'][ind_tgt_2].detach()[:1]
-                            sep_mask = torch.cat((mask_1,mask_2),axis=0)
+                            mother_ind = torch.where(prev_target["track_ids"] == mother_id)[0][0]
+                            prev_mask = prev_target["masks"][mother_ind][:1]
 
-                            # Make a prediction how the two daughter cell masks get combined with the mother cell mask as a reference
-                            combined_mask = combine_div_masks(sep_mask,prev_mask)
+                            mask_1 = cur_target["masks"][ind_tgt_1].detach()[:1]
+                            mask_2 = cur_target["masks"][ind_tgt_2].detach()[:1]
+                            sep_mask = torch.cat((mask_1, mask_2), dim=0)
 
-                            # Replace cell 1 mask with the combined mask and remove cell 2 mask
-                            cur_target['masks'][ind_tgt_1] = combined_mask
-                            cur_target['masks_orig'][ind_tgt_orig_1] = combined_mask
-                            cur_target['masks_orig'] = cur_target['masks_orig'][ind_orig_keep]
+                            combined_mask = combine_div_masks(sep_mask, prev_mask)
 
-                        # In ind_out_1 add the object query pointing to pred box combined and get rid of ind_out_2
-                        ind_out[ind_1]  = ind_out_combined
-                            
-                        track_id_mot_ind = man_track[:,0] == mother_id
-                        track_id_1_ind = man_track[:,0] == track_id_1
-                        track_id_2_ind = man_track[:,0] == track_id_2
+                            cur_target["masks"][ind_tgt_1] = combined_mask
+                            cur_target["masks_orig"][ind_tgt_orig_1] = combined_mask
+                            cur_target["masks_orig"] = cur_target["masks_orig"][ind_orig_keep]
 
-                        man_track[track_id_mot_ind,2] += 1
-                        man_track[track_id_1_ind,1] += 1
-                        man_track[track_id_2_ind,1] += 1
+                        # remplacer la prédiction 1 par l'object query combiné
+                        ind_out[ind_1] = ind_out_combined
 
-                        # Check to see if a division occurs in the future frame. A cell could have left the FOV
-                        if man_track[track_id_1_ind,2] < man_track[track_id_1_ind,1] or man_track[track_id_2_ind,2] < man_track[track_id_2_ind,1]:
-                            man_track[track_id_mot_ind,2] = torch.max(man_track[track_id_1_ind,2],man_track[track_id_2_ind,2])
-                            man_track[track_id_1_ind,1:] = -1
-                            man_track[track_id_2_ind,1:] = -1
+                        track_id_mot_ind = man_track[:, 0] == mother_id
+                        track_id_1_ind = man_track[:, 0] == track_id_1
+                        track_id_2_ind = man_track[:, 0] == track_id_2
 
-                            # Since cell division does not exist in future frames, we need to update the fut_track_id to the mother_id
-                            if track_id_1 in fut_target['track_ids_orig']:
-                                fut_target['track_ids_orig'][fut_target['track_ids_orig'] == track_id_1] = mother_id
-                            elif track_id_2 in fut_target['track_ids_orig']:
-                                fut_target['track_ids_orig'][fut_target['track_ids_orig'] == track_id_2] = mother_id
+                        man_track[track_id_mot_ind, 2] += 1
+                        man_track[track_id_1_ind, 1] += 1
+                        man_track[track_id_2_ind, 1] += 1
 
-                            if track_id_1 in man_track[:,-1] and track_id_2 in man_track[:,-1]:
-                                # error in dataset here. Cell divides two frames in a row
-                                div_track_id_1, div_track_id_2 = man_track[(man_track[:,-1] == track_id_1),0]
-                                div_track_id_1_ind = man_track[:,0] == div_track_id_1
-                                div_track_id_2_ind = man_track[:,0] == div_track_id_2
-                                man_track[div_track_id_1_ind,-1] = 0
-                                man_track[div_track_id_2_ind,-1] = 0
-                                div_track_id_1, div_track_id_2 = man_track[(man_track[:,-1] == track_id_2),0]
-                                div_track_id_1_ind = man_track[:,0] == div_track_id_1
-                                div_track_id_2_ind = man_track[:,0] == div_track_id_2
-                                man_track[div_track_id_1_ind,-1] = 0
-                                man_track[div_track_id_2_ind,-1] = 0
-                            elif track_id_1 in man_track[:,-1]:
-                                div_track_id_1, div_track_id_2 = man_track[(man_track[:,-1] == track_id_1),0]
-                                div_track_id_1_ind = man_track[:,0] == div_track_id_1
-                                div_track_id_2_ind = man_track[:,0] == div_track_id_2
-                                man_track[div_track_id_1_ind,-1] = mother_id
-                                man_track[div_track_id_2_ind,-1] = mother_id
-                            elif track_id_2 in man_track[:,-1]:
-                                div_track_id_1, div_track_id_2 = man_track[(man_track[:,-1] == track_id_2),0]
-                                div_track_id_1_ind = man_track[:,0] == div_track_id_1
-                                div_track_id_2_ind = man_track[:,0] == div_track_id_2
-                                man_track[div_track_id_1_ind,-1] = mother_id
-                                man_track[div_track_id_2_ind,-1] = mother_id
-  
-                # Check if cell is about to divide
-                elif man_track[track_id_ind,2] == framenb and (man_track[:,-1] == track_id).sum() == 2 and training_method != 'dn_object': # Doesn't make sense for dn_object to detect early divisions as a FP would need to be turned into a TP which is tricky             
+                        # si une fille sort rapidement, remplacer par la mère
+                        cond_out_1 = _any(man_track[track_id_1_ind, 2] < man_track[track_id_1_ind, 1])
+                        cond_out_2 = _any(man_track[track_id_2_ind, 2] < man_track[track_id_2_ind, 1])
+                        if cond_out_1 or cond_out_2:
+                            man_track[track_id_mot_ind, 2] = torch.max(
+                                man_track[track_id_1_ind, 2], man_track[track_id_2_ind, 2]
+                            )
+                            man_track[track_id_1_ind, 1:] = -1
+                            man_track[track_id_2_ind, 1:] = -1
 
-                        # Get groundtruths for mother cell in current frame
-                        box =  cur_target['boxes'][ind_tgt_i].clone()
+                            # mettre à jour les fut ids -> mother_id
+                            if _isin_scalar(track_id_1, fut_target["track_ids_orig"]):
+                                fut_target["track_ids_orig"][
+                                    fut_target["track_ids_orig"] == track_id_1
+                                ] = mother_id
+                            elif _isin_scalar(track_id_2, fut_target["track_ids_orig"]):
+                                fut_target["track_ids_orig"][
+                                    fut_target["track_ids_orig"] == track_id_2
+                                ] = mother_id
 
-                        fut_track_id_1, fut_track_id_2 = man_track[(man_track[:,-1] == track_id),0]
+                            if _isin_scalar(track_id_1, man_track[:, -1]) and _isin_scalar(
+                                track_id_2, man_track[:, -1]
+                            ):
+                                div_track_id_1, div_track_id_2 = man_track[
+                                    (man_track[:, -1] == track_id_1), 0
+                                ]
+                                div_track_id_1_ind = man_track[:, 0] == div_track_id_1
+                                div_track_id_2_ind = man_track[:, 0] == div_track_id_2
+                                man_track[div_track_id_1_ind, -1] = 0
+                                man_track[div_track_id_2_ind, -1] = 0
+                                div_track_id_1, div_track_id_2 = man_track[
+                                    (man_track[:, -1] == track_id_2), 0
+                                ]
+                                div_track_id_1_ind = man_track[:, 0] == div_track_id_1
+                                div_track_id_2_ind = man_track[:, 0] == div_track_id_2
+                                man_track[div_track_id_1_ind, -1] = 0
+                                man_track[div_track_id_2_ind, -1] = 0
+                            elif _isin_scalar(track_id_1, man_track[:, -1]):
+                                div_track_id_1, div_track_id_2 = man_track[
+                                    (man_track[:, -1] == track_id_1), 0
+                                ]
+                                div_track_id_1_ind = man_track[:, 0] == div_track_id_1
+                                div_track_id_2_ind = man_track[:, 0] == div_track_id_2
+                                man_track[div_track_id_1_ind, -1] = mother_id
+                                man_track[div_track_id_2_ind, -1] = mother_id
+                            elif _isin_scalar(track_id_2, man_track[:, -1]):
+                                div_track_id_1, div_track_id_2 = man_track[
+                                    (man_track[:, -1] == track_id_2), 0
+                                ]
+                                div_track_id_1_ind = man_track[:, 0] == div_track_id_1
+                                div_track_id_2_ind = man_track[:, 0] == div_track_id_2
+                                man_track[div_track_id_1_ind, -1] = mother_id
+                                man_track[div_track_id_2_ind, -1] = mother_id
 
-                        # Get indices for daughter cells in the future frame
-                        fut_ind_tgt_1 = torch.where(fut_target['track_ids_orig'] == fut_track_id_1)[0][0]
-                        fut_ind_tgt_2 = torch.where(fut_target['track_ids_orig'] == fut_track_id_2)[0][0]
+                # === Cas: la cellule est sur le point de DIVISER (fin de piste à framenb + 2 filles)
+                else:
+                    end_here = man_track[track_id_ind, 2]
+                    end_at_frame = _any_eq(end_here, framenb)
+                    two_daughters = _count_eq(man_track[:, -1], track_id) == 2
+                    if (
+                        end_at_frame
+                        and two_daughters
+                        and training_method != "dn_object"
+                    ):
+                        # GT de la mère à t
+                        box = cur_target["boxes"][ind_tgt_i].clone()
 
-                        # Get boxes for the daughter cells
-                        fut_box_1 = fut_target['boxes_orig'][fut_ind_tgt_1,:4]
-                        fut_box_2 = fut_target['boxes_orig'][fut_ind_tgt_2,:4]
-                        fut_box = torch.cat((fut_box_1,fut_box_2))
+                        fut_track_id_1, fut_track_id_2 = man_track[
+                            (man_track[:, -1] == track_id), 0
+                        ]
 
-                        # Simulate a divided cell for the current frame
-                        div_box = divide_box(box,fut_box)
+                        # indices filles à t+1
+                        fut_ind_tgt_1 = torch.where(
+                            fut_target["track_ids_orig"] == fut_track_id_1
+                        )[0][0]
+                        fut_ind_tgt_2 = torch.where(
+                            fut_target["track_ids_orig"] == fut_track_id_2
+                        )[0][0]
 
-                        # Get all potential pred boxes that could match the predicted divided cell
-                        # potential_object_query_indices = [ind_out_id for ind_out_id in torch.arange(N-num_queries,N) if ((ind_out_id not in ind_out or ind_out_id == ind_out_i) and outputs['pred_logits'][t,ind_out_id,0].sigmoid().detach() > 0.5)]
-                        potential_object_query_indices = [ind_out_id for ind_out_id in torch.arange(N-num_queries,N) if outputs['pred_logits'][t,ind_out_id,0].sigmoid().detach() > 0.5 or ind_out_id == ind_out_i] # Due to matching, if there is a early and late division adjacent to each other, this can cause issues and forces us to look at track queries as well
-            
-                        if len(potential_object_query_indices) > 1:
+                        # boîtes filles t+1
+                        fut_box_1 = fut_target["boxes_orig"][fut_ind_tgt_1, :4]
+                        fut_box_2 = fut_target["boxes_orig"][fut_ind_tgt_2, :4]
+                        fut_box = torch.cat((fut_box_1, fut_box_2))
 
-                            # Get potential pred div boxes
-                            potential_pred_boxes = outputs['pred_boxes'][t,potential_object_query_indices].detach()
+                        # simulate divided cell at t
+                        div_box = divide_box(box, fut_box)
 
-                            # Calculate iou for all combinations of pred div cells and the simulated div cell
-                            iou_div_all = generalized_box_iou(box_cxcywh_to_xyxy(potential_pred_boxes[:,:4]),box_cxcywh_to_xyxy(torch.cat((div_box[None,:4],div_box[None,4:]),axis=0)),return_iou_only=True)
+                        # candidats object queries (incluant celui déjà matché)
+                        pot_inds = []
+                        used = set([_to_int(x) for x in ind_out.tolist()])
+                        for ind_out_id in range(N - num_queries, N):
+                            if ind_out_id == _to_int(ind_out_i):
+                                pot_inds.append(ind_out_id)
+                            else:
+                                cls_ok = (
+                                    outputs["pred_logits"][
+                                        t, ind_out_id, 0
+                                    ].sigmoid().item()
+                                    > CLS_THR
+                                )
+                                if cls_ok and (ind_out_id not in used):
+                                    pot_inds.append(ind_out_id)
 
-                            # Find best matching div cells
-                            match_ind = torch.argmax(iou_div_all,axis=0).to('cpu')
+                        if len(pot_inds) > 1:
+                            potential_pred_boxes = outputs["pred_boxes"][t, pot_inds].detach()
 
-                            if potential_object_query_indices[match_ind[0]] != ind_out_i and potential_object_query_indices[match_ind[1]] != ind_out_i:
+                            iou_div_all = generalized_box_iou(
+                                box_cxcywh_to_xyxy(potential_pred_boxes[:, :4]),
+                                box_cxcywh_to_xyxy(
+                                    torch.cat(
+                                        (div_box[None, :4], div_box[None, 4:]), dim=0
+                                    )
+                                ),
+                                return_iou_only=True,
+                            )
+
+                            match_ind = torch.argmax(iou_div_all, dim=0).cpu()
+
+                            if (
+                                pot_inds[_to_int(match_ind[0])] != _to_int(ind_out_i)
+                                and pot_inds[_to_int(match_ind[1])] != _to_int(ind_out_i)
+                            ):
                                 continue
 
-                            if len(torch.unique(match_ind)) == 2: # Check that two separate div cells match best to the two simulated div cells
+                            if len(torch.unique(match_ind)) == 2:
+                                selected_pred_boxes = potential_pred_boxes[
+                                    match_ind, :4
+                                ]
+                                iou_div = calc_iou(
+                                    div_box,
+                                    torch.cat(
+                                        (
+                                            selected_pred_boxes[0],
+                                            selected_pred_boxes[1],
+                                        )
+                                    ),
+                                )
 
-                                # Get newly predicted cells
-                                selected_pred_boxes = potential_pred_boxes[match_ind,:4]
-                                iou_div = calc_iou(div_box, torch.cat((selected_pred_boxes[0],selected_pred_boxes[1])))
+                                pred_box = outputs["pred_boxes"][t, ind_out_i, :4].detach()
+                                iou = calc_iou(
+                                    box,
+                                    torch.cat((pred_box, torch.zeros_like(pred_box))),
+                                )
 
-                                pred_box = outputs['pred_boxes'][t,ind_out_i,:4].detach()
-                                iou = calc_iou(box,torch.cat((pred_box,torch.zeros_like(pred_box))))
+                                assert 0.0 <= iou_div <= 1.0 and 0.0 <= iou <= 1.0
 
-                                assert iou_div <= 1 and iou_div >= 0 and iou <= 1 and iou >= 0
+                                if (iou_div - iou > 0) and (iou_div > 0.5):
+                                    if (
+                                        calc_iou(div_box[:4], selected_pred_boxes[0])
+                                        + calc_iou(div_box[4:], selected_pred_boxes[1])
+                                        < calc_iou(div_box[4:], selected_pred_boxes[0])
+                                        + calc_iou(div_box[:4], selected_pred_boxes[1])
+                                    ):
+                                        fut_track_id_1, fut_track_id_2 = (
+                                            fut_track_id_2,
+                                            fut_track_id_1,
+                                        )
 
-                                if iou_div - iou > 0 and iou_div > 0.5:
+                                    cur_target["boxes"][ind_tgt_i] = torch.cat(
+                                        (div_box[:4], torch.zeros_like(div_box[:4]))
+                                    )
+                                    cur_target["boxes"] = torch.cat(
+                                        (
+                                            cur_target["boxes"],
+                                            torch.cat(
+                                                (div_box[4:], torch.zeros_like(div_box[:4]))
+                                            )[None],
+                                        )
+                                    )
 
-                                    if calc_iou(div_box[:4], selected_pred_boxes[0]) + calc_iou(div_box[4:], selected_pred_boxes[1]) < calc_iou(div_box[4:], selected_pred_boxes[0]) + calc_iou(div_box[:4], selected_pred_boxes[1]):
-                                        fut_track_id_1, fut_track_id_2 = fut_track_id_2, fut_track_id_1
+                                    assert cur_target["labels"][ind_tgt_i, 1] == 1
+                                    cur_target["labels"] = torch.cat(
+                                        (
+                                            cur_target["labels"],
+                                            torch.tensor([0, 1])[None, :].to(device),
+                                        )
+                                    )
+                                    cur_target["track_ids"][ind_tgt_i] = fut_track_id_1
+                                    cur_target["track_ids"] = torch.cat(
+                                        (
+                                            cur_target["track_ids"],
+                                            torch.tensor([fut_track_id_2]).to(device),
+                                        )
+                                    )
+                                    cur_target["flexible_divisions"][ind_tgt_i] = True
+                                    cur_target["flexible_divisions"] = torch.cat(
+                                        (
+                                            cur_target["flexible_divisions"],
+                                            torch.tensor([True]).to(device),
+                                        )
+                                    )
+                                    cur_target["is_touching_edge"] = torch.cat(
+                                        (
+                                            cur_target["is_touching_edge"],
+                                            cur_target["is_touching_edge"][ind_tgt_i][
+                                                None
+                                            ],
+                                        )
+                                    )
 
-                                    cur_target['boxes'][ind_tgt_i] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
-                                    cur_target['boxes'] = torch.cat((cur_target['boxes'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
+                                    ind_keep = torch.cat((ind_keep, torch.tensor([True])))
 
-                                    assert cur_target['labels'][ind_tgt_i,1] == 1
-                                    cur_target['labels'] = torch.cat((cur_target['labels'],torch.tensor([0,1])[None,].to(device)))
-                                    cur_target['track_ids'][ind_tgt_i] = fut_track_id_1
-                                    cur_target['track_ids'] = torch.cat((cur_target['track_ids'],torch.tensor([fut_track_id_2]).to(device)))
-                                    cur_target['flexible_divisions'][ind_tgt_i] = True
-                                    cur_target['flexible_divisions'] = torch.cat((cur_target['flexible_divisions'],torch.tensor([True]).to(device)))
-                                    cur_target['is_touching_edge'] = torch.cat((cur_target['is_touching_edge'],cur_target['is_touching_edge'][ind_tgt_i][None]))
+                                    ind_tgt_orig_i = torch.where(
+                                        cur_target["boxes_orig"].eq(box).all(-1)
+                                    )[0][0]
 
-                                    ind_keep = torch.cat((ind_keep,torch.tensor([True])))
+                                    cur_target["boxes_orig"][ind_tgt_orig_i] = torch.cat(
+                                        (div_box[:4], torch.zeros_like(div_box[:4]))
+                                    )
+                                    cur_target["boxes_orig"] = torch.cat(
+                                        (
+                                            cur_target["boxes_orig"],
+                                            torch.cat(
+                                                (div_box[4:], torch.zeros_like(div_box[:4]))
+                                            )[None],
+                                        )
+                                    )
 
-                                    ind_tgt_orig_i = torch.where(cur_target['boxes_orig'].eq(box).all(-1))[0][0]
-
-                                    cur_target['boxes_orig'][ind_tgt_orig_i] = torch.cat((div_box[:4],torch.zeros_like(div_box[:4])))
-                                    cur_target['boxes_orig'] = torch.cat((cur_target['boxes_orig'],torch.cat((div_box[4:],torch.zeros_like(div_box[:4])))[None]))
-
-                                    cur_target['labels_orig'] = torch.cat((cur_target['labels_orig'],torch.tensor([0,1])[None,].to(device)))
-                                    cur_target['track_ids_orig'][ind_tgt_orig_i] = fut_track_id_1
-                                    cur_target['track_ids_orig'] = torch.cat((cur_target['track_ids_orig'],torch.tensor([fut_track_id_2]).to(device)))
-                                    cur_target['flexible_divisions_orig'][ind_tgt_orig_i] = True
-                                    cur_target['flexible_divisions_orig'] = torch.cat((cur_target['flexible_divisions_orig'],torch.tensor([True]).to(device)))
-                                    cur_target['is_touching_edge_orig'] = torch.cat((cur_target['is_touching_edge_orig'],cur_target['is_touching_edge'][ind_tgt_orig_i][None]))
-
+                                    cur_target["labels_orig"] = torch.cat(
+                                        (
+                                            cur_target["labels_orig"],
+                                            torch.tensor([0, 1])[None, :].to(device),
+                                        )
+                                    )
+                                    cur_target["track_ids_orig"][ind_tgt_orig_i] = (
+                                        fut_track_id_1
+                                    )
+                                    cur_target["track_ids_orig"] = torch.cat(
+                                        (
+                                            cur_target["track_ids_orig"],
+                                            torch.tensor([fut_track_id_2]).to(device),
+                                        )
+                                    )
+                                    cur_target["flexible_divisions_orig"][
+                                        ind_tgt_orig_i
+                                    ] = True
+                                    cur_target["flexible_divisions_orig"] = torch.cat(
+                                        (
+                                            cur_target["flexible_divisions_orig"],
+                                            torch.tensor([True]).to(device),
+                                        )
+                                    )
+                                    cur_target["is_touching_edge_orig"] = torch.cat(
+                                        (
+                                            cur_target["is_touching_edge_orig"],
+                                            cur_target["is_touching_edge"][ind_tgt_orig_i][
+                                                None
+                                            ],
+                                        )
+                                    )
 
                                     if use_masks:
-                                        mask = cur_target['masks'][ind_tgt_i]
-                                        fut_mask_1 = fut_target['masks_orig'][fut_ind_tgt_1][:1]
-                                        fut_mask_2 = fut_target['masks_orig'][fut_ind_tgt_2][:1]
-                                        fut_mask = torch.cat((fut_mask_1,fut_mask_2))
-                                        div_mask = divide_mask(mask,fut_mask)
+                                        mask = cur_target["masks"][ind_tgt_i]
+                                        fut_mask_1 = fut_target["masks_orig"][
+                                            fut_ind_tgt_1
+                                        ][:1]
+                                        fut_mask_2 = fut_target["masks_orig"][
+                                            fut_ind_tgt_2
+                                        ][:1]
+                                        fut_mask = torch.cat((fut_mask_1, fut_mask_2))
+                                        div_mask = divide_mask(mask, fut_mask)
 
-                                        cur_target['masks'][ind_tgt_i] = torch.cat((div_mask[:1],torch.zeros_like(div_mask[:1])))
-                                        cur_target['masks'] = torch.cat((cur_target['masks'],torch.cat((div_mask[1:],torch.zeros_like(div_mask[:1])))[None]))
+                                        cur_target["masks"][ind_tgt_i] = torch.cat(
+                                            (div_mask[:1], torch.zeros_like(div_mask[:1]))
+                                        )
+                                        cur_target["masks"] = torch.cat(
+                                            (
+                                                cur_target["masks"],
+                                                torch.cat(
+                                                    (
+                                                        div_mask[1:],
+                                                        torch.zeros_like(div_mask[:1]),
+                                                    )
+                                                )[None],
+                                            )
+                                        )
 
-                                        cur_target['masks_orig'][ind_tgt_orig_i] = torch.cat((div_mask[:1],torch.zeros_like(div_mask[:1])))
-                                        cur_target['masks_orig'] = torch.cat((cur_target['masks_orig'],torch.cat((div_mask[1:],torch.zeros_like(div_mask[:1])))[None]))
+                                        cur_target["masks_orig"][ind_tgt_orig_i] = torch.cat(
+                                            (div_mask[:1], torch.zeros_like(div_mask[:1]))
+                                        )
+                                        cur_target["masks_orig"] = torch.cat(
+                                            (
+                                                cur_target["masks_orig"],
+                                                torch.cat(
+                                                    (
+                                                        div_mask[1:],
+                                                        torch.zeros_like(div_mask[:1]),
+                                                    )
+                                                )[None],
+                                            )
+                                        )
 
-                                    ind_out_copy = torch.cat((ind_out,torch.tensor([-10])))
+                                    # synchroniser ind_out
+                                    ind_out_copy = torch.cat((ind_out, torch.tensor([-10])))
 
-                                    if (potential_object_query_indices[match_ind[1]] != ind_out_i and potential_object_query_indices[match_ind[1]] in ind_out):
-                                        ind_out[ind_out == potential_object_query_indices[match_ind[1]]] = -1
-                                    elif (potential_object_query_indices[match_ind[0]] != ind_out_i and potential_object_query_indices[match_ind[0]] in ind_out):
-                                        ind_out[ind_out == potential_object_query_indices[match_ind[0]]] = -1
+                                    # invalider un des deux prédits si nécessaire
+                                    pot_1 = pot_inds[_to_int(match_ind[1])]
+                                    pot_0 = pot_inds[_to_int(match_ind[0])]
+                                    if pot_1 != _to_int(ind_out_i) and _isin_scalar(
+                                        pot_1, ind_out
+                                    ):
+                                        ind_out[ind_out == pot_1] = -1
+                                    elif pot_0 != _to_int(ind_out_i) and _isin_scalar(
+                                        pot_0, ind_out
+                                    ):
+                                        ind_out[ind_out == pot_0] = -1
 
-                                    ind_out = torch.cat((ind_out,torch.tensor([potential_object_query_indices[match_ind[1]]])))
-                                    ind_tgt = torch.cat((ind_tgt,torch.tensor([cur_target['boxes'].shape[0]-1])))        
+                                    ind_out = torch.cat(
+                                        (ind_out, torch.tensor([pot_1]))
+                                    )
+                                    ind_tgt = torch.cat(
+                                        (
+                                            ind_tgt,
+                                            torch.tensor([cur_target["boxes"].shape[0] - 1]),
+                                        )
+                                    )
 
-                                    ind_out[ind_out_copy == ind_out_i] = torch.tensor([potential_object_query_indices[match_ind[0]]])
+                                    ind_out[ind_out_copy == ind_out_i] = torch.tensor([pot_0])
 
-                                    if -1 in ind_out:
-                                        unmatched_box = cur_target['boxes'][ind_out == -1]
-                                        potential_object_query_indices = [ind_out_id for ind_out_id in torch.arange(N-num_queries,N) if ind_out_id not in ind_out and outputs['pred_logits'][t,ind_out_id,0].sigmoid().detach() > 0.5]
+                                    if _any(ind_out == -1):
+                                        unmatched_box = cur_target["boxes"][ind_out == -1]
+                                        # candidats restants
+                                        pot_inds2 = []
+                                        used2 = set([_to_int(x) for x in ind_out.tolist()])
+                                        for ind_out_id in range(N - num_queries, N):
+                                            if (ind_out_id not in used2) and (
+                                                outputs["pred_logits"][
+                                                    t, ind_out_id, 0
+                                                ].sigmoid().item()
+                                                > 0.5
+                                            ):
+                                                pot_inds2.append(ind_out_id)
 
-                                        if len(potential_object_query_indices) == 0:
-                                            potential_object_query_indices = [ind_out_id for ind_out_id in torch.arange(N-num_queries,N) if ind_out_id not in ind_out]
+                                        if len(pot_inds2) == 0:
+                                            for ind_out_id in range(N - num_queries, N):
+                                                if ind_out_id not in used2:
+                                                    pot_inds2.append(ind_out_id)
 
-                                        if len(potential_object_query_indices) == 0:
+                                        if len(pot_inds2) == 0:
                                             continue
 
-                                        # Get potential pred div boxes
-                                        potential_pred_boxes = outputs['pred_boxes'][t,potential_object_query_indices].detach()
+                                        potential_pred_boxes2 = outputs["pred_boxes"][
+                                            t, pot_inds2
+                                        ].detach()
 
-                                        # Calculate iou for all combinations of pred div cells and the simulated div cell
-                                        iou_div_all = generalized_box_iou(box_cxcywh_to_xyxy(potential_pred_boxes[:,:4]),box_cxcywh_to_xyxy(unmatched_box[:,:4]),return_iou_only=True)
+                                        iou_div_all2 = generalized_box_iou(
+                                            box_cxcywh_to_xyxy(potential_pred_boxes2[:, :4]),
+                                            box_cxcywh_to_xyxy(unmatched_box[:, :4]),
+                                            return_iou_only=True,
+                                        )
 
-                                        if iou_div_all.sum() == 0:
-                                            match_ind = torch.randint(low=0, high=len(potential_object_query_indices), size=(1,), dtype=torch.int)
+                                        if iou_div_all2.sum() == 0:
+                                            match_ind2 = torch.randint(
+                                                low=0,
+                                                high=len(pot_inds2),
+                                                size=(1,),
+                                                dtype=torch.int64,
+                                            )
                                         else:
-                                            match_ind = torch.argmax(iou_div_all,axis=0).to('cpu')
+                                            match_ind2 = torch.argmax(iou_div_all2, dim=0).cpu()
 
-                                        potential_object_query_ind = potential_object_query_indices[match_ind]
-                                        assert potential_object_query_ind not in ind_out
-                                        ind_out[ind_out == -1] = potential_object_query_ind
+                                        chosen = pot_inds2[_to_int(match_ind2)]
+                                        assert not _isin_scalar(chosen, ind_out)
+                                        ind_out[ind_out == -1] = chosen
 
-                                    assert -1 not in ind_out
+                                    assert not _any(ind_out == -1)
                                     assert len(ind_out) == len(ind_tgt)
-                                    assert len(cur_target['boxes']) == len(cur_target['labels'])
+                                    assert len(cur_target["boxes"]) == len(
+                                        cur_target["labels"]
+                                    )
 
-                                    fut_track_id_1_ind = man_track[:,0] == fut_track_id_1
-                                    fut_track_id_2_ind = man_track[:,0] == fut_track_id_2
+                                    fut_track_id_1_ind = man_track[:, 0] == fut_track_id_1
+                                    fut_track_id_2_ind = man_track[:, 0] == fut_track_id_2
 
-                                    man_track[track_id_ind,2] -= 1
-                                    man_track[fut_track_id_1_ind,1] -= 1
-                                    man_track[fut_track_id_2_ind,1] -= 1
+                                    man_track[track_id_ind, 2] -= 1
+                                    man_track[fut_track_id_1_ind, 1] -= 1
+                                    man_track[fut_track_id_2_ind, 1] -= 1
 
-                                    if man_track[track_id_ind,1] > man_track[track_id_ind,2]:
-                                        man_track[track_id_ind,1:] = -1
-                                        man_track[fut_track_id_1_ind,-1] = 0
-                                        man_track[fut_track_id_2_ind,-1] = 0
+                                    if _any(
+                                        man_track[track_id_ind, 1]
+                                        > man_track[track_id_ind, 2]
+                                    ):
+                                        man_track[track_id_ind, 1:] = -1
+                                        man_track[fut_track_id_1_ind, -1] = 0
+                                        man_track[fut_track_id_2_ind, -1] = 0
 
-        if training_method == 'dn_object':
-            if cur_target['num_FPs'] > 0:
-                cur_target['track_queries_fal_pos_mask'][:-cur_target['num_FPs']][cur_target['track_ids'] == -1] = True
+        if training_method == "dn_object":
+            if cur_target["num_FPs"] > 0:
+                cur_target["track_queries_fal_pos_mask"][
+                    :-cur_target["num_FPs"]
+                ][cur_target["track_ids"] == -1] = True
             else:
-                cur_target['track_queries_fal_pos_mask'][cur_target['track_ids'] == -1] = True
+                cur_target["track_queries_fal_pos_mask"][
+                    cur_target["track_ids"] == -1
+                ] = True
 
-        cur_target['boxes'] = cur_target['boxes'][ind_tgt[ind_keep].sort()[0]]
-        cur_target['labels'] = cur_target['labels'][ind_tgt[ind_keep].sort()[0]]
-        cur_target['track_ids'] = cur_target['track_ids'][ind_tgt[ind_keep].sort()[0]]
-        cur_target['flexible_divisions'] = cur_target['flexible_divisions'][ind_tgt[ind_keep].sort()[0]]
-        cur_target['is_touching_edge'] = cur_target['is_touching_edge'][ind_tgt[ind_keep].sort()[0]]
-
+        # appliquer ind_keep
+        order = ind_tgt[ind_keep].sort()[0]
+        cur_target["boxes"] = cur_target["boxes"][order]
+        cur_target["labels"] = cur_target["labels"][order]
+        cur_target["track_ids"] = cur_target["track_ids"][order]
+        cur_target["flexible_divisions"] = cur_target["flexible_divisions"][order]
+        cur_target["is_touching_edge"] = cur_target["is_touching_edge"][order]
         if use_masks:
-            cur_target['masks'] = cur_target['masks'][ind_tgt[ind_keep].sort()[0]]
+            cur_target["masks"] = cur_target["masks"][order]
 
-        if 'track_query_match_ids' in cur_target and training_method != 'dn_object': # This needs to be updated for aux outputs and enc outputs because the matcher is rerun then
-            prev_track_ids = prev_target['track_ids'][cur_target['prev_ind'][1]]
+        if "track_query_match_ids" in cur_target and training_method != "dn_object":
+            prev_track_ids = prev_target["track_ids"][cur_target["prev_ind"][1]]
 
-            # match track ids between frames
-            target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(cur_target['track_ids'])
-            cur_target['target_ind_matching'] = target_ind_match_matrix.any(dim=1)
-            cur_target['track_query_match_ids'] = target_ind_match_matrix.nonzero()[:, 1]
+            target_ind_match_matrix = prev_track_ids.unsqueeze(dim=1).eq(
+                cur_target["track_ids"]
+            )
+            cur_target["target_ind_matching"] = target_ind_match_matrix.any(dim=1)
+            cur_target["track_query_match_ids"] = target_ind_match_matrix.nonzero()[:, 1]
 
-            # For images with no cells in them, we reformat target_ind_matching so torch.cat works properly with zero cells
-            if cur_target['target_ind_matching'].shape[0] == 0:
-                cur_target['target_ind_matching'] = torch.tensor([],device=device).bool()
+            if cur_target["target_ind_matching"].shape[0] == 0:
+                cur_target["target_ind_matching"] = torch.tensor([], device=device).bool()
 
-            track_queries_mask = torch.ones_like(cur_target['target_ind_matching']).bool()
+            track_queries_mask = torch.ones_like(
+                cur_target["target_ind_matching"]
+            ).bool()
 
-            cur_target['track_queries_mask'] = torch.cat([
-                track_queries_mask,
-                torch.tensor([True,] * cur_target['num_FPs']).to(device),
-                torch.tensor([False,] * num_queries).to(device), 
-                ]).bool()
+            cur_target["track_queries_mask"] = torch.cat(
+                [
+                    track_queries_mask,
+                    torch.tensor([True] * cur_target["num_FPs"]).to(device),
+                    torch.tensor([False] * num_queries).to(device),
+                ]
+            ).bool()
 
-            cur_target['track_queries_TP_mask'] = torch.cat([
-                cur_target['target_ind_matching'],
-                torch.tensor([False,] * cur_target['num_FPs']).to(device),
-                torch.tensor([False,] * num_queries).to(device), 
-                ]).bool()
+            cur_target["track_queries_TP_mask"] = torch.cat(
+                [
+                    cur_target["target_ind_matching"],
+                    torch.tensor([False] * cur_target["num_FPs"]).to(device),
+                    torch.tensor([False] * num_queries).to(device),
+                ]
+            ).bool()
 
-            cur_target['track_queries_fal_pos_mask'] = torch.cat([
-                ~cur_target['target_ind_matching'],
-                torch.tensor([True,] * cur_target['num_FPs']).to(device),
-                torch.tensor([False,] * num_queries).to(device),
-                ]).bool()
+            cur_target["track_queries_fal_pos_mask"] = torch.cat(
+                [
+                    ~cur_target["target_ind_matching"],
+                    torch.tensor([True] * cur_target["num_FPs"]).to(device),
+                    torch.tensor([False] * num_queries).to(device),
+                ]
+            ).bool()
 
-            assert cur_target['track_queries_TP_mask'].sum() == len(cur_target['track_query_match_ids'])
+            assert (
+                cur_target["track_queries_TP_mask"].sum()
+                == len(cur_target["track_query_match_ids"])
+            )
 
         ind_out = ind_out[ind_keep]
         ind_tgt = ind_tgt[ind_keep]
 
-        while not torch.arange(len(ind_tgt))[:,None].eq(ind_tgt[None]).any(0).all():
+        # compacter ind_tgt (sans trous)
+        while not torch.arange(len(ind_tgt))[:, None].eq(ind_tgt[None]).any(0).all():
             for i in range(len(ind_tgt)):
                 if i not in ind_tgt:
                     ind_tgt[ind_tgt > i] = ind_tgt[ind_tgt > i] - 1
 
-        indices[t] = (ind_out,ind_tgt)
-        targets[t][training_method]['man_track'] = man_track
+        indices[t] = (ind_out, ind_tgt)
+        targets[t][training_method]["man_track"] = man_track
 
     return targets, indices

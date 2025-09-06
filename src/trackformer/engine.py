@@ -4,7 +4,7 @@ Train and eval functions used in main.py
 """
 import math
 import sys
-from typing import Iterable
+from typing import Iterable, Tuple, Any, Dict, List
 import numpy as np
 import PIL
 import torch
@@ -20,21 +20,286 @@ import matplotlib.pyplot as plt
 from .util import data_viz
 from .util import misc as utils
 from .util import box_ops
-from .util import data_viz
-from .datasets.transforms import Normalize,ToTensor,Compose
+from .datasets.transforms import Normalize, ToTensor, Compose
+
+import os, csv, json
+from datetime import datetime
+
+# ============================================================
+# Triplet diagnostics (non-destructif, pas de reorder/skip)
+# ============================================================
+
+class TripletStats:
+    def __init__(self):
+        self.batches = 0
+        self.constructed_triplets = 0
+        self.reordered_triplets = 0     # on ne réordonne jamais ici
+        self.skipped_batches = 0        # on ne skippe jamais ici
+        self.bad_ctc = 0
+        self.bad_nonconsecutive = 0
+        self.missing_keys = 0
+        self.bad_shape = 0
+        self.examples: List[Dict[str, Any]] = []
+
+def _triplet_log_paths(args):
+    out_dir = getattr(args, "output_dir", ".")
+    return (os.path.join(out_dir, "triplet_stats.jsonl"),
+            os.path.join(out_dir, "triplet_issues.csv"))
+
+
+def _to_int(x, default=None) -> int:
+    try:
+        if isinstance(x, torch.Tensor):
+            return int(x.item())
+        return int(x)
+    except Exception:
+        return default
+
+# alias (certain vieux bouts de code appellent _tensor_to_int)
+_tensor_to_int = _to_int
+
+def _meta_from_slot(slot_dict: Dict[str, Any], fallback_root: Dict[str, Any] = None) -> Tuple[int, int]:
+    """Récupère ctc_id/frame_id dans un sous-cible (prev/cur/fut).
+       Fallback possible depuis la cible racine si le slot ne les porte pas."""
+    ctc = _to_int(slot_dict.get("ctc_id", None))
+    fr  = _to_int(slot_dict.get("frame_id", None))
+    if (ctc is None or fr is None) and isinstance(fallback_root, dict):
+        if ctc is None: ctc = _to_int(fallback_root.get("ctc_id", None))
+        if fr  is None: fr  = _to_int(fallback_root.get("frame_id", None))
+    return ctc, fr
+
+def validate_triplet_item(item: Dict[str, Any], stats: TripletStats,
+                          keep_examples: bool=False, max_examples: int=10) -> bool:
+    """Valide un SEUL item (il contient déjà prev/cur/fut). Ne modifie rien."""
+    try:
+        main = item["main"]
+        prev = main["prev_target"]; cur = main["cur_target"]; fut = main["fut_target"]
+    except Exception:
+        stats.missing_keys += 1
+        if keep_examples and len(stats.examples) < max_examples:
+            stats.examples.append({"reason": "missing_main_or_slots"})
+        return False
+
+    ctc_prev, fr_prev = _meta_from_slot(prev, item)
+    ctc_cur,  fr_cur  = _meta_from_slot(cur,  item)
+    ctc_fut,  fr_fut  = _meta_from_slot(fut,  item)
+
+    if None in (ctc_prev, ctc_cur, ctc_fut, fr_prev, fr_cur, fr_fut):
+        stats.missing_keys += 1
+        if keep_examples and len(stats.examples) < max_examples:
+            stats.examples.append({
+                "reason": "missing_ctc_or_frame",
+                "ctc": [ctc_prev, ctc_cur, ctc_fut],
+                "fr":  [fr_prev,  fr_cur,  fr_fut],
+            })
+        return False
+
+    if not (ctc_prev == ctc_cur == ctc_fut):
+        stats.bad_ctc += 1
+        if keep_examples and len(stats.examples) < max_examples:
+            stats.examples.append({
+                "reason": "ctc_mismatch",
+                "ctc": [ctc_prev, ctc_cur, ctc_fut],
+                "fr":  [fr_prev,  fr_cur,  fr_fut],
+            })
+        return False
+
+    # ordre strict croissant ET consécutif
+    if not (fr_prev < fr_cur < fr_fut) or not (fr_prev + 1 == fr_cur and fr_cur + 1 == fr_fut):
+        stats.bad_nonconsecutive += 1
+        if keep_examples and len(stats.examples) < max_examples:
+            stats.examples.append({
+                "reason": "non_consecutive_or_bad_order",
+                "ctc": [ctc_prev, ctc_cur, ctc_fut],
+                "fr":  [fr_prev,  fr_cur,  fr_fut],
+            })
+        return False
+
+    return True
+
+def validate_triplet_batch(targets: List[Dict[str, Any]], stats: TripletStats,
+                           keep_examples: bool=False) -> float:
+    """Vérifie une liste d’items (taille = nb de centres). Ne modifie rien."""
+    stats.batches += 1
+    stats.constructed_triplets += len(targets)
+    oks = []
+    for it in targets:
+        oks.append(validate_triplet_item(it, stats, keep_examples=keep_examples))
+    return float(sum(oks)) / max(1, len(oks))
+
+# ---------- helpers pour extraire ctc_id / frame_id ----------
+def _find_key_recursive(d, key):
+    if isinstance(d, dict):
+        if key in d:
+            return d[key]
+        for v in d.values():
+            out = _find_key_recursive(v, key)
+            if out is not None:
+                return out
+    elif isinstance(d, (list, tuple)):
+        for v in d:
+            out = _find_key_recursive(v, key)
+            if out is not None:
+                return out
+    return None
+
+def _to_int(x, default=None):
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return int(x.item())
+        return int(x)
+    except Exception:
+        return default
+
+def _extract_ids_anywhere(t):
+    # Cherche ctc_id / frame_id n'importe où dans la structure
+    ctc = t.get("ctc_id", None) if isinstance(t, dict) else None
+    fr  = t.get("frame_id", None) if isinstance(t, dict) else None
+    if ctc is None: ctc = _find_key_recursive(t, "ctc_id")
+    if fr  is None: fr  = _find_key_recursive(t, "frame_id")
+    # fallback possible (selon ton dataset)
+    if fr is None: fr = _find_key_recursive(t, "framenb")
+    return _to_int(ctc), _to_int(fr)
+
+# ---------- vérifie & réordonne un batch (groupes de 3) ----------
+def _check_and_fix_triplet_batch(samples, targets, stats, keep_examples=False, max_examples=20):
+    """
+    Pour chaque triplet (t-1,t,t+1), on impose:
+      - même ctc_id
+      - frames strictement croissants ET consécutifs
+    On réordonne si possible (tri par frame + check consécutif), sinon on laisse tel quel
+    ou on rejette le batch si TRIPLET_STRICT=1 et que l'erreur est bloquante.
+    """
+    import os, numpy as _np, torch as _torch
+    strict = os.environ.get("TRIPLET_STRICT", "0") == "1"
+
+    B = len(targets) if targets is not None else 0
+    if B == 0 or (B % 3) != 0:
+        stats.bad_shape += 1
+        stats.skipped_batches += 1
+        return samples, targets, False, {"reason": "bad_shape", "B": B}
+
+    stats.batches += 1
+    triplets = B // 3
+    stats.constructed_triplets += triplets
+
+    perm = _np.arange(B, dtype=_np.int64)
+    reordered_local = 0
+
+    for g in range(0, B, 3):
+        ctcs, frms, miss = [], [], False
+        for t in targets[g:g+3]:
+            ctc, fr = _extract_ids_anywhere(t)
+            if ctc is None or fr is None:
+                miss = True
+            ctcs.append(ctc); frms.append(fr)
+
+        if miss:
+            stats.missing_keys += 1
+            if keep_examples and len(stats.examples) < max_examples:
+                stats.examples.append({"group": g//3, "reason": "missing_keys", "ctc": ctcs, "frames": frms})
+            if strict:
+                stats.skipped_batches += 1
+                return samples, targets, False, {"reason": "missing_keys", "ctc": ctcs, "frames": frms}
+            continue
+
+        if not (ctcs[0] == ctcs[1] == ctcs[2]):
+            stats.bad_ctc += 1
+            if keep_examples and len(stats.examples) < max_examples:
+                stats.examples.append({"group": g//3, "reason": "ctc_mismatch", "ctc": ctcs, "frames": frms})
+            if strict:
+                stats.skipped_batches += 1
+                return samples, targets, False, {"reason": "ctc_mismatch", "ctc": ctcs, "frames": frms}
+            continue
+
+        # Ordre par frame si nécessaire
+        if not (frms[0] < frms[1] < frms[2]):
+            order = _np.argsort(frms)
+            sorted_fr = [frms[i] for i in order]
+            if (sorted_fr[0] + 1 == sorted_fr[1]) and (sorted_fr[1] + 1 == sorted_fr[2]):
+                perm[g:g+3] = perm[g:g+3][order]
+                reordered_local += 1
+            else:
+                stats.bad_nonconsecutive += 1
+                if keep_examples and len(stats.examples) < max_examples:
+                    stats.examples.append({"group": g//3, "reason": "non_consecutive", "frames": frms})
+                if strict:
+                    stats.skipped_batches += 1
+                    return samples, targets, False, {"reason": "non_consecutive", "frames": frms}
+                continue
+        else:
+            # déjà croissants: vérifier "consécutifs"
+            if not (frms[0] + 1 == frms[1] and frms[1] + 1 == frms[2]):
+                stats.bad_nonconsecutive += 1
+                if keep_examples and len(stats.examples) < max_examples:
+                    stats.examples.append({"group": g//3, "reason": "non_consecutive", "frames": frms})
+                if strict:
+                    stats.skipped_batches += 1
+                    return samples, targets, False, {"reason": "non_consecutive", "frames": frms}
+
+    stats.reordered_triplets += reordered_local
+
+    # appliquer permutation si nécessaire
+    if not (perm == _np.arange(B)).all():
+        idx = _torch.as_tensor(perm, device=samples.tensors.device, dtype=_torch.long)
+        tensors = samples.tensors.index_select(0, idx)
+        mask = samples.mask.index_select(0, idx) if getattr(samples, "mask", None) is not None else None
+        samples = type(samples)(tensors, mask)
+        targets = [targets[i] for i in perm.tolist()]
+
+    return samples, targets, True, {"reordered_groups": int(reordered_local)}
+
+
+# ============================================================
+# Schéma de target (souple)
+# ============================================================
+
+def _assert_slot(slot: Dict[str, Any], slot_name: str):
+    for key in ['boxes', 'labels', 'track_ids', 'flexible_divisions']:
+        assert key in slot, f"missing {slot_name}.{key}"
+
+    B = slot['boxes'].shape[0]
+    # boxes: (N, 8) dans ce projet (xyxy + 2*div boxes) — on autorise >=4
+    assert slot['boxes'].ndim == 2 and slot['boxes'].shape[0] == B and slot['boxes'].shape[1] >= 4, \
+        f"bad shape for {slot_name}.boxes: {tuple(slot['boxes'].shape)}"
+
+    # labels: 1D (N,) ou 2D (N,K) suivant le dataset (ex: moma => Nx2)
+    assert slot['labels'].ndim in (1, 2), f"{slot_name}.labels must be 1D or 2D"
+    assert slot['labels'].shape[0] == B, f"{slot_name}.labels 1st dim must match boxes"
+
+    assert slot['track_ids'].shape == (B,), f"{slot_name}.track_ids must be (N,)"
+    assert slot['flexible_divisions'].shape == (B,), f"{slot_name}.flexible_divisions must be (N,)"
+
+def assert_target_schema(t: Dict[str, Any]):
+    assert 'main' in t and all(k in t['main'] for k in ['prev_target','cur_target','fut_target']), "missing main.{prev,cur,fut}_target"
+    _assert_slot(t['main']['prev_target'], 'prev_target')
+    _assert_slot(t['main']['cur_target'],  'cur_target')
+    _assert_slot(t['main']['fut_target'],  'fut_target')
+
+    # ctc_id/frame_id peuvent être au niveau racine ou au niveau des slots : on ne force pas ici
+    # mais s’ils sont présents ils doivent être scalaires
+    for key in ('ctc_id', 'frame_id'):
+        if key in t:
+            v = t[key]
+            if isinstance(v, torch.Tensor):
+                assert v.ndim == 0, f"{key} must be scalar tensor"
+
+# ============================================================
+# Perte et boucle train/val
+# ============================================================
 
 def calc_loss_for_training_methods(outputs, targets, criterion):
-
     outputs_split = {}
     losses = {}
-    training_methods =  outputs['training_methods'] # dn_object, dn_track, dn_enc
+    training_methods = outputs['training_methods']  # p.ex. ['main', 'OD', ...]
     outputs_split = {}
 
     for training_method in training_methods:
 
         target_TM = targets[0][training_method]
-        outputs_TM = utils.split_outputs(outputs,target_TM)
-        
+        outputs_TM = utils.split_outputs(outputs, target_TM)
+
         if training_method == 'main':
             if 'two_stage' in outputs:
                 outputs_TM['two_stage'] = outputs['two_stage']
@@ -44,45 +309,123 @@ def calc_loss_for_training_methods(outputs, targets, criterion):
                 outputs_split['OD'] = outputs['OD']
 
         outputs_split[training_method] = outputs_TM
-        
         losses = criterion(outputs_TM, targets, losses, training_method)
 
     outputs_split['prev_outputs'] = outputs['prev_outputs']
     outputs_split['prev_prev_outputs'] = outputs['prev_prev_outputs']
-        
     return outputs_split, losses
 
-def train_one_epoch(model: torch.nn.Module, 
-                    criterion: torch.nn.Module,
-                    data_loader: Iterable, 
-                    optimizer: torch.optim.Optimizer,
-                    epoch: int, 
-                    args,  
-                    interval: int = 50):
+# ------------------------------------------------------------
 
+def _ensure_output_dir(out_dir: Path):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+def _triplet_log_paths(args):
+    out_dir = _ensure_output_dir(getattr(args, "output_dir", "."))
+    return (out_dir / "triplet_stats.jsonl"), (out_dir / "triplet_issues.csv")
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    args,
+    interval: int = 50
+):
     dataset = 'train'
     model.train()
     criterion.train()
 
-    ids = np.concatenate(([0],np.random.randint(0,len(data_loader),args.num_plots)))
+    ids = np.concatenate(([0], np.random.randint(0, len(data_loader), args.num_plots)))
+    metrics_dict: Dict[str, Any] = {}
 
-    metrics_dict = {}
+    # triplet diag
+    triplet_stats = TripletStats()
+    stats_path, issues_path = _triplet_log_paths(args)
+    csv_initialized = False
+    log_triplet_examples = True
 
     for i, (samples, targets) in enumerate(data_loader):
-
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
 
-        outputs, targets, _, _, _ = model(samples,targets)
+        # --- check triplets (non destructif) ---
+        ok_ratio = validate_triplet_batch(targets, triplet_stats, keep_examples=log_triplet_examples)
+        if (i % 20 == 0) or (i == 0):
+            print(f"[TRIPLET-CHECK][train] batch={i}  ok_items={ok_ratio*100:.1f}%  "
+                  f"bad_ctc={triplet_stats.bad_ctc}  bad_noncons={triplet_stats.bad_nonconsecutive}  "
+                  f"missing={triplet_stats.missing_keys}", flush=True)
 
-        del _
+        # dump d’exemples problématiques (optionnel, pas bloquant)
+        if log_triplet_examples and triplet_stats.examples:
+            try:
+                if not csv_initialized:
+                    with open(issues_path, "w", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        w.writerow(["epoch", "batch", "reason", "detail"])
+                    csv_initialized = True
+                # on flush puis on clear pour ne pas dupliquer
+                with open(issues_path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    for ex in triplet_stats.examples:
+                        w.writerow([epoch, i, ex.get("reason", "?"), json.dumps(ex)])
+                triplet_stats.examples.clear()
+            except Exception as e:
+                print(f"[TRIPLET-WARN] write CSV failed: {e}", flush=True)
+
+        # schéma (souple)
+        for k in range(len(targets)):
+            try:
+                assert_target_schema(targets[k])
+            except AssertionError as e:
+                # on remonte l’erreur pour qu’elle soit visible – ici on ne “répare” rien
+                raise
+
+        # forward
+        outputs, targets, _, _, _ = model(samples, targets)
+
+        # (sanity) debug divisions 1× au début
+        if (i == 0) and getattr(args, "div_sanity_check", True):
+            utils.validate_divisions_in_targets(
+                targets,
+                training_method=getattr(args, "training_method", "main"),
+                input_target_name="prev_target",
+                output_target_name="cur_target",
+                div_event_key="gt_div"
+            )
+
+        import os as _os
+        if getattr(args, "debug_division", False) or _os.environ.get("DIVDBG") == "1":
+            for k in range(min(2, len(targets))):
+                utils.debug_div_event_alignment(
+                    targets[k],
+                    training_method=getattr(args, "training_method", "main"),
+                    input_target_name="prev_target",
+                    output_target_name="cur_target",
+                    gt_div_key="gt_div",
+                    pred_div_key="pred_div",
+                    max_print=5
+                )
+
         torch.cuda.empty_cache()
 
+        # pertes
         outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion)
-        
-        weight_dict = criterion.weight_dict
 
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys())
+        # neutralisation optionnelle de la CE CoMOT
+        weight_dict = criterion.weight_dict.copy()
+        if hasattr(args, "CoMOT_loss_ce") and not args.CoMOT_loss_ce:
+            for k in list(loss_dict.keys()):
+                if k.startswith("CoMOT_loss_ce"):
+                    loss_dict[k] = torch.nan_to_num(loss_dict[k], nan=0.0, posinf=0.0, neginf=0.0).detach() * 0.0
+            for k in list(weight_dict.keys()):
+                if k.startswith("CoMOT_loss_ce"):
+                    weight_dict[k] = 0.0
+
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
 
         if not math.isfinite(losses.item()):
@@ -98,16 +441,37 @@ def train_one_epoch(model: torch.nn.Module,
         optimizer.step()
 
         if i == 0:
-            lr = np.zeros((1,len(optimizer.param_groups)))
-            for p,param_group in enumerate(optimizer.param_groups):
-                lr[0,p] = param_group['lr']
+            lr = np.zeros((1, len(optimizer.param_groups)))
+            for p, param_group in enumerate(optimizer.param_groups):
+                lr[0, p] = param_group['lr']
 
         main_targets = [target['main']['cur_target'] for target in targets]
 
         acc_dict = {}
         if targets[0]['track']:
-            acc_dict = utils.calc_track_acc(acc_dict,outputs['main'],main_targets,args)
+            acc_dict = utils.calc_track_acc(acc_dict, outputs['main'], main_targets, args)
 
+            import os as _os2
+            if (getattr(args, "debug_division", False) or _os2.environ.get("DIVDBG") == "1") and 'dbg_div' in acc_dict:
+                d = np.array(acc_dict['dbg_div'])
+                if d.ndim == 2 and d.shape[1] == 8:
+                    sums = d[:, :6].sum(axis=0)
+                    means = np.nanmean(d[:, 6:], axis=0)
+                    g0, g1, g2, g3, g4, g5 = sums
+                    m6, m7 = means
+                elif d.ndim == 1 and d.shape[0] == 8:
+                    g0, g1, g2, g3, g4, g5, m6, m7 = d
+                else:
+                    flat = d.reshape(-1)
+                    g0, g1, g2, g3, g4, g5, m6, m7 = flat[:8]
+
+                print(f"[DIV-DBG] gt_div={int(g0)} pred_div>thr(noGT)={int(g1)} "
+                      f"pred_div>thr&GT={int(g2)} pred_div<=thr&GT={int(g3)} "
+                      f"iou_div_hits/trials={int(g4)}/{int(g5)} "
+                      f"mean_pred_div(gt)={float(m6):.3f} mean_pred_div(noGT)={float(m7):.3f}",
+                      flush=True)
+
+        # acc det
         if outputs['prev_prev_outputs'] is not None:
             det_outputs = outputs['prev_prev_outputs']
             det_targets = [target['main']['prev_prev_target'] for target in targets]
@@ -118,21 +482,67 @@ def train_one_epoch(model: torch.nn.Module,
             det_outputs = outputs['main']
             det_targets = main_targets
 
-        acc_dict = utils.calc_bbox_acc(acc_dict,det_outputs,det_targets,args)
+        acc_dict = utils.calc_bbox_acc(acc_dict, det_outputs, det_targets, args)
 
         if 'OD' in outputs:
             OD_targets = [target['OD']['cur_target'] for target in targets]
-            acc_dict = utils.calc_bbox_acc(acc_dict,outputs['OD'],OD_targets,args,text='OD_L1_')
+            acc_dict = utils.calc_bbox_acc(acc_dict, outputs['OD'], OD_targets, args, text='OD_L1_')
 
-        metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i,lr)
+        metrics_dict = utils.update_metrics_dict(metrics_dict, acc_dict, loss_dict, weight_dict, i, lr)
 
         if (i in ids and (epoch % 5 == 0 or epoch == 1)) and args.data_viz:
-            data_viz.plot_results(outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args)
+            data_viz.plot_results(
+                outputs, targets, samples.tensors, args.output_dir,
+                folder=dataset + '_outputs',
+                filename=f'Epoch{epoch:03d}_Step{i:06d}.png', args=args
+            )
 
         if i > 0 and (i % interval == 0 or i == len(data_loader) - 1):
-            utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
-    
+            utils.display_loss(metrics_dict, i, len(data_loader), epoch=epoch, dataset=dataset)
+
+        # impression finale DIV-DBG (robuste)
+        if 'dbg_div' in acc_dict:
+            d = np.array(acc_dict['dbg_div'])
+            if d.ndim == 2 and d.shape[1] == 8:
+                sums = d[:, :6].sum(axis=0)
+                means = np.nanmean(d[:, 6:], axis=0)
+                g0, g1, g2, g3, g4, g5 = sums
+                m6, m7 = means
+            elif d.ndim == 1 and d.shape[0] == 8:
+                g0, g1, g2, g3, g4, g5, m6, m7 = d
+            else:
+                flat = d.reshape(-1)
+                g0, g1, g2, g3, g4, g5, m6, m7 = flat[:8]
+
+            print(f"[DIV-DBG] gt_div={int(g0)}  pred_div>thr(noGT)={int(g1)}  "
+                  f"pred_div>thr&GT={int(g2)}  pred_div<=thr&GT={int(g3)}  "
+                  f"iou_div_hits/trials={int(g4)}/{int(g5)}  "
+                  f"mean_pred_div(gt)={float(m6):.3f}  mean_pred_div(noGT)={float(m7):.3f}",
+                  flush=True)
+
+    # --- Résumé / dump JSONL des stats triplets (train) ---
+    summary = {
+        "phase": "train",
+        "epoch": int(epoch),
+        "batches": triplet_stats.batches,
+        "constructed_triplets": triplet_stats.constructed_triplets,
+        "reordered_triplets": triplet_stats.reordered_triplets,
+        "skipped_batches": triplet_stats.skipped_batches,
+        "bad_ctc": triplet_stats.bad_ctc,
+        "bad_nonconsecutive": triplet_stats.bad_nonconsecutive,
+        "missing_keys": triplet_stats.missing_keys,
+        "bad_shape": triplet_stats.bad_shape,
+    }
+    print("[TRIPLET-STATS][train]", summary, flush=True)
+    try:
+        with open(_triplet_log_paths(args)[0], "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary) + "\n")
+    except Exception as e:
+        print(f"[TRIPLET-WARN] write stats failed: {e}", flush=True)
+
     return metrics_dict
+
+# ------------------------------------------------------------
 
 @torch.no_grad()
 def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50):
@@ -140,27 +550,85 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
     model.eval()
     criterion.eval()
     dataset = 'val'
-    ids = np.concatenate(([0],np.random.randint(0,len(data_loader),args.num_plots)))
+    ids = np.concatenate(([0], np.random.randint(0, len(data_loader), args.num_plots)))
 
-    metrics_dict = {}
+    metrics_dict: Dict[str, Any] = {}
+
+    bs = getattr(data_loader, "batch_sampler", None)
+    name = type(bs).__name__ if bs is not None else "None"
+    print(f"[VAL] batch_sampler: {name}", flush=True)
+
+    # Info seulement, pas d'assert fort ici : la validité des triplets
+    # est déjà garantie par _check_and_fix_triplet_batch plus bas.
+    if bs is None:
+        print("[VAL][WARN] DataLoader sans batch_sampler explicite (probable batch_size passé).", flush=True)
+    else:
+        if hasattr(bs, "last_batch_indices") and hasattr(bs, "build_triplet_info"):
+            try:
+                _ = bs.build_triplet_info(getattr(bs, "last_batch_indices", None))
+            except Exception as e:
+                print(f"[VAL][WARN] build_triplet_info indisponible/échec: {e}", flush=True)
+        else:
+            print("[VAL][INFO] Sampler sans build_triplet_info (OK) — validation des triplets au runtime.", flush=True)
+            
+    triplet_stats_eval = TripletStats()
+
     for i, (samples, targets) in enumerate(data_loader):
-         
         samples = samples.to(args.device)
         targets = [utils.nested_dict_to_device(t, args.device) for t in targets]
+        
+        samples, targets, ok, info = _check_and_fix_triplet_batch(
+            samples, targets, triplet_stats_eval, keep_examples=False
+        )
+        if not ok:
+            # batch invalide en mode strict (ou shape ≠ 3k) -> on log et on passe au suivant
+            print(f"[VAL][TRIPLET-FAIL] batch={i} reason={info.get('reason','?')} details={info}", flush=True)
+            continue
 
-        outputs, targets, _, _, _ = model(samples,targets)
+
+        ok_ratio = validate_triplet_batch(targets, triplet_stats_eval, keep_examples=False)
+        if (i % 20 == 0) or (i == 0):
+            print(f"[TRIPLET-CHECK][val] batch={i}  ok_items={ok_ratio*100:.1f}%  "
+                  f"bad_ctc={triplet_stats_eval.bad_ctc}  bad_noncons={triplet_stats_eval.bad_nonconsecutive}  "
+                  f"missing={triplet_stats_eval.missing_keys}", flush=True)
+
+        if i < 3:
+            print("[VAL] BATCH LEN =", len(targets))
+
+        outputs, targets, _, _, _ = model(samples, targets)
         outputs, loss_dict = calc_loss_for_training_methods(outputs, targets, criterion)
 
-        weight_dict = criterion.weight_dict
+        if (i == 0) and getattr(args, "div_sanity_check", True):
+            utils.validate_divisions_in_targets(
+                targets,
+                training_method=getattr(args, "training_method", "main"),
+                input_target_name="prev_target",
+                output_target_name="cur_target",
+                div_event_key="gt_div"
+            )
 
-        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys())
+        import os as _os
+        if getattr(args, "debug_division", False) or _os.environ.get("DIVDBG") == "1":
+            for k in range(min(2, len(targets))):
+                utils.debug_div_event_alignment(
+                    targets[k],
+                    training_method=getattr(args, "training_method", "main"),
+                    input_target_name="prev_target",
+                    output_target_name="cur_target",
+                    gt_div_key="gt_div",
+                    pred_div_key="pred_div",
+                    max_print=5
+                )
+
+        weight_dict = criterion.weight_dict
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
         loss_dict['loss'] = losses
 
         main_targets = [target['main']['cur_target'] for target in targets]
 
         acc_dict = {}
         if targets[0]['track']:
-            acc_dict = utils.calc_track_acc(acc_dict,outputs['main'],main_targets,args)
+            acc_dict = utils.calc_track_acc(acc_dict, outputs['main'], main_targets, args)
 
         if outputs['prev_prev_outputs'] is not None:
             det_outputs = outputs['prev_prev_outputs']
@@ -172,33 +640,59 @@ def evaluate(model, criterion, data_loader, args, epoch: int = None, interval=50
             det_outputs = outputs['main']
             det_targets = main_targets
 
-        acc_dict = utils.calc_bbox_acc(acc_dict,det_outputs,det_targets,args)
+        acc_dict = utils.calc_bbox_acc(acc_dict, det_outputs, det_targets, args)
 
         if 'OD' in outputs:
             OD_targets = [target['OD']['cur_target'] for target in targets]
-            acc_dict = utils.calc_bbox_acc(acc_dict,outputs['OD'],OD_targets,args,text='OD_L1_')
+            acc_dict = utils.calc_bbox_acc(acc_dict, outputs['OD'], OD_targets, args, text='OD_L1_')
 
-        metrics_dict = utils.update_metrics_dict(metrics_dict,acc_dict,loss_dict,weight_dict,i)
+        metrics_dict = utils.update_metrics_dict(metrics_dict, acc_dict, loss_dict, weight_dict, i)
 
         if i in ids and (epoch % 5 == 0 or epoch == 1) and args.data_viz:
-            data_viz.plot_results(outputs, targets,samples.tensors, args.output_dir, folder=dataset + '_outputs', filename = f'Epoch{epoch:03d}_Step{i:06d}.png', args=args)
+            data_viz.plot_results(
+                outputs, targets, samples.tensors, args.output_dir,
+                folder=dataset + '_outputs',
+                filename=f'Epoch{epoch:03d}_Step{i:06d}.png', args=args
+            )
 
-        if i > 0 and (i % interval == 0  or i == len(data_loader) - 1):
-            utils.display_loss(metrics_dict,i,len(data_loader),epoch=epoch,dataset=dataset)
+        if i > 0 and (i % interval == 0 or i == len(data_loader) - 1):
+            utils.display_loss(metrics_dict, i, len(data_loader), epoch=epoch, dataset=dataset)
+
+    summary = {
+        "phase": "val",
+        "epoch": int(epoch) if epoch is not None else -1,
+        "batches": triplet_stats_eval.batches,
+        "constructed_triplets": triplet_stats_eval.constructed_triplets,
+        "reordered_triplets": triplet_stats_eval.reordered_triplets,
+        "skipped_batches": triplet_stats_eval.skipped_batches,
+        "bad_ctc": triplet_stats_eval.bad_ctc,
+        "bad_nonconsecutive": triplet_stats_eval.bad_nonconsecutive,
+        "missing_keys": triplet_stats_eval.missing_keys,
+        "bad_shape": triplet_stats_eval.bad_shape,
+    }
+    print("[TRIPLET-STATS][val]", summary, flush=True)
+    try:
+        with open(_triplet_log_paths(args)[0], "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary) + "\n")
+    except Exception as e:
+        print(f"[TRIPLET-WARN] write stats failed: {e}", flush=True)
 
     return metrics_dict
 
+# ============================================================
+# Pipeline vidéo (inchangé sauf menues sécurités d’E/S)
+# ============================================================
 
 @torch.no_grad()
 class pipeline():
-    def __init__(self,model, fps, args, display_all_aux_outputs=False):
-        
+    def __init__(self, model, fps, args, display_all_aux_outputs=False):
+
         self.model = model
         self.display_all_aux_outputs = display_all_aux_outputs
 
         # Make a new folder with CTC folder number
-        self.output_dir = args.output_dir / fps[0].parts[-2]
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir = (Path(args.output_dir) / fps[0].parts[-2])
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.write_video = True
 
@@ -224,21 +718,20 @@ class pipeline():
 
         self.method = 'object_detection' if not self.track else 'track'
 
-        # Image needs to be normalized same as ResNet 
+        # Image normalization (comme ResNet)
         self.normalize = Compose([ToTensor(), Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
-        # Get attention maps for self attention in deocder (too info for a full movie. only use this for a couple of frames)
+        # hooks (optionnels)
         self.use_hooks = False
         if self.use_hooks:
             (self.output_dir / self.data_viz_folder / 'attn_weight_maps').mkdir(exist_ok=True)
 
-        # Because target size is stored as a string within the yaml file, we have to convert it back into a number
-        if isinstance(self.target_size[0],str):
+        if isinstance(self.target_size[0], str):
             self.target_size = literal_eval(self.target_size)
 
         np.random.seed(1)
 
-        # Set colors; we set the first six colors as primary colors
+        # couleurs
         self.all_colors = np.array([tuple((255*np.random.random(3))) for _ in range(10000)])
         self.all_colors[:6] = np.array([[0.,0.,255.],[0.,255.,0.],[255.,0.,0.],[255.,0.,255.],[0.,255.,255.],[255.,255.,0.]])
         self.all_colors = np.concatenate((self.all_colors, np.array([[127.5,127.5,0.],[0.,127.5,0.],[0.,0.,127.5],[0.,127.5,127.5],[127.5,0.,0.],[255.,127.5,255.],[255.,127.5,0.],[127.5,255.,127.5],[255.,255.,127.5],[127.5,127.5,255.],[50.,200,200],[255.,127.5,127.5],[75,75,150.],[127.5,255.,255.],[255.,255.,255.],[127.5,127.5,127.5]])))
@@ -246,23 +739,19 @@ class pipeline():
         if args.two_stage:
             (self.output_dir.parent / 'two_stage').mkdir(exist_ok=True)
             (self.output_dir / self.data_viz_folder / 'two_stage').mkdir(exist_ok=True)
-            # final_fmap = np.array([self.target_size[0] // 32, self.target_size[1] // 32])
-            # self.enc_map = [np.zeros((final_fmap[0]*2**f,final_fmap[1]*2**f)) for f in range(args.num_feature_levels)][::-1]
             self.enc_map = None
         else:
-            self.query_box_locations = [np.zeros((0,4)) for i in range(args.num_queries)]
-        
-        self.query_box_locations = [np.zeros((0,4)) for i in range(args.num_queries)]
+            self.query_box_locations = [np.zeros((0,4)) for _ in range(args.num_queries)]
+
+        self.query_box_locations = [np.zeros((0,4)) for _ in range(args.num_queries)]
 
         self.display_decoder_aux = True if args.dataset == 'moma' else False
-
         if self.display_decoder_aux:
             (self.output_dir / self.data_viz_folder / 'decoder_bbox_outputs').mkdir(exist_ok=True)
-            # Number of deocder frames in a video to display (selected randomly)
             self.num_decoder_frames = 1
 
-        img = PIL.Image.open(fps[0],mode='r')
-        self.color_stack = np.zeros((len(fps),img.size[1],img.size[0],3))
+        img = PIL.Image.open(fps[0], mode='r')
+        self.color_stack = np.zeros((len(fps), img.size[1], img.size[0], 3))
 
         if np.max(img) < 2**8:
             self.max_val = 255
@@ -270,340 +759,220 @@ class pipeline():
             self.max_val = 2**12-1
         else:
             self.max_val = 2**16-1
-                    
-    def update_query_box_locations(self,pred_boxes):
-        # This is only used to display to reference points for object queries that are detected
 
-        oq_boxes = pred_boxes[self.object_indices,:4].cpu().numpy()
-
+    def update_query_box_locations(self, pred_boxes):
+        oq_boxes = pred_boxes[self.object_indices, :4].cpu().numpy()
         oq_boxes[:,1::2] = np.clip(oq_boxes[:,1::2] * self.target_size[0], 0, self.target_size[0])
         oq_boxes[:,0::2] = np.clip(oq_boxes[:,::2] * self.target_size[1], 0, self.target_size[1])
 
         oq_indices_norm = (self.object_indices - self.num_TQs)
-        for oq_ind, oq_box in zip(oq_indices_norm,oq_boxes):
-            self.query_box_locations[oq_ind] = np.append(self.query_box_locations[oq_ind], oq_box[None],axis=0)
+        for oq_ind, oq_box in zip(oq_indices_norm, oq_boxes):
+            self.query_box_locations[oq_ind] = np.append(self.query_box_locations[oq_ind], oq_box[None], axis=0)
 
     def split_up_divided_cells(self):
-
-        self.div_track = -1 * np.ones((len(self.all_indices) + len(self.div_indices)),dtype=np.uint16) # keeps track of which cells were the result of cell division
+        self.div_track = -1 * np.ones((len(self.all_indices) + len(self.div_indices)), dtype=np.uint16)
         nb_divs = 0
         for div_ind in self.div_indices:
-            ind = np.where(self.all_indices==div_ind)[0][0]
-
-            self.max_cellnb += 1             
-            self.cells = np.concatenate((self.cells[:ind+1],[self.max_cellnb],self.cells[ind+1:])) # add daughter cellnb after mother cellnb
-            self.all_indices = np.concatenate((self.all_indices[:ind],self.all_indices[ind:ind+1],self.all_indices[ind:])) # order doesn't matter here since they are the same track indices
-            self.track_indices = np.concatenate((self.track_indices[:ind],self.track_indices[ind:ind+1],self.track_indices[ind:])) # order doesn't matter here since they are the same track indices
-
-            self.div_track[ind:ind+2] = div_ind 
+            ind = np.where(self.all_indices == div_ind)[0][0]
+            self.max_cellnb += 1
+            self.cells = np.concatenate((self.cells[:ind+1], [self.max_cellnb], self.cells[ind+1:]))
+            self.all_indices = np.concatenate((self.all_indices[:ind], self.all_indices[ind:ind+1], self.all_indices[ind:]))
+            self.track_indices = np.concatenate((self.track_indices[:ind], self.track_indices[ind:ind+1], self.track_indices[ind:]))
+            self.div_track[ind:ind+2] = div_ind
             nb_divs += 1
-
         self.object_indices += nb_divs
 
-        # Used for data visualization; highlights cells that were detected, not tracked
         if self.i > 0:
             self.new_cells = self.cells == 0
-
         if 0 in self.cells:
-            self.max_cellnb += 1   
-            self.cells[self.cells==0] = np.arange(self.max_cellnb,self.max_cellnb+sum(self.cells==0),dtype=np.uint16)
-            
-            # Update the max cellnb
+            self.max_cellnb += 1
+            self.cells[self.cells == 0] = np.arange(self.max_cellnb, self.max_cellnb + sum(self.cells == 0), dtype=np.uint16)
             self.max_cellnb = np.max(self.cells)
 
-    def update_div_boxes(self,pred_boxes,pred_masks=None):
-        # boxes where div_indices were repeat; now they need to be rearrange because only the first box is sent to decoder
+    def update_div_boxes(self, pred_boxes, pred_masks=None):
         unique_divs = np.unique(self.div_track[self.div_track != -1])
         for unique_div in unique_divs:
             div_ids = (self.div_track == unique_div).nonzero()[0]
-            pred_boxes[div_ids[1],:4] = pred_boxes[div_ids[0],4:]
-            # e.g. [[15, 45, 16, 22, 14, 62, 15, 20]   -->  [[15, 45, 16, 22, 14, 62, 15, 20]   -->  [[15, 45, 16, 22]  --> fed to decoder
-            #       [15, 45, 16, 22, 14, 62, 15, 20]]  -->   [14, 62, 15, 20, 14, 62, 15, 20]]  -->   [14, 62, 15, 20]]  --> fed to decoder
-
+            pred_boxes[div_ids[1], :4] = pred_boxes[div_ids[0], 4:]
             if pred_masks is not None:
-                pred_masks[div_ids[1],:1] = pred_masks[div_ids[0],1:] 
+                pred_masks[div_ids[1], :1] = pred_masks[div_ids[0], 1:]
+        return pred_boxes[:, :4], pred_masks[:, 0]
 
-        return pred_boxes[:,:4], pred_masks[:,0]   
-    
-    def preprocess_img(self,fp):
-
-        self.img = cv2.imread(str(fp),cv2.IMREAD_ANYDEPTH)
-        ### This is the preprocessing when converting the CTC to COCO - maybe we want to chnage this for the future as 8 bti is less info than 16 bit
+    def preprocess_img(self, fp):
+        self.img = cv2.imread(str(fp), cv2.IMREAD_ANYDEPTH)
         self.img = self.img / np.max(self.img)
         self.img = (255 * self.img).astype(np.uint8)
-        ###
         img = PIL.Image.fromarray(self.img)
         self.img_size = img.size
-        
-        img_resized = img.resize((self.target_size[1],self.target_size[0])).convert('RGB')
-
+        img_resized = img.resize((self.target_size[1], self.target_size[0])).convert('RGB')
         samples = self.normalize(img_resized)[0][None]
-        samples = samples.to(self.device)            
-
+        samples = samples.to(self.device)
         return samples
-    
-    def get_track_object_div_indices(self,pred_logits):
 
+    def get_track_object_div_indices(self, pred_logits):
         N,_ = pred_logits.shape
         self.num_TQs = N - self.num_queries
-
         keep = (pred_logits[:,0] > self.threshold)
         keep_div = (pred_logits[:,1] > self.threshold)
-        keep_div[-self.num_queries:] = False # disregard any divisions predicted by object queries; model should have learned not to do this anyways
+        keep_div[-self.num_queries:] = False
         keep_div[~keep] = False
-            
-        all_indices = keep.nonzero()[0] # Get query indices (object or track) where a cell was detected / tracked; this is used to create track queries for next  frame
-        track_indices = np.array([ind for ind in all_indices if ind < self.num_TQs],dtype=int)
-        object_indices = np.array([ind for ind in all_indices if ind >= self.num_TQs],dtype=int)
-        div_indices = keep_div.nonzero()[0] # Get track query indices where a cell division was tracked; object queries should not be able to detect divisions
-
+        all_indices = keep.nonzero()[0]
+        track_indices = np.array([ind for ind in all_indices if ind < self.num_TQs], dtype=int)
+        object_indices = np.array([ind for ind in all_indices if ind >= self.num_TQs], dtype=int)
+        div_indices = keep_div.nonzero()[0]
         return all_indices, track_indices, object_indices, div_indices
-    
-    def post_process_masks(self,masks,boxes):
 
-        # Resize mask to original size
-        masks = cv2.resize(np.transpose(masks.cpu().numpy(),(1,2,0)),self.img_size) # regardless of cropping / resize, segmentation is 2x smaller than the original image                                
-        masks = masks[:,:,None] if masks.ndim == 2 else masks # cv2.resize will drop last dim if it is 1
-        masks = np.transpose(masks,(-1,0,1))
+    def post_process_masks(self, masks, boxes):
+        masks = cv2.resize(np.transpose(masks.cpu().numpy(), (1,2,0)), self.img_size)
+        masks = masks[:,:,None] if masks.ndim == 2 else masks
+        masks = np.transpose(masks, (-1,0,1))
 
-        # Get max pixel value across all segmentations and then threshold
         masks_filt = np.zeros((masks.shape))
-        argmax = np.argmax(masks,axis=0)
+        argmax = np.argmax(masks, axis=0)
         for m in range(masks.shape[0]):
-            masks_filt[m,argmax==m] = masks[m,argmax==m]
-            
+            masks_filt[m, argmax==m] = masks[m, argmax==m]
         masks = masks_filt > self.mask_threshold
 
-        # If a mask has no area, we remove it regardless of the bounding box prediction
-        keep_all_cells = np.ones(len(self.all_indices),dtype=bool)
-        keep_track_cells = np.ones(len(self.track_indices),dtype=bool)
-        keep_object_cells = np.ones(len(self.object_indices),dtype=bool)
-        keep_div_cells = np.ones(len(self.div_indices),dtype=bool)
+        keep_all_cells = np.ones(len(self.all_indices), dtype=bool)
+        keep_track_cells = np.ones(len(self.track_indices), dtype=bool)
+        keep_object_cells = np.ones(len(self.object_indices), dtype=bool)
+        keep_div_cells = np.ones(len(self.div_indices), dtype=bool)
 
-        # Keep largest segmentation per mask by area; we don't want multiple objects/cells/segmentations per mask; assume the largets is correct
-        for m,mask in enumerate(masks):
+        for m, mask in enumerate(masks):
             if mask.sum() > 0:
-                # label each segmentation for a mask
                 label_mask = label(mask)
                 labels = np.unique(label_mask)
                 labels = labels[labels != 0]
-
-                # Find largest segmentation and remove all other segmentations 
                 largest_ind = np.argmax(np.array([label_mask[label_mask == label].sum() for label in labels]))
-                new_mask = np.zeros_like(mask,dtype=bool)
+                new_mask = np.zeros_like(mask, dtype=bool)
                 new_mask[label_mask == labels[largest_ind]] = True
                 masks[m] = new_mask
-
-            else: # Embedding was predicted to be a cell but there is no cell mask so we remove it
-                keep_all_cells[m] = False # Remove track/object index
-
-                # Update track and object queries
+            else:
+                keep_all_cells[m] = False
                 if self.all_indices[m] < self.num_TQs:
                     keep_track_cells[m] = False
                 else:
                     keep_object_cells[m - len(self.track_indices)] = False
                     assert len(self.all_indices) - len(self.object_indices) == len(self.track_indices)
-
                 index = self.all_indices[self.cells == self.cells[m]][0]
-        
-                # If cell was part of division, we need to change it from cell division to regular tracking
-                if index in self.div_indices:          
-
-                    keep_div_cells[self.div_indices == index] = False # Remove division indiex
-
+                if index in self.div_indices:
+                    keep_div_cells[self.div_indices == index] = False
                     self.div_track[self.div_track == index] = -1
-
-                    # Since there is no division, update other divided cell with the mother number since it is just being tracked
                     if index < self.num_TQs and self.prevcells[index] not in self.cells:
                         other_div_cell = self.cells[(self.div_track == index) * (self.cells != self.cells[m])]
                         self.cells[self.cells == other_div_cell] = self.prevcells[index]
-                    else:
-                        a=0
-                            
 
         self.cells = self.cells[keep_all_cells]
         self.all_indices = self.all_indices[keep_all_cells]
-
         self.track_indices = self.track_indices[keep_track_cells]
         self.object_indices = self.object_indices[keep_object_cells]
-
         self.div_indices = self.div_indices[keep_div_cells]
         self.div_track = self.div_track[keep_all_cells]
-
         masks = masks[keep_all_cells]
         boxes = boxes[keep_all_cells]
-
         self.num_TQs -= (~keep_track_cells).sum()
-
         return masks, boxes
-    
+
     def reset_vars(self):
-                
         self.all_indices = None
         self.track_indices = None
         self.object_indices = None
-        self.div_track = -1 * np.ones(len(self.cells),dtype=np.uint16)
+        self.div_track = -1 * np.ones(len(self.cells), dtype=np.uint16)
         self.new_cells = None
 
     def forward(self):
-
         print(f'video {self.fps[0].parts[-2]}')
-        
+
         if self.display_decoder_aux:
-            random_nbs = np.random.choice(np.arange(1,len(self.fps)),self.num_decoder_frames)
-            random_nbs = np.concatenate((random_nbs,random_nbs+1)) # so we can see two consecutive frames
+            random_nbs = np.random.choice(np.arange(1, len(self.fps)), self.num_decoder_frames)
+            random_nbs = np.concatenate((random_nbs, random_nbs+1))
 
         ctc_data = np.zeros((0,4))
-
-        targets = [{'main': {'cur_target':{}}}]
+        targets = [{'main': {'cur_target': {}}}]
         self.max_cellnb = 0
         self.cells = np.zeros((0))
 
         for i, fp in enumerate(tqdm(self.fps)):
-
             self.reset_vars()
             self.fp = fp
             self.i = i
 
-            # This will display self attention map for deocder for all layer for self.num_decoder_frames
             if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
                 dec_attn_outputs = []
                 hooks = [self.model.decoder.layers[layer_index].self_attn.register_forward_hook(lambda self, input, output: dec_attn_outputs.append(output)) for layer_index in range(len(self.model.decoder.layers))]
 
             samples = self.preprocess_img(fp)
-
             with torch.no_grad():
-                outputs, targets, _, _, _ = self.model(samples,targets=targets)                
+                outputs, targets, _, _, _ = self.model(samples, targets=targets)
 
             pred_logits = outputs['pred_logits'][0].sigmoid().cpu().numpy()
-
             self.all_indices, self.track_indices, self.object_indices, self.div_indices = self.get_track_object_div_indices(pred_logits)
 
-            # Keep track of cell numbers from the previous frame that correspond to the track queries
             self.prevcells = np.copy(self.cells)
-            self.cells = np.zeros((len(self.all_indices)),dtype=np.uint16)
+            self.cells = np.zeros((len(self.all_indices)), dtype=np.uint16)
 
             if len(self.all_indices) > 0:
-
-                # Update cell numbers with track queries that were successfully tracked
                 self.cells[:len(self.track_indices)] = self.prevcells[self.track_indices]
-
-                # Indices for track queries that divide are duplicated since there are two cells for one query
                 self.split_up_divided_cells()
 
-                # Get predicted boxes and masks
-                boxes = outputs['pred_boxes'][0][self.all_indices] # For div_indices, the boxes will be repeated and will properly updated below
-
+                boxes = outputs['pred_boxes'][0][self.all_indices]
+                masks = None
                 if self.masks:
                     masks = outputs['pred_masks'][0].sigmoid()[self.all_indices]
 
-                # Track queries that were predicted to be divisions need to split into separate boxes/masks
-                boxes, masks = self.update_div_boxes(boxes,masks)
-
-                # post-process mask; need to get max pixel value across all segmentations and then threshold into a binary mask
+                boxes, masks = self.update_div_boxes(boxes, masks)
                 if self.masks:
                     masks, boxes = self.post_process_masks(masks, boxes)
 
                 if self.track:
-                    # 'hs_embed' is used as the content embedding for the track queries
-                    targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0,self.all_indices] # For div_indices, hs_embeds will be the same; no update
-
-                    # 'track_query_boxes' are used as the positional embeddings for the track queries
-                    # You can use the bounding box or mask as a positional embedding; default is to use the mask
+                    targets[0]['main']['cur_target']['track_query_hs_embeds'] = outputs['hs_embed'][0, self.all_indices]
                     if self.args.init_boxes_from_masks:
-                        boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks),cxcywh=True).to(self.device)
+                        boxes_encoded_from_masks = box_ops.masks_to_boxes(torch.tensor(masks), cxcywh=True).to(self.device)
                         targets[0]['main']['cur_target']['track_query_boxes'] = boxes_encoded_from_masks
                     else:
                         targets[0]['main']['cur_target']['track_query_boxes'] = boxes
 
                 boxes = boxes.cpu().numpy()
-
                 assert boxes.shape[0] == len(self.cells)
             else:
                 boxes = None
                 masks = None
 
-            # If no objects are detected, skip
-            # if not self.two_stage and len(self.object_indices) > 0:
             if True:
                 self.update_query_box_locations(outputs['pred_boxes'][0])
 
             if self.img.ndim == 2:
-                self.img = np.repeat(self.img[:,:,None],3,-1)
+                self.img = np.repeat(self.img[:,:,None], 3, -1)
 
             if self.track:
-                color_frame = data_viz.plot_tracking_results(self.img,boxes,masks,self.all_colors[self.cells-1],self.div_track,self.new_cells)
+                color_frame = data_viz.plot_tracking_results(self.img, boxes, masks, self.all_colors[self.cells-1], self.div_track, self.new_cells)
             else:
-                color_frame = data_viz.plot_tracking_results(self.img,boxes,masks,self.all_colors[:len(self.cells)],self.div_track,None)
+                color_frame = data_viz.plot_tracking_results(self.img, boxes, masks, self.all_colors[:len(self.cells)], self.div_track, None)
 
             assert np.max(color_frame) <= 255 and np.min(color_frame) >= 0
-
-            # ### Need for paper
-            # # Scale bar - don't delete until paper is publsihed
-            # if i < 10 and self.fps[0].parts[-2] == '10':
-            #     blah = np.copy(color_frame)
-            #     # if i == 0:
-            #     #     blah[10:12,5:20] = 255
-            #     # cv2.imwrite(f'/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/moma/test/CTC/20/color_frames/frame{i:03d}.png',blah)
-            #     cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_pred.png',blah)
-            #     cv2.imwrite('/projectnb/dunlop/ooconnor/MOT/models/cell-trackformer/results/DynamicNuclearNet-tracking-v1_0/test/CTC' + '/' + self.fps[0].parts[-2] + f'/color_frames/frame{i:03d}_img.png',self.img)
-
-            # min = i * 5
-            # hr = min // 60
-            # rem_min = min % 60
-
-            # color_frame = cv2.putText(
-            #     color_frame,
-            #     # text = f'{i:03d}', 
-            #     text = f'{hr:01d} hr', 
-            #     org=(0,10), 
-            #     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-            #     fontScale = 0.4,
-            #     color = (255,255,255),
-            #     thickness=1,
-            #     )
-
-            # # color_frame = np.concatenate((color_frame,np.zeros((color_frame.shape[0],20,3))),1)
-
-            # color_frame = cv2.putText(
-            #     color_frame,
-            #     # text = f'{rem_min:02d} min', 
-            #     text = f'{min:03d} min', 
-            #     # org=(0,10), 
-            #     org=(0,20), 
-            #     fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
-            #     fontScale = 0.4,
-            #     color = (255,255,255),
-            #     thickness=1,
-            #     )
-
-            # ### Need for paper
-
-            self.color_stack[i] = color_frame         
+            self.color_stack[i] = color_frame
 
             if self.use_hooks and ((self.display_decoder_aux and i in random_nbs) or (self.display_all_aux_outputs and i > 0)):
                 for hook in hooks:
                     hook.remove()
-
                 self.display_attn_maps(dec_attn_outputs)
 
             if masks is not None:
-                ctc_data = self.save_ctc(ctc_data,masks)
+                ctc_data = self.save_ctc(ctc_data, masks)
 
             if i == 0:
                 self.display_two_stage(outputs)
 
             display_proposal_index_on_img = False
-
             if self.display_all_aux_outputs and i in random_nbs:
                 self.display_aux_preds(outputs)
                 display_proposal_index_on_img = True
-            
+
             if 'two_stage' in outputs:
-                self.save_enc_map(outputs,display_proposal_index_on_img)
+                self.save_enc_map(outputs, display_proposal_index_on_img)
 
             torch.cuda.empty_cache()
-                
+
             if len(self.all_indices) == 0:
                 self.prevcells = None
 
@@ -617,14 +986,13 @@ class pipeline():
             self.display_enc_map()
 
         if ctc_data is not None and self.masks:
-            np.savetxt(self.output_dir / 'res_track.txt',ctc_data,fmt='%d')
+            np.savetxt(self.output_dir / 'res_track.txt', ctc_data, fmt='%d')
 
         if self.write_video:
             self.save_video()
 
         if not self.two_stage:
             self.save_object_query_box_locations(outputs)
-
 
     def save_ctc(self,ctc_data,masks):
 

@@ -2,15 +2,11 @@
 
 import os
 import glob
+import sys
 
 import torch
-
-from torch.utils.cpp_extension import CUDA_HOME
-from torch.utils.cpp_extension import CppExtension
-from torch.utils.cpp_extension import CUDAExtension
-
-from setuptools import find_packages
-from setuptools import setup
+from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
+from setuptools import find_packages, setup
 
 requirements = ["torch", "torchvision"]
 
@@ -31,14 +27,32 @@ def get_extensions():
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]
-        extra_compile_args["nvcc"] = [
-            "-DCUDA_HAS_FP16=1",
-            "-D__CUDA_NO_HALF_OPERATORS__",
-            "-D__CUDA_NO_HALF_CONVERSIONS__",
-            "-D__CUDA_NO_HALF2_OPERATORS__",
-        ]
+
+        if sys.platform == "win32":
+             # Flags pour MSVC
+            extra_compile_args["cxx"] = ["/O2"]
+            extra_compile_args["nvcc"] = [
+                "-allow-unsupported-compiler",
+                "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+                "-DCUDA_HAS_FP16=1",
+                "-D__CUDA_NO_HALF_OPERATORS__",
+                "-D__CUDA_NO_HALF_CONVERSIONS__",
+                "-D__CUDA_NO_HALF2_OPERATORS__",
+                "--use_fast_math"
+            ]
+        else:
+            # Flags GCC/Linux
+            extra_compile_args["cxx"] = ["-O3"]
+            extra_compile_args["nvcc"] = [
+                "-DCUDA_HAS_FP16=1",
+                "-D__CUDA_NO_HALF_OPERATORS__",
+                "-D__CUDA_NO_HALF_CONVERSIONS__",
+                "-D__CUDA_NO_HALF2_OPERATORS__",
+                "--use_fast_math",
+                "-Xcompiler", "-Wall"
+            ]
     else:
-        raise NotImplementedError('Cuda is not available')
+        raise NotImplementedError("Cuda is not available")
 
     sources = [os.path.join(extensions_dir, s) for s in sources]
     include_dirs = [extensions_dir]
@@ -60,7 +74,6 @@ setup(
     url="xxx",
     description="Multi-Scale Deformable Attention Module in Deformable DETR",
     packages=find_packages(exclude=("configs", "tests",)),
-    # install_requires=requirements,
     ext_modules=get_extensions(),
     cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
 )

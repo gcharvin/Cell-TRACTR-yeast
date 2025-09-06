@@ -1,9 +1,9 @@
 tracking: true
-freeze_backbone: False
-freeze_backbone_and_encoder: False
+freeze_backbone: false
+freeze_backbone_and_encoder: false
 lr: 0.0002
 lr_backbone_names: ['backbone.0']
-lr_backbone: 0.00002
+lr_backbone: 0.00005
 lr_linear_proj_names: ['reference_points', 'sampling_offsets']
 lr_linear_proj_mult: 0.1
 lr_track: 0.0001
@@ -13,9 +13,9 @@ batch_size: 2
 weight_decay: 0.0001
 epochs: 12
 lr_drop: 11
-target_size: (256,32)
+target_size: (137,66)
 # Number of object queries
-num_queries: 60
+num_queries: 48
 # Flexible divisions
 flex_div: false
 # Tracking 2 sequential frames - use prev_prev, prev and cur frame (detection 1 frame and track for 2 frames - 3 frames total)
@@ -38,7 +38,7 @@ freeze_detr: false
 load_mask_head_from_model: null
 # Backbone
 # Name of the convolutional backbone to use. ('resnet18, resnet34, resnet50', 'resnet101')
-backbone: resnet18
+backbone: resnet50
 # If true, we replace stride with dilation in the last convolutional block (DC5)
 dilation: false
 # Type of positional embedding to use on top of the image features. ('sine', 'learned')
@@ -85,7 +85,7 @@ share_bbox_layers: false
 # COMOT is a paper that used the first X decoder layers to simultaneously track and detect and used the last layer solely for tracking
 CoMOT: true
 # COMOT - determines if loss is backpropgated over COMOT loss for cross-entropy (class)
-CoMOT_loss_ce: true
+CoMOT_loss_ce: false
 # Use masks to generate the bounding boxes that are fed to next decoder + to next frame
 init_boxes_from_masks: true
 # Embeddings to differentiate object vs track queries
@@ -133,14 +133,14 @@ dice_loss_coef: 5.0
 mask_loss_coef: 5.0
 mask_weight_target_cell_coef: 2.0
 mask_weight_all_cells_coef: 10.0
-div_loss_coef: 20
-track_div_loss_coef: 3
+div_loss_coef: 5.0 
+track_div_loss_coef: 2.0
 dn_object_coef: 1.0
 dn_track_coef: 1.0
 FN_det_query_loss_coef: 2.0
-object_queries_loss_coef: 1.0
+object_queies_loss_coef: 1.0
 touching_edge_loss_coef: 0.2
-flex_div_loss_coef: 0.4
+flex_div_loss_coef: 0.
 # Relative classification weight of the no-object class
 eos_coef: 0.1
 focal_loss: true
@@ -152,19 +152,19 @@ dataset: moma
 num_plots: 10
 # Miscellaneous
 # path where to save, empty for no saving
-output_dir: C:\Users\charvin\SynologyDrive\results\
-data_dir: C:\Users\charvin\SynologyDrive\Data\
+output_dir: C:/Users/charvin/SynologyDrive/Data/DetecDivProjects/anais/bud4/classification/my_classi_6/results/my_classi_6
+data_dir: C:/Users/charvin/SynologyDrive/Data/DetecDivProjects/anais/bud4/classification/my_classi_6/trainingdataset
 # device to use for training / testing
 device: cuda
 seed: 42
 # resume from checkpoint
 resume: ''
-resume_shift_neuron: False
+resume_shift_neuron: false
 # resume optimization from checkpoint
 resume_optim: true
 start_epoch: 1
 eval_only: false
-num_workers: 0
+num_workers: 4
 val_interval: 5
 debug: false
 # epoch interval for model saving. if 0 only save last and best models
@@ -175,10 +175,11 @@ world_size: 1
 # url used to set up distributed training
 dist_url: env://
 cls_threshold: 0.35
-iou_threshold: 0.5
+iou_threshold: 0.55
 # Data Viz
-data_viz: False
+data_viz: false
 # Data Viz - show all 
-display_all: False
-hooks: False
-avg_attn_weight_maps: True
+display_all: false
+hooks: false
+avg_attn_weight_maps: true
+dataset: moma

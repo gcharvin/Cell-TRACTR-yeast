@@ -63,77 +63,116 @@ class CocoDetection(torchvision.datasets.CocoDetection):
     def _getitem_from_id(self, image_id, framenb, random_state=None):
 
         img_raw, annotations = super(CocoDetection, self).__getitem__(image_id)
+        
+        
+        
+                # Récupère les métadonnées "image" côté COCO
+        img_info = self.coco.loadImgs(self.ids[image_id])[0]
+        # ctc_id peut être "01", on l’extrait de façon robuste
+        import re
+        ctc_raw = img_info.get("ctc_id", img_info.get("man_track_id", ""))
+        m = re.findall(r"\d+", str(ctc_raw))
+        ctc_id_val = int(m[-1]) if m else -1
+
+        # frame_id : meta COCO ou fallback sur l’argument framenb
+        frame_id_val = int(img_info.get("frame_id", int(framenb)))
+
+        # stocke provisoirement pour réinjection après transforms
+        _target_meta = {"ctc_id": ctc_id_val, "frame_id": frame_id_val}
+
+        # --- infos COCO ---
+        coco_img_id = int(self.ids[image_id])
+        img_info = self.coco.imgs.get(coco_img_id) if hasattr(self.coco, "imgs") else self.coco.loadImgs([coco_img_id])[0]
+        file_name = img_info.get("file_name", "")
+
+        # préférer les champs écrits par ton export (ints)
+        ctc_id  = img_info.get("ctc_id", None)
+        frame_id = img_info.get("frame_id", None)
+
+        # fallback: parser depuis le file_name "CTC_<seq>_frame_<fr>.tif"
+        if ctc_id is None or frame_id is None:
+            m = re.search(r"CTC_(\d+)_frame_(\d+)\.(?:tif|tiff|png|jpg|jpeg)$",
+                        os.path.basename(file_name), flags=re.IGNORECASE)
+            if m:
+                if ctc_id is None:
+                    ctc_id = int(m.group(1))
+                if frame_id is None:
+                    frame_id = int(m.group(2))
+        # ultime secours pour éviter None -> tensor
+        if ctc_id is None:
+            ctc_id = -1
+        if frame_id is None:
+            frame_id = -1
+
+        # >>> IMPORTANT: tout ce qui doit aller sur device = Tensor
         target = {
-            'image_id': torch.tensor(self.ids[image_id]),
-            'annotations': annotations,
-            'framenb': torch.tensor(framenb),
-            'dataset': self.dataset_type,
-            'target_size': self.target_size,
+            'image_id': torch.tensor(coco_img_id, dtype=torch.int64),
+            'annotations': annotations,            # list de dicts (gérée en aval)
+            'framenb': torch.tensor(framenb, dtype=torch.int64),
+            'dataset': self.dataset_type,          # string OK (laisser tel quel)
+            'target_size': self.target_size,       # inchangé comme avant
+            'ctc_id': torch.tensor(int(ctc_id), dtype=torch.int64),
+            'frame_id': torch.tensor(int(frame_id), dtype=torch.int64),
+            # NOTE: ne PAS mettre 'file_name' ici (sinon .to() plante sur str)
         }
 
-        if 'ctc_counter' in annotations[0]:
-            target['ctc_counter'] = torch.tensor(annotations[0]['ctc_counter'])
+        # robuste si pas d'annos
+        if isinstance(annotations, list) and len(annotations) > 0 and 'ctc_counter' in annotations[0]:
+            target['ctc_counter'] = torch.tensor(annotations[0]['ctc_counter'], dtype=torch.int64)
 
-        img_w_raw,img_h_raw = img_raw.size
-        h,w = self.target_size[0].item(), self.target_size[1].item()
+        img_w_raw, img_h_raw = img_raw.size
+        h, w = self.target_size[0].item(), self.target_size[1].item()
 
-        # Calculate padding
+        # padding
         padding_width = max(self.target_size[1] - img_w_raw, 0)
         padding_height = max(self.target_size[0] - img_h_raw, 0)
 
-        # Apply padding (left, top, right, bottom)
         img = Image.new('RGB', (img_w_raw + padding_width, img_h_raw + padding_height), (0, 0, 0))
         img.paste(img_raw, (0, 0))
 
         img_w, img_h = img.size
-        
-        if self.crop and self.RandomCrop.region is None:
 
+        if self.crop and self.RandomCrop.region is None:
             if self.shift:
                 bbox_areas = torch.tensor([ann['bbox'][2] * ann['bbox'][3] for ann in annotations])
                 self.shift_value = torch.sqrt(bbox_areas).mean() / 2
-                self.shift_value = self.shift_value * np.power(100 / bbox_areas.shape[0],1/3)
-
+                self.shift_value = self.shift_value * np.power(100 / bbox_areas.shape[0], 1/3)
                 self.img_w, self.img_h = img_w, img_h
                 self.num_cells = bbox_areas.shape[0]
 
             if img_w > self.target_size[1] or img_h > self.target_size[0]:
-                bbox_centers = torch.tensor([[ann['bbox'][0] + ann['bbox'][2]//2, ann['bbox'][1] + ann['bbox'][3]//2] for ann in annotations])
-                
-                if torch.rand(1) < 0.9:
+                bbox_centers = torch.tensor([[ann['bbox'][0] + ann['bbox'][2]//2,
+                                            ann['bbox'][1] + ann['bbox'][3]//2] for ann in annotations])
 
+                if torch.rand(1) < 0.9:
                     random_index = torch.randint(0, len(bbox_centers), (1,))[0]
                     bbox_center = bbox_centers[random_index]
-                    i,j = bbox_center[0].item() - h//2, bbox_center[1].item() - w//2
+                    i, j = bbox_center[0].item() - h//2, bbox_center[1].item() - w//2
 
                     if torch.rand(1) < 0.2:
-                        i += torch.randint(-self.target_size[1]//2,self.target_size[1]//2,(1,)).item()
-                        j += torch.randint(-self.target_size[0]//2,self.target_size[0]//2,(1,)).item()
+                        i += torch.randint(-self.target_size[1]//2, self.target_size[1]//2, (1,)).item()
+                        j += torch.randint(-self.target_size[0]//2, self.target_size[0]//2, (1,)).item()
                         self.shift_value /= 2
                 else:
-                    i = torch.randint(0, max(img_h - h,1), (1,)).item()
-                    j = torch.randint(0, max(img_w - w,1), (1,)).item()
+                    i = torch.randint(0, max(img_h - h, 1), (1,)).item()
+                    j = torch.randint(0, max(img_w - w, 1), (1,)).item()
 
-                if j+h > img_h:
+                if j + h > img_h:
                     j = img_h - h
                 elif j < 0:
                     j = 0
 
-                if i+w > img_w:
+                if i + w > img_w:
                     i = img_w - w
                 elif i < 0:
                     i = 0
 
             elif img_w == self.target_size[1] and img_h == self.target_size[0]:
-                i = 0
-                j = 0
-                w = img_w
-                h = img_h
-
+                i = 0; j = 0; w = img_w; h = img_h
             else:
                 raise NotImplementedError
 
-            self.RandomCrop.region = [j,i,h,w]
+            self.RandomCrop.region = [j, i, h, w]
 
         img = img.crop((0, 0, img_w_raw, img_h_raw))
 
@@ -150,7 +189,11 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
         img, target = self._norm_transforms(img, target)
 
+        target['ctc_id']  = torch.tensor(int(ctc_id), dtype=torch.int64)
+        target['frame_id'] = torch.tensor(int(frame_id), dtype=torch.int64)
         return img, target
+
+
 
 
 def convert_coco_poly_to_mask(segmentations, height, width, crop_region):

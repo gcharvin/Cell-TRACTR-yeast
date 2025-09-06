@@ -4,6 +4,36 @@ Utilities for bounding box manipulation and GIoU.
 """
 import torch
 from torchvision.ops.boxes import box_area
+import os 
+
+def _order_key_xywh(box4: torch.Tensor):
+    # box format is cx, cy, w, h (Cell-TRACTR)
+    # returns (cx, cy) as ordering key
+    return box4[..., 0], box4[..., 1]
+
+def standardize_div_order(box8: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure a consistent order of the two halves in an 8D division box:
+      - primarily by cx (left->right)
+      - tie-breaker by cy (top->bottom)
+    Works on shape (8,) or (..., 8).
+    """
+    if box8.ndim == 1:
+        a, b = box8[:4].clone(), box8[4:].clone()
+        cx_a, cy_a = _order_key_xywh(a)
+        cx_b, cy_b = _order_key_xywh(b)
+        swap = (cx_a > cx_b) or (abs(float(cx_a - cx_b)) < 1e-6 and cy_a > cy_b)
+        if swap:
+            a, b = b, a
+        return torch.cat((a, b), dim=0).to(box8.device)
+    else:
+        a, b = box8[..., :4].clone(), box8[..., 4:].clone()
+        cx_a, cy_a = _order_key_xywh(a)
+        cx_b, cy_b = _order_key_xywh(b)
+        swap = (cx_a > cx_b) | ((cx_a - cx_b).abs() < 1e-6) & (cy_a > cy_b)
+        a2 = torch.where(swap[..., None], b, a)
+        b2 = torch.where(swap[..., None], a, b)
+        return torch.cat((a2, b2), dim=-1).to(box8.device)
 
 def box_cxcywh_to_xyxy(x):
 
@@ -174,37 +204,70 @@ def combine_div_masks(mask, prev_mask):
     
     return combined_mask
 
-def divide_box(box,fut_box):
+import torch
+
+def divide_box(box, fut_box):
+    """
+    Ajuste la bbox mère et la bbox fille prédites au futur (fut_box)
+    en les recentrant par rapport à la bbox mère courante (box),
+    puis les borne à l'intérieur de la bbox mère courante.
+    Entrées et sortie attendues: Tensors 1D de taille 8 [cx,cy,w,h, cx_f,cy_f,w_f,h_f].
+    """
+    box     = box.view(-1)
+    fut_box = fut_box.view(-1)
+    assert box.numel() == 8 and fut_box.numel() == 8, "divide_box attend des vecteurs (8,)"
+
+    device = box.device
+    dtype  = box.dtype
 
     new_box = torch.zeros_like(box)
 
-    new_box[2:4] = fut_box[2:4]
-    new_box[6:8] = fut_box[6:8]
+    # On part des tailles de fut_box
+    new_box[2:4] = fut_box[2:4]   # w,h mère
+    new_box[6:8] = fut_box[6:8]   # w,h fille
 
-    min_y = min(fut_box[1] - fut_box[3] / 2, fut_box[5] - fut_box[7] / 2)
-    max_y = max(fut_box[1] + fut_box[3] / 2, fut_box[5] + fut_box[7] / 2)
+    # Centre moyen (x,y) couvrant mère & fille de fut_box
+    min_y = torch.minimum(fut_box[1] - fut_box[3] / 2, fut_box[5] - fut_box[7] / 2)
+    max_y = torch.maximum(fut_box[1] + fut_box[3] / 2, fut_box[5] + fut_box[7] / 2)
     avg_y = (min_y + max_y) / 2
     dif_y = box[1] - avg_y
 
-    min_x = min(fut_box[0] - fut_box[2] / 2, fut_box[4] - fut_box[6] / 2)
-    max_x = max(fut_box[0] + fut_box[2] / 2, fut_box[4] + fut_box[6] / 2)
+    min_x = torch.minimum(fut_box[0] - fut_box[2] / 2, fut_box[4] - fut_box[6] / 2)
+    max_x = torch.maximum(fut_box[0] + fut_box[2] / 2, fut_box[4] + fut_box[6] / 2)
     avg_x = (min_x + max_x) / 2
     dif_x = box[0] - avg_x
 
+    # Recentrage des centres (mère aux indices 0,1 ; fille aux 4,5)
     new_box[0::4] = fut_box[0::4] + dif_x
     new_box[1::4] = fut_box[1::4] + dif_y
 
-    new_box_y_0 = torch.clamp((new_box[1::4] - new_box[3::4] / 2), box[1] - box[3] / 2, box[1] + box[3] / 2)
-    new_box_x_0 = torch.clamp((new_box[0::4] - new_box[2::4] / 2), box[0] - box[2] / 2, box[0] + box[2] / 2)
-    new_box_y_1 = torch.clamp((new_box[1::4] + new_box[3::4] / 2), box[1] - box[3] / 2, box[1] + box[3] / 2)
-    new_box_x_1 = torch.clamp((new_box[0::4] + new_box[2::4] / 2), box[0] - box[2] / 2, box[0] + box[2] / 2)
+    # Bornes imposées par la bbox mère courante (x0,y0,x1,y1)
+    mother_x0 = box[0] - box[2] / 2
+    mother_x1 = box[0] + box[2] / 2
+    mother_y0 = box[1] - box[3] / 2
+    mother_y1 = box[1] + box[3] / 2
 
-    new_box[1::4] = (new_box_y_0 + new_box_y_1) / 2
-    new_box[3::4] = new_box_y_1 - new_box_y_0
-    new_box[0::4] = (new_box_x_0 + new_box_x_1) / 2
-    new_box[2::4] = new_box_x_1 - new_box_x_0
+    # Clamp des coins pour mère et fille
+    new_y0 = torch.clamp(new_box[1::4] - new_box[3::4] / 2, min=mother_y0, max=mother_y1)
+    new_y1 = torch.clamp(new_box[1::4] + new_box[3::4] / 2, min=mother_y0, max=mother_y1)
+    new_x0 = torch.clamp(new_box[0::4] - new_box[2::4] / 2, min=mother_x0, max=mother_x1)
+    new_x1 = torch.clamp(new_box[0::4] + new_box[2::4] / 2, min=mother_x0, max=mother_x1)
+
+    # Recalcule (cx,cy,w,h) depuis coins clampés
+    eps = torch.tensor(1e-6, device=device, dtype=dtype)
+    new_box[1::4] = (new_y0 + new_y1) / 2
+    new_box[3::4] = torch.clamp(new_y1 - new_y0, min=eps)
+    new_box[0::4] = (new_x0 + new_x1) / 2
+    new_box[2::4] = torch.clamp(new_x1 - new_x0, min=eps)
+
+    # Standardiser l'ordre (si la fonction existe dans le module)
+    try:
+        new_box = standardize_div_order(new_box)
+    except NameError:
+        pass
 
     return new_box
+
 
 def divide_mask(mask,fut_mask):
 

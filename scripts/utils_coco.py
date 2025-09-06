@@ -12,28 +12,37 @@ def get_info(dataset):
     if dataset == 'moma':
         info = {
             'contributor': 'Dunlop Lab (Owen OConnor)',
-            'date_created':'2022',
-            'description':'E. Coli growing in mother machine',
+            'date_created': '2022',
+            'description': 'E. Coli growing in mother machine',
             'version': '1.0',
             'year': '2024'
-            }
+        }
     elif dataset == '2D':
         info = {
             'contributor': 'Simon van Vliet',
-            'paper':'Spatially Correlated Gene Expression in Bacterial Groups: The Role of Lineage History, Spatial Gradients, and Cell-Cell Interactions (2018 van Vliet et al.)',
-            'description':'E. Coli and Salmonella growing on agarose pads',
+            'paper': 'Spatially Correlated Gene Expression in Bacterial Groups: The Role of Lineage History, Spatial Gradients, and Cell-Cell Interactions (2018 van Vliet et al.)',
+            'description': 'E. Coli and Salmonella growing on agarose pads',
             'version': '1.0',
             'year': '2024'
-            }
+        }
     elif dataset == 'DynamicNuclearNet-tracking-v1_0':
         info = {
             'contributor': 'Van Valen Lab',
-            'paper':'Caliban: Accurate cell tracking and lineage construction in live-cell imaging experiments with deep learning (2023 M. Schwartz et al.)',
+            'paper': 'Caliban: Accurate cell tracking and lineage construction in live-cell imaging experiments with deep learning (2023 M. Schwartz et al.)',
             'version': '1.0',
             'year': '2024'
-            }
-        
+        }
+    else:
+        # Cas générique
+        info = {
+            'contributor': 'Unknown contributor',
+            'description': f'Dataset: {dataset}',
+            'version': '1.0',
+            'year': '2025'
+        }
+    
     return info
+
 
 def create_folders(datapath,folders):
 
