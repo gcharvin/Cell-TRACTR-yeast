@@ -3,8 +3,10 @@
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.13.1-red.svg)](https://pytorch.org/)
 
-# Cell-TRACTR
+# Cell-TRACTR-yeast 
 This repository provides the implementation of [Cell-TRACTR](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1013071) paper by Owen M. O'Connor and Mary J. Dunlop. The codebase builds upon [DETR](https://github.com/facebookresearch/detr), [Deformable DETR](https://github.com/fundamentalvision/Deformable-DETR) and [Trackformer](https://github.com/timmeinhardt/trackformer)
+
+This repository provides the implementation of analysis of yeast cell lineages
 
 ## Table of Contents
 - [Abstract](#abstract)
