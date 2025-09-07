@@ -32,6 +32,31 @@ if _dbg:
 # ---------------------------------------------------------------------
 # Helpers robustes (torch / numpy) pour lever toute ambiguïté booléenne
 # ---------------------------------------------------------------------
+
+def _dbg_div_box_choice(box_f1, box_f2, chosen_box, extra=None):
+    """
+    Log léger pour diagnostiquer la construction de la GT de division.
+    - box_f1, box_f2 : cx,cy,w,h des filles (t ou t+1 selon le cas)
+    - chosen_box     : boîte retenue (cx,cy,w,h, cx,cy,w,h ou cx,cy,w,h si combinée)
+    """
+    def _tolist(t):
+        import torch
+        if isinstance(t, torch.Tensor):
+            return [float(x) for x in t.detach().flatten().tolist()]
+        return list(t)
+    msg = (f"[DIVDBG:GT-CHOICE] d1={_tolist(box_f1[:4])}  d2={_tolist(box_f2[:4])}  "
+           f"-> chosen={_tolist(chosen_box)}")
+    if extra:
+        # extra peut contenir fr, ids, etc.
+        try:
+            import json
+            msg += f"  ctx={json.dumps(extra)}"
+        except Exception:
+            msg += f"  ctx={extra}"
+    print(msg, flush=True)
+
+
+
 def _to_int(x):
     """Retourne un int Python à partir d'un tensor 0-D / numpy / int."""
     try:
@@ -94,6 +119,7 @@ def update_early_or_late_track_divisions(
 ):
     device = outputs["pred_logits"].device
     use_masks = "masks" in targets[0][training_method][cur_target_name]
+    
 
     # check for early / late cell division and adjust ground truths as necessary
     for t, target in enumerate(targets):
@@ -184,6 +210,19 @@ def update_early_or_late_track_divisions(
                     pred_box_single = pred_box.clone()
                     pred_box_single[4:] = 0
                     iou_combined = calc_iou(combined_box, pred_box_single)
+                    
+                    # --- DEBUG (2% des cas) : on log les 2 filles (box[:4], box[4:]) et la boîte combinée choisie
+                    if torch.rand(1, device=combined_box.device).item() < 0.5:
+                        _dbg_div_box_choice(
+                            box[:4], box[4:8], combined_box,
+                            extra={
+                                "phase": "LATE",
+                                "fr": int(_to_int(cur_target.get("framenb", -1))),
+                                "iou_div_vs_pred": float(_to_int(iou_div)),
+                                "iou_combined_vs_pred": float(_to_int(iou_combined)),
+                            }
+                        )
+
 
                     if (iou_combined - iou_div > 0) and (iou_combined > DIV_BBOX_IOU_THR):
                         # remplacer la division GT par une boîte unique combinée
@@ -411,6 +450,19 @@ def update_early_or_late_track_divisions(
                         fut_box_2 = fut_target["boxes_orig"][
                             fut_target["track_ids_orig"] == fut_track_id_2
                         ][0]
+                        
+                        # --- DEBUG (2% des cas) : on log les 2 filles (t+1) et la boîte de division construite à t
+                        if torch.rand(1, device=div_box.device).item() < 0.5:
+                            _dbg_div_box_choice(
+                                fut_box_1[:4], fut_box_2[:4], div_box,
+                                extra={
+                                    "phase": "EARLY",
+                                    "fr": int(_to_int(cur_target.get("framenb", -1))),
+                                    "iou_div_vs_pred": float(_to_int(iou_div)),
+                                    "iou_single_vs_pred": float(_to_int(iou)),
+                                }
+                            )
+
 
                         if (
                             (div_box[:2] - fut_box_1[:2]).square().sum()
