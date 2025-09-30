@@ -980,14 +980,15 @@ def calc_track_acc(track_acc_dict, outputs, targets, args, calc_mask_acc=True, u
                     div_bbox_acc[1] += 1
                     dbg["iou_div_hits"] += 1
                 else:
-                    FP_bbox += 1
-                    div_bbox_acc[1] += 1
+                    slot_idx = 0 if _matched_slot == 1 else 1
 
-                if has_masks:
-                    pm = pred_track_masks[p:p+1, :1]
+                    pm = pred_track_masks[p:p+1, slot_idx:slot_idx+1]  # masque fille prédite correspondant au slot choisi
                     pm = F.interpolate(pm, size=tgt_masks.shape[-2:], mode="bilinear", align_corners=False)
                     pm = (pm > 0.5).float()
-                    miou_div = _mask_iou_scalar(pm, tgt_masks[gt_id:gt_id+1, :1])
+
+                    gm = tgt_masks[gt_id:gt_id+1, slot_idx:slot_idx+1] # masque GT de la fille correspondante
+                    miou_div = _mask_iou_scalar(pm, gm)
+
                     if miou_div > iou_thresh:
                         TP_mask += 1
                         div_mask_acc[0] += 1
@@ -995,21 +996,21 @@ def calc_track_acc(track_acc_dict, outputs, targets, args, calc_mask_acc=True, u
                     else:
                         FP_mask += 1
                         div_mask_acc[1] += 1
-                
-                # if debug_div and (dbg["iou_div_trials"] <= 5) and (iou_div <= iou_thresh):
-                #     print("[DIVDBG][MISS] pred_div_score=%.3f iou_div=%.3f  pred_div=%s  gt_div=%s" %
-                #         (pred_div_score, iou_div,
-                #         pred_track_boxes[p, 4:8].detach().cpu().numpy(),
-                #         tgt_boxes[gt_id, 4:8].detach().cpu().numpy()))
+
+                if debug_div and (dbg["iou_div_trials"] <= 5):
+                    # calcule iou1/iou2 séparément pour l'inspection (sans influer sur la métrique)
+                    iou1 = float(_pair_iou(pred_d, gt_row[:, :4], use_generalized_iou))
+                    iou2 = float(_pair_iou(pred_d, gt_row[:, 4:8], use_generalized_iou))
+                    print(f"[DIVDBG][PAIR] iou1={iou1:.3f}  iou2={iou2:.3f}  chosen={_matched_slot}  best={iou_div:.3f}")
+
+                # --- DEBUG cohérent avec le best-of-two ---
                 if debug_div and (dbg["iou_div_trials"] <= 5) and (iou_div <= iou_thresh):
                     _pred = pred_track_boxes[p, 4:8].detach().cpu().numpy()
                     _gt_d1 = tgt_boxes[gt_id, :4].detach().cpu().numpy()
                     _gt_d2 = tgt_boxes[gt_id, 4:8].detach().cpu().numpy()
                     print("[DIVDBG][MISS] pred_div_score=%.3f iou_div(best)=%.3f matched_slot=%d  pred_div=%s  gt_d1=%s  gt_d2=%s"
                         % (pred_div_score, iou_div, _matched_slot, _pred, _gt_d1, _gt_d2))
-                
                     sys.stdout.flush()
-
 
             else:
                 # TN division

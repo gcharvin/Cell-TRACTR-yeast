@@ -4,7 +4,7 @@ Train and eval functions used in main.py
 """
 import math
 import sys
-from typing import Iterable, Tuple, Any, Dict, List
+from typing import Iterable, Tuple, Any, Dict, List, Optional
 import numpy as np
 import PIL
 import torch
@@ -68,16 +68,35 @@ def _meta_from_slot(slot_dict: Dict[str, Any], fallback_root: Dict[str, Any] = N
         if fr  is None: fr  = _to_int(fallback_root.get("frame_id", None))
     return ctc, fr
 
+_TRIPLET_SLOT_PRIORITIES = (
+    ("prev_target", "cur_target", "fut_target"),
+    ("prev_prev_target", "prev_target", "cur_target"),
+)
+
+def _select_triplet_slot_names(main: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    for candidate in _TRIPLET_SLOT_PRIORITIES:
+        if all(name in main for name in candidate):
+            return candidate
+    return None
+
 def validate_triplet_item(item: Dict[str, Any], stats: TripletStats,
                           keep_examples: bool=False, max_examples: int=10) -> bool:
     """Valide un SEUL item (il contient déjà prev/cur/fut). Ne modifie rien."""
     try:
         main = item["main"]
-        prev = main["prev_target"]; cur = main["cur_target"]; fut = main["fut_target"]
+        slot_names = _select_triplet_slot_names(main)
+        if slot_names is None:
+            raise KeyError("missing triplet slots")
+        prev, cur, fut = (main[name] for name in slot_names)
     except Exception:
         stats.missing_keys += 1
         if keep_examples and len(stats.examples) < max_examples:
-            stats.examples.append({"reason": "missing_main_or_slots"})
+            example = {"reason": "missing_main_or_slots"}
+            if isinstance(item, dict):
+                main_part = item.get("main")
+                if isinstance(main_part, dict):
+                    example["available_slots"] = [name for name in main_part.keys() if name.endswith("_target")]
+            stats.examples.append(example)
         return False
 
     ctc_prev, fr_prev = _meta_from_slot(prev, item)
@@ -272,10 +291,17 @@ def _assert_slot(slot: Dict[str, Any], slot_name: str):
     assert slot['flexible_divisions'].shape == (B,), f"{slot_name}.flexible_divisions must be (N,)"
 
 def assert_target_schema(t: Dict[str, Any]):
-    assert 'main' in t and all(k in t['main'] for k in ['prev_target','cur_target','fut_target']), "missing main.{prev,cur,fut}_target"
-    _assert_slot(t['main']['prev_target'], 'prev_target')
-    _assert_slot(t['main']['cur_target'],  'cur_target')
-    _assert_slot(t['main']['fut_target'],  'fut_target')
+    assert 'main' in t, "missing main target dict"
+    main = t['main']
+    slot_names = _select_triplet_slot_names(main)
+    if slot_names is None:
+        available = [k for k in main.keys() if k.endswith('_target')]
+        raise AssertionError(f"missing required triplet targets (available: {available})")
+    for slot_name in slot_names:
+        _assert_slot(main[slot_name], slot_name)
+    for extra in ('prev_prev_target', 'fut_target'):
+        if extra in main and extra not in slot_names:
+            _assert_slot(main[extra], extra)
 
     # ctc_id/frame_id peuvent être au niveau racine ou au niveau des slots : on ne force pas ici
     # mais s’ils sont présents ils doivent être scalaires

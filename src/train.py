@@ -9,6 +9,7 @@ import sacred
 import torch
 import yaml
 from torch.utils.data import DataLoader
+import argparse, sys
 
 import trackformer.util.misc as utils
 from trackformer.datasets import build_dataset
@@ -17,6 +18,10 @@ from trackformer.models import build_model
 from trackformer.util.misc import collate_fn as tr_collate_fn
 
 from trackformer.util.mitosis_sampler import scan_mitosis, TripletBatchSampler, _guess_mantrack_path
+from trackformer.data.triplet_seq import TripletWrapperDataset, collate_triplet_batch
+
+
+DEFAULT_USE_MITOSIS_SAMPLER = False  # <-- Mets True si tu veux réactiver plus tard
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -28,12 +33,17 @@ yaml_file_paths = (filepath.parents[1] / 'cfgs').glob("*.yaml")
 yaml_files = [yaml_file.stem.split('train_')[1] for yaml_file in yaml_file_paths]
 
 
+
 ex = sacred.Experiment('train', save_git_info=False)
 
-def train(respath, dataset) -> None:
+@ex.config
+def _defaults():
+    use_mitosis_sampler = DEFAULT_USE_MITOSIS_SAMPLER  # <= clé connue par Sacred
+
+def train(respath, dataset,args) -> None:
     # La config a déjà été ajoutée dans __main__ via ex.add_config
-    config = ex.run_commandline().config
-    args = utils.nested_dict_to_namespace(config)
+   # config = ex.run_commandline().config
+   # args = utils.nested_dict_to_namespace(config)
 
     Path(args.output_dir).mkdir(exist_ok=True)
 
@@ -118,134 +128,111 @@ def train(respath, dataset) -> None:
 
     dataset_train = build_dataset(split='train', args=args)
     dataset_val = build_dataset(split='val', args=args)
+    
+    use_mitosis_sampler = getattr(args, "use_mitosis_sampler", DEFAULT_USE_MITOSIS_SAMPLER)
+    
+    print(f"[CFG] use_mitosis_sampler = {use_mitosis_sampler}")
 
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
-    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+    if use_mitosis_sampler:
+        # ====== CHEMIN ACTUEL (custom sampler) ======
+        if not hasattr(dataset_train, "split_name"): setattr(dataset_train, "split_name", "train")
+        if not hasattr(dataset_val,   "split_name"): setattr(dataset_val,   "split_name", "val")
+
+        coco_root = Path(args.data_dir) / "moma" / "COCO"
+        if not coco_root.exists():
+            cand = Path(args.output_dir).parents[1] / "trainingdataset" / "COCO"
+            if cand.exists(): coco_root = cand
+            else: raise FileNotFoundError(f"[COCO] introuvable: {coco_root} (fallback: {cand})")
+        print(f"[COCO] root = {coco_root}")
+
+        # scan + samplers comme avant...
+        pos_idx, neg_idx, seq2frames = scan_mitosis(dataset_train, coco_root=coco_root, split_dir="train")
+
+        centers_per_batch = args.batch_size // 3
+        pos_per_batch = max(1, int(0.5 * centers_per_batch))
+
+        batch_sampler = TripletBatchSampler(
+            dataset=dataset_train,
+            pos_centers=pos_idx,
+            neg_centers=neg_idx,
+            batch_size=args.batch_size,     # multiple de 3 requis
+            pos_per_batch=pos_per_batch,
+            seq2frames=seq2frames,
+            shuffle=True,
+            seed=42,
+            require_triplets=True
+        )
+
+        data_loader_train = DataLoader(
+            dataset_train,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=tr_collate_fn,
+        )
+
+        pos_va, neg_va, seq2frames_val = scan_mitosis(dataset_val, coco_root=coco_root, split_dir="val")
+        sampler_val = TripletBatchSampler(
+            dataset=dataset_val,
+            pos_centers=pos_va,
+            neg_centers=neg_va,
+            batch_size=3,  # 1 triplet
+            pos_per_batch=1,
+            seq2frames=seq2frames_val,
+            shuffle=False,
+            seed=0,
+            require_triplets=True
+        )
+        data_loader_val = DataLoader(
+            dataset_val,
+            batch_sampler=sampler_val,
+            collate_fn=tr_collate_fn,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+    else:
+        # ====== SEQUENTIAL TRIPLETS (no mitosis balancing) ======
+        # Wrap base datasets so each item yields a (prev, cur, next) triplet.
+        train_wrapper = TripletWrapperDataset(
+            dataset_train,
+            seq_len=3,
+            pad_mode="edge",      # duplicate edge frames at boundaries
+            jitter=0,             # no temporal jitter
+            center_mode="middle", # (t-1, t, t+1) around the index
+        )
+        val_wrapper = TripletWrapperDataset(
+            dataset_val,
+            seq_len=3,
+            pad_mode="edge",
+            jitter=0,
+            center_mode="middle",
+        )
+
+        data_loader_train = DataLoader(
+            train_wrapper,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_triplet_batch,   # <<< important
+            worker_init_fn=seed_worker,
+            persistent_workers=args.num_workers > 0,
+        )
+        data_loader_val = DataLoader(
+            val_wrapper,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_triplet_batch,   # <<< important
+            worker_init_fn=seed_worker,
+            persistent_workers=args.num_workers > 0,
+        )
+
 
    
-  # règle simple : ~50% POS si dispo, sinon 0 (fallback auto)
-    # batch_sampler = BalancedMitosisBatchSampler.from_dataset(
-    #     dataset_train,
-    #     batch_size=args.batch_size,
-    #     pos_per_batch=None,    # None -> heuristique (moitié si pos>0)
-    #     nscan=None,            # ou limite ex. 10000 si dataset énorme
-    #     shuffle=True,
-    #     seed=42,
-    #     drop_last=True,
-    # )
-
-    # data_loader_train = DataLoader(
-    #     dataset_train,
-    #     batch_sampler=batch_sampler,   # (défini ci-dessous)
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    #     collate_fn=tr_collate_fn,
-    # )
-
-# S'assure que le dataset expose un split_name (utile pour lire man_track/train|val)
-    if not hasattr(dataset_train, "split_name"):
-        setattr(dataset_train, "split_name", "train")
-    if not hasattr(dataset_val, "split_name"):
-        setattr(dataset_val, "split_name", "val")
-
-    # === COCO root depuis le YAML ===
-    coco_root = Path(args.data_dir) / "moma" / "COCO" 
-    
-    if not coco_root.exists():
-        # Fallback simple si jamais data_dir pointe ailleurs
-        cand = Path(args.output_dir).parents[1] / "trainingdataset" / "COCO"
-        if cand.exists():
-            coco_root = cand
-        else:
-            raise FileNotFoundError(f"[COCO] introuvable: {coco_root} (fallback: {cand})")
-
-    print(f"[COCO] root = {coco_root}")
-
-   # 1) Scanner les centres POS/NEG une fois
-    pos_idx, neg_idx, seq2frames = scan_mitosis(dataset_train, coco_root=coco_root, split_dir="train")
-
-    # DEBUG : vérifie une séquence
-    if hasattr(dataset_train, "coco_root"):
-        print("[COCO] root =", dataset_train.coco_root)
-    # Affiche les 3 premières clés de seq détectées
-    from itertools import islice
-    print("[MITOSIS][DEBUG] nb seq =", len(seq2frames))
-    print("[MITOSIS][DEBUG] sample seqs =", list(islice(sorted(seq2frames.keys()), 5)))
-    if len(seq2frames):
-        s = next(iter(seq2frames.keys()))
-        print("[MITOSIS][DEBUG] man_track path =", _guess_mantrack_path(coco_root, "train", s))
-
-
-    # 2) Définir un ratio par *centres* (ex. 50% de centres POS par batch)
-    centers_per_batch = args.batch_size // 3
-    
-    pos_per_batch = max(1, int(0.5 * centers_per_batch))
-
-    # 3) Sampler qui émet des indices [t-1, t, t+1,  t-1, t, t+1, ...]
-    batch_sampler = TripletBatchSampler(
-        dataset=dataset_train,
-        pos_centers=pos_idx,
-        neg_centers=neg_idx,
-        batch_size=args.batch_size,         # doit être multiple de 3
-        pos_per_batch=pos_per_batch,        # sur les *centres*
-        seq2frames=seq2frames,
-        shuffle=True,
-        seed=42,
-        require_triplets=True
-    )
-
-    data_loader_train = DataLoader(
-        dataset_train,
-        batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=tr_collate_fn
-    )
-
-    pos_va, neg_va, seq2frames_val = scan_mitosis(dataset_val, coco_root=coco_root, split_dir="val")
-
-    # batch de 1 triplet (t-1, t, t+1) en validation
-    sampler_val = TripletBatchSampler(
-        dataset=dataset_val,
-        pos_centers=pos_va,
-        neg_centers=neg_va,
-        batch_size=3,           # 1 “centre” => 3 images
-        pos_per_batch=1,        # au moins 1 centre POS si dispo
-        seq2frames=seq2frames_val,
-        shuffle=False,
-        seed=0,
-        require_triplets=True
-    )
-
-    data_loader_val = torch.utils.data.DataLoader(
-        dataset_val,
-        batch_sampler=sampler_val,     # <== PAS de batch_size ici
-        collate_fn=tr_collate_fn,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-
-        
-    # OPTION A — le plus simple : pas de batch_sampler, juste batch_size + shuffle
-    # data_loader_train = DataLoader(
-    #     dataset_train,
-    #     batch_size=args.batch_size,
-    #     shuffle=True,
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    #     collate_fn=tr_collate_fn
-    # )
-    
-    # data_loader_val= DataLoader(
-    #     dataset_val,
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    #     collate_fn=tr_collate_fn
-    # )
-
-
-  
-    
     print("[DEBUG] train collate_fn =", data_loader_train.collate_fn.__name__)
     print("[DEBUG] val   collate_fn =", data_loader_val.collate_fn.__name__)
 
@@ -337,12 +324,45 @@ def load_config(_config, _run):
 
 
 if __name__ == '__main__':
-    # Parse the dataset from the command line
-    dataset = yaml_files[0]  # ou override via --with dataset=...
-    yaml_path = filepath.parents[1] / 'cfgs' / ('train_' + dataset + '.yaml')
+        # 1) Parser uniquement notre arg custom et retirer le reste
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--dataset', type=str)
+    cli_args, remaining = parser.parse_known_args()
+
+    # 2) Choisir le YAML
+    dataset = cli_args.dataset if cli_args.dataset else yaml_files[0]
+    yaml_path = filepath.parents[1] / 'cfgs' / f'train_{dataset}.yaml'
+    print("[CFG] YAML chargé :", yaml_path)
     ex.add_config(str(yaml_path))
 
-    args = ex.run_commandline().config
+    # 3) IMPORTANT : enlever --dataset des args avant Sacred
+    sys.argv = [sys.argv[0]] + remaining
+
+    # 4) Laisser Sacred parser les overrides "with ..."
+    run = ex.run_commandline()
+    config = run.config
+    args = utils.nested_dict_to_namespace(config)
+
     respath = filepath.parents[1] / 'results' / dataset
     respath.mkdir(exist_ok=True)
-    train(respath, dataset)
+    train(respath, dataset, args)           # <— on passe args i
+    
+    
+    # import argparse
+    # parser = argparse.ArgumentParser(add_help=False)
+    # parser.add_argument("--dataset", type=str, help="suffixe après train_, ex: moma -> train_moma.yaml")
+    # cli_args, _ = parser.parse_known_args()
+
+    # if cli_args.dataset:
+    #     dataset = cli_args.dataset
+    # else:
+    #     dataset = yaml_files[0]
+
+    # yaml_path = filepath.parents[1] / 'cfgs' / f"train_{dataset}.yaml"
+    # print("[CFG] YAML chargé :", yaml_path)  # pour vérifier
+    # ex.add_config(str(yaml_path))
+
+    # args = ex.run_commandline().config
+    # respath = filepath.parents[1] / 'results' / dataset
+    # respath.mkdir(exist_ok=True)
+    # train(respath, dataset)
